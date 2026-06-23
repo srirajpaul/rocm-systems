@@ -1053,8 +1053,12 @@ static ncclResult_t repairMissingChannels(struct ncclTopoRanks** allTopoRanks, i
 
 NCCL_PARAM(UnpackDoubleNChannels, "UNPACK_DOUBLE_NCHANNELS", 1);
 RCCL_PARAM(OutputTrees, "OUTPUT_TREES", 0);
+// Upper bound on the number of channels used by the PAT algorithm.
+// Set to <= 0 to disable the cap.
+RCCL_PARAM(MaxPatNchannels, "MAX_PAT_NCHANNELS", 4);
 
 ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePatterns, struct ncclTopoRanks** allTopoRanks, int* rings, struct ncclTopoGraph** graphs, struct ncclComm* parent, int nc) {
+  int maxPatNChannels = rcclParamMaxPatNchannels();
   // Gather data from all ranks
   ncclResult_t ret = ncclSuccess;
   int *ringRecv = NULL, *ringSend = NULL, *ringPrev = NULL, *ringNext = NULL, *treeToParent = NULL, *treeToChild0 = NULL, *treeToChild1 = NULL, *nvlsHeads = NULL;
@@ -1318,6 +1322,12 @@ ncclResult_t ncclTopoPostset(struct ncclComm* comm, int* firstRanks, int* treePa
   }
 
   comm->collChannels = comm->nChannels;
+
+  comm->patChannels = comm->nChannels;
+  if (maxPatNChannels > 0 && maxPatNChannels < comm->nChannels) {
+    comm->patChannels = maxPatNChannels;
+  }
+
 #if CUDART_VERSION >= 12010
   // Support maximal channel usage for aggregation
   if (shared && comm->nvlsChannels > parent->nvlsResources->nChannels) {

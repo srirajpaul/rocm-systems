@@ -699,6 +699,7 @@ struct ncclComm {
   int nChannels; // connection nChannels
   int collChannels; // enqueue nChannels
   int nvlsChannels; // enqueue nChannels
+  int patChannels;
   int nvlsTreeMaxChunkSize;
 
   // all nvls heads stored to check if we can splitShare
