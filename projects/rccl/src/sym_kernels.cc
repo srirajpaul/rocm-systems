@@ -27,6 +27,7 @@ constexpr char const* kernelName[] = {
   "AllGather_TmaSTMC",
   "AllGather_STMC",
   "AllGather_RailRing_LsaSTMC",
+  "AlltoAll_ST",
   "ReduceScatter_LL",
   "ReduceScatter_TmaLD",
   "ReduceScatter_LD",
@@ -67,6 +68,8 @@ constexpr uint32_t kernelMask_AR = 1<<ncclSymkKernelId_AllReduce_AGxLLMC_R |
                                    1<<ncclSymkKernelId_AllReduce_RSxLD_AGxST |
                                    1<<ncclSymkKernelId_AllReduce_RSxTmaLD_AGxTmaST;
 
+constexpr uint32_t kernelMask_A2A = 1<<ncclSymkKernelId_AlltoAll_ST;
+
 constexpr uint32_t kernelMask_RS = 1<<ncclSymkKernelId_ReduceScatter_LD |
                                    1<<ncclSymkKernelId_ReduceScatter_LDMC |
                                    1<<ncclSymkKernelId_ReduceScatter_TmaLD |
@@ -85,6 +88,7 @@ constexpr uint32_t kernelMask_LSA = 1<<ncclSymkKernelId_AllReduce_AGxLL_R |
                                     1<<ncclSymkKernelId_AllGather_STMC |
                                     1<<ncclSymkKernelId_AllGather_TmaST |
                                     1<<ncclSymkKernelId_AllGather_TmaSTMC |
+                                    1<<ncclSymkKernelId_AlltoAll_ST |
                                     1<<ncclSymkKernelId_ReduceScatter_LL |
                                     1<<ncclSymkKernelId_ReduceScatter_LD |
                                     1<<ncclSymkKernelId_ReduceScatter_LDMC |
@@ -113,6 +117,7 @@ static uint32_t kernelMask_coll(ncclFunc_t coll) {
   switch (coll) {
   case ncclFuncAllGather: return kernelMask_AG;
   case ncclFuncAllReduce: return kernelMask_AR;
+  case ncclFuncAlltoAll: return kernelMask_A2A;
   case ncclFuncReduceScatter: return kernelMask_RS;
   default: return 0;
   }
@@ -452,6 +457,10 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
     nMaxBlocks = nMaxBlocksNvls;
     break;
 
+  case ncclSymkKernelId_AlltoAll_ST:
+    busBytes = (nRanks-1)*nBytes;
+    break;
+
   case ncclSymkKernelId_ReduceScatter_LL:
     busBytes = nRanks*nBytes*LL_BusFactor;
     break;
@@ -617,6 +626,8 @@ static bool ncclSymkImplemented(ncclFunc_t coll, int/*ncclDevRedOp_t*/ red, nccl
       return isFloat && ty != ncclFloat64;
     }
     return false;
+  case ncclFuncAlltoAll:
+    return true;
   case ncclFuncReduceScatter:
     // Symmetric ReduceScatter implements sum and avg (ncclDevSumPostDiv).
     if (red == ncclDevSum || red == ncclDevSumPostDiv) {
@@ -704,6 +715,8 @@ ncclResult_t ncclSymkPickKernel(
   } else if (coll == ncclFuncAllGather) {
     if (winRegType != ncclSymSendRegRecvReg && winRegType != ncclSymSendNonregRecvReg) kmask &= kernelMask_LL;
     if (winRegType != ncclSymSendRegRecvReg && comm->nNodes > 1) kmask &= ~kernelMask_Gin;
+  } else if (coll == ncclFuncAlltoAll) {
+    if (winRegType != ncclSymSendRegRecvReg) kmask = 0;
   } else if (coll == ncclFuncReduceScatter) {
     if (winRegType != ncclSymSendRegRecvReg && winRegType != ncclSymSendRegRecvNonreg) kmask &= kernelMask_LL;
   }
