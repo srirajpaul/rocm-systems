@@ -69,8 +69,13 @@ __launch_bounds__(512)
 
   // It is expensive to launch hipMemcpyAsync on ROCm
   // Move data copy here. Each block copies part of sendbuff data
+  const T* __restrict__ mysendbuff = sendbuff1; //sendbuffs[selfRank];
+  T* __restrict__ myrecvbuff = recvbuff1; //recvbuffs[selfRank];
+  //const T* __restrict__ mysendbuff = sendbuff.localPtr();
+  //T* __restrict__ myrecvbuff = recvbuff.localPtr();
+
   copyFromSrcToDest<T>(
-      sendbuff1, ipcbuffs[selfRank], idxStart, copyCount, idxStride);
+      mysendbuff, ipcbuffs[selfRank], idxStart, copyCount, idxStride);
 
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,
@@ -91,7 +96,7 @@ __launch_bounds__(512)
       int srcRank = r;
       int srcIdx = idx + selfRank * idxEnd;
       int destIdx = idx + r * idxEnd;
-      *reinterpret_cast<uint4*>(&recvbuff1[destIdx]) =
+      *reinterpret_cast<uint4*>(&myrecvbuff[destIdx]) =
           reinterpret_cast<const uint4*>(&ipcbuffs[srcRank][srcIdx])[0];
     }
   }

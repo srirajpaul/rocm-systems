@@ -79,15 +79,18 @@ static ncclResult_t ncclAllToAllDdaIpcTyped(
       NCCLCHECK(ncclGetLsaDevicePointer(sendPtr.window, sendPtr.offset, r, &sp));
       sendbuffs[r] = (T*)sp;
     }
+
     meta::comms::ddaAllToAllIpc<T, kDdaNranks, false>
         <<<grid, block, 0, stream>>>(
             d_ipcbuffs,
             recvPtr,
-            static_cast<T*>(recvbuff),
+            //static_cast<T*>(recvbuff),
+            static_cast<T*>(recvbuffs[comm->rank]),
             recvbuffs,
             count,
             sendPtr,
-            static_cast<const T*>(sendbuff),
+            //static_cast<const T*>(sendbuff),
+            static_cast<const T*>(sendbuffs[comm->rank]),
             sendbuffs,
             comm->rank,
             barrierHost);
