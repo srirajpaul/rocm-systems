@@ -40,40 +40,31 @@ __launch_bounds__(512)
   const size_t copyCount = count * NRANKS;
   const auto idxStride = gridDim.x * blockDim.x * countPerThread;
 
+  T *dst[NRANKS];
+  ncclSymPtr<T> dstSlice = recvbuff + selfRank * countPerRank;
+  const T* src = sendbuff.localPtr();
+#pragma unroll NRANKS
+  for (int r = 0; r < NRANKS; ++r) {
+    dst[r] = dstSlice.lsaPtr(r);
+  }
+
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,
       true /* hasSubsequentMemAccess */>();
 
-#if 0
-  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
-#pragma unroll NRANKS
-    for (int r = 0; r < NRANKS; ++r) {
-      int srcRank = r;
-      int srcIdx = idx + selfRank * idxEnd;
-      int destIdx = idx + r * idxEnd;
-      *reinterpret_cast<uint4*>(&recvbuff[destIdx]) =
-          reinterpret_cast<const uint4*>(&ipcbuffs[srcRank][srcIdx])[0];
-    }
-  }
-#endif
-
-  bool inPlace = (sendbuff == recvbuff);
+  //bool inPlace = (sendbuff == recvbuff);
   static_assert(sizeof(T) == 1);
 
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
 #pragma unroll NRANKS
     for (int r = 0; r < NRANKS; ++r) {
-      size_t peer = (selfRank + r) % NRANKS;
-      if (peer == selfRank && inPlace) continue;
+      //const size_t peer = (selfRank + r) % NRANKS;
+      //if (peer == selfRank && inPlace) continue;
 
-      ncclSymPtr<T> srcSlice = sendbuff  + peer * countPerRank;
-      ncclSymPtr<T> dstSlice = recvbuff + selfRank * countPerRank;
+      const int srcIdx = idx + r * countPerRank;
 
-      T*       dst = dstSlice.lsaPtr(peer);
-      T const* src = srcSlice.localPtr();
-
-      *(reinterpret_cast<uint4*>(dst + idx)) =
-      *(reinterpret_cast<const uint4*>(src + idx));
+      *(reinterpret_cast<uint4*>(dst[r] + idx)) =
+      (reinterpret_cast<const uint4*>(src + srcIdx))[0];
     }
   }
   // barrier to ensure remote ranks won't free their buffers until I'm done
