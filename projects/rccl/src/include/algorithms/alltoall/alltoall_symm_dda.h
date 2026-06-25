@@ -23,8 +23,10 @@ __launch_bounds__(512)
     __global__ void ddaAllToAllIpc(
         T* const* __restrict__ ipcbuffs,
         ncclSymPtr<T> recvbuff,
+        T* __restrict__ recvbuff1,
         size_t count,
         const ncclSymPtr<T> sendbuff,
+        const T* __restrict__ sendbuff1,
         int selfRank,
         IpcGpuBarrier barrier) {
   // use uint4 to do 16-byte loads to maximize memory efficiency
@@ -51,17 +53,25 @@ __launch_bounds__(512)
     dst[r] = dstSlice.lsaPtr(r);
   }
 #else
-  ncclSymPtr<T> srcSlice = sendbuff + selfRank * countPerRank;
-  T *dstPtr = recvbuff.localPtr();
-#pragma unroll NRANKS
-  for (int r = 0; r < NRANKS; ++r) {
-    src[r] = srcSlice.lsaPtr(r);
-    dst[r] = dstPtr + r * countPerRank;
-  }
+  //ncclSymPtr<T> srcSlice = sendbuff + selfRank * countPerRank;
+  //T *dstPtr = recvbuff.localPtr();
+  //#pragma unroll NRANKS
+  //for (int r = 0; r < NRANKS; ++r) {
+  //  src[r] = srcSlice.lsaPtr(r);
+  //  dst[r] = dstPtr + r * countPerRank;
+  //}
+
+  //const T* __restrict__ sendbuffPtr = sendbuff.localPtr();
+  //T* __restrict__ recvbuffPtr = recvbuff.localPtr();
 #endif
 
+  // It is expensive to launch hipMemcpyAsync on ROCm
+  // Move data copy here. Each block copies part of sendbuff data
+  copyFromSrcToDest<T>(
+      sendbuff1, ipcbuffs[selfRank], idxStart, copyCount, idxStride);
+
   barrier.syncOnSameBlockIdx<
-      false /* hasPreviousMemAccess */,
+      true /* hasPreviousMemAccess */,
       true /* hasSubsequentMemAccess */>();
 
   //bool inPlace = (sendbuff == recvbuff);
@@ -73,8 +83,14 @@ __launch_bounds__(512)
       //const size_t peer = (selfRank + r) % NRANKS;
       //if (peer == selfRank && inPlace) continue;
 
-      *(reinterpret_cast<uint4*>(dst[r] + idx)) =
-      (reinterpret_cast<const uint4*>(src[r] + idx))[0];
+      //*(reinterpret_cast<uint4*>(dst[r] + idx)) =
+      //(reinterpret_cast<const uint4*>(src[r] + idx))[0];
+
+      int srcRank = r;
+      int srcIdx = idx + selfRank * idxEnd;
+      int destIdx = idx + r * idxEnd;
+      *reinterpret_cast<uint4*>(&recvbuff1[destIdx]) =
+          reinterpret_cast<const uint4*>(&ipcbuffs[srcRank][srcIdx])[0];
     }
   }
   // barrier to ensure remote ranks won't free their buffers until I'm done

@@ -71,8 +71,10 @@ static ncclResult_t ncclAllToAllDdaIpcTyped(
         <<<grid, block, 0, stream>>>(
             d_ipcbuffs,
             recvPtr,
+            static_cast<T*>(recvbuff),
             count,
             sendPtr,
+            static_cast<const T*>(sendbuff),
             comm->rank,
             barrierHost);
   }
