@@ -40,11 +40,13 @@ __launch_bounds__(512)
   const size_t copyCount = count * NRANKS;
   const auto idxStride = gridDim.x * blockDim.x * countPerThread;
 
+  const T *src[NRANKS];
   T *dst[NRANKS];
+  const T* srcPtr = sendbuff.localPtr();
   ncclSymPtr<T> dstSlice = recvbuff + selfRank * countPerRank;
-  const T* src = sendbuff.localPtr();
 #pragma unroll NRANKS
   for (int r = 0; r < NRANKS; ++r) {
+    src[r] = (T*)srcPtr + r * countPerRank;
     dst[r] = dstSlice.lsaPtr(r);
   }
 
@@ -61,10 +63,8 @@ __launch_bounds__(512)
       //const size_t peer = (selfRank + r) % NRANKS;
       //if (peer == selfRank && inPlace) continue;
 
-      const int srcIdx = idx + r * countPerRank;
-
       *(reinterpret_cast<uint4*>(dst[r] + idx)) =
-      (reinterpret_cast<const uint4*>(src + srcIdx))[0];
+      (reinterpret_cast<const uint4*>(src[r] + idx))[0];
     }
   }
   // barrier to ensure remote ranks won't free their buffers until I'm done
