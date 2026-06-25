@@ -24,9 +24,11 @@ __launch_bounds__(512)
         T* const* __restrict__ ipcbuffs,
         ncclSymPtr<T> recvbuff,
         T* __restrict__ recvbuff1,
+        T* __restrict__ recvbuffs[NRANKS],
         size_t count,
         const ncclSymPtr<T> sendbuff,
         const T* __restrict__ sendbuff1,
+        T* __restrict__ sendbuffs[NRANKS],
         int selfRank,
         IpcGpuBarrier barrier) {
   // use uint4 to do 16-byte loads to maximize memory efficiency

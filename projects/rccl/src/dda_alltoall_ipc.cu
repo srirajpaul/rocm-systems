@@ -64,21 +64,36 @@ static ncclResult_t ncclAllToAllDdaIpcTyped(
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
 
   if (comm->symmetricSupport) {
+      INFO(NCCL_TUNING, "ncclAllToAllDdaIpcTyped  symmetricSupport");
     ncclSymPtr<char> recvPtr, sendPtr;
     meta::comms::ncclPtrToSymPtr(comm, recvbuff, recvPtr);
     meta::comms::ncclPtrToSymPtr(comm, (void *)sendbuff, sendPtr);
+    T *recvbuffs[kDdaNranks], *sendbuffs[kDdaNranks];
+#pragma unroll
+    for (int r = 0; r < kDdaNranks; ++r) {
+      //recvbuffs[r] = (T*)(recvPtr.lsaPtr(r));
+      //sendbuffs[r] = (T*)(sendPtr.lsaPtr(r));
+      void *rp = nullptr, *sp = nullptr;
+      NCCLCHECK(ncclGetLsaDevicePointer(recvPtr.window, recvPtr.offset, r, &rp));
+      recvbuffs[r] = (T*)rp;
+      NCCLCHECK(ncclGetLsaDevicePointer(sendPtr.window, sendPtr.offset, r, &sp));
+      sendbuffs[r] = (T*)sp;
+    }
     meta::comms::ddaAllToAllIpc<T, kDdaNranks, false>
         <<<grid, block, 0, stream>>>(
             d_ipcbuffs,
             recvPtr,
             static_cast<T*>(recvbuff),
+            recvbuffs,
             count,
             sendPtr,
             static_cast<const T*>(sendbuff),
+            sendbuffs,
             comm->rank,
             barrierHost);
   }
   else {
+      INFO(NCCL_TUNING, "ncclAllToAllDdaIpcTyped  non-symmetricSupport");
     meta::comms::ddaAllToAllIpc<T, kDdaNranks, false>
         <<<grid, block, 0, stream>>>(
             d_ipcbuffs,
