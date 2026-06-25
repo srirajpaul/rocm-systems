@@ -42,6 +42,7 @@ __launch_bounds__(512)
 
   const T *src[NRANKS];
   T *dst[NRANKS];
+#if USE_WRITE
   const T* srcPtr = sendbuff.localPtr();
   ncclSymPtr<T> dstSlice = recvbuff + selfRank * countPerRank;
 #pragma unroll NRANKS
@@ -49,9 +50,18 @@ __launch_bounds__(512)
     src[r] = (T*)srcPtr + r * countPerRank;
     dst[r] = dstSlice.lsaPtr(r);
   }
+#else
+  ncclSymPtr<T> srcSlice = sendbuff + selfRank * countPerRank;
+  T *dstPtr = recvbuff.localPtr();
+#pragma unroll NRANKS
+  for (int r = 0; r < NRANKS; ++r) {
+    src[r] = srcSlice.lsaPtr(r);
+    dst[r] = dstPtr + r * countPerRank;
+  }
+#endif
 
   barrier.syncOnSameBlockIdx<
-      true /* hasPreviousMemAccess */,
+      false /* hasPreviousMemAccess */,
       true /* hasSubsequentMemAccess */>();
 
   //bool inPlace = (sendbuff == recvbuff);
