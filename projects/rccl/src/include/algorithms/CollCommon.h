@@ -32,6 +32,7 @@ using bf16 = __nv_bfloat16;
 using bf162 = __nv_bfloat162;
 #endif
 
+#include "dev_runtime.h"
 
 namespace meta::comms {
 
@@ -218,6 +219,19 @@ getGridAndBlockDims(size_t count, int typeSize, size_t maxBlocks) {
   }
 
   return std::make_pair(blocks, threads);
+}
+
+// returns ncclSuccess if ptr is in a symmetric window,
+// ncclInvalidArgument if not.
+inline ncclResult_t ncclPtrToSymPtr(struct ncclComm* comm, void* ptr, ncclSymPtr<char>& out) {
+  struct ncclDevrWindow* win = nullptr;
+  NCCLCHECK(ncclDevrFindWindow(comm, ptr, &win));
+  if (win == nullptr)
+    return ncclInvalidArgument;
+
+  out.window = win->vidmem;
+  out.offset = (uint8_t*)ptr - (uint8_t*)win->userPtr;
+  return ncclSuccess;
 }
 
 } // namespace meta::comms

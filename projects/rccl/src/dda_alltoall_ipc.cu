@@ -8,6 +8,7 @@
 
 #include "algorithms/CollCommon.h"
 #include "algorithms/alltoall/alltoall_dda.h"
+#include "algorithms/alltoall/alltoall_symm_dda.h"
 #include "checks.h"
 #include "comm.h"
 #include "debug.h"
@@ -62,14 +63,29 @@ static ncclResult_t ncclAllToAllDdaIpcTyped(
   void* peerPtrsDev = comm->ddaIpcPeerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
 
-  meta::comms::ddaAllToAllIpc<T, kDdaNranks, false>
-      <<<grid, block, 0, stream>>>(
-          d_ipcbuffs,
-          static_cast<T*>(recvbuff),
-          count,
-          static_cast<const T*>(sendbuff),
-          comm->rank,
-          barrierHost);
+  if (comm->symmetricSupport) {
+    ncclSymPtr<char> recvPtr, sendPtr;
+    meta::comms::ncclPtrToSymPtr(comm, recvbuff, recvPtr);
+    meta::comms::ncclPtrToSymPtr(comm, (void *)sendbuff, sendPtr);
+    meta::comms::ddaAllToAllIpc<T, kDdaNranks, false>
+        <<<grid, block, 0, stream>>>(
+            d_ipcbuffs,
+            recvPtr,
+            count,
+            sendPtr,
+            comm->rank,
+            barrierHost);
+  }
+  else {
+    meta::comms::ddaAllToAllIpc<T, kDdaNranks, false>
+        <<<grid, block, 0, stream>>>(
+            d_ipcbuffs,
+            static_cast<T*>(recvbuff),
+            count,
+            static_cast<const T*>(sendbuff),
+            comm->rank,
+            barrierHost);
+  }
   CUDACHECK(cudaGetLastError());
 
   return ncclSuccess;
@@ -113,6 +129,10 @@ bool ncclAllToAllDdaIpcEligible(
   // Check for data size divisible by 16
   if ((count * ncclTypeSize(datatype)) % 16) {
     return false;
+  }
+
+  if (comm->symmetricSupport) {
+      //TODO: check all pointers are aligned to 16 bytes
   }
 
   return true;
