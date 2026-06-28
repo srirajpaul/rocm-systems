@@ -65,19 +65,33 @@ static ncclResult_t ncclAllToAllDdaIpcTyped(
 
   if (comm->symmetricSupport) {
       INFO(NCCL_TUNING, "ncclAllToAllDdaIpcTyped  symmetricSupport");
+
+    struct ncclDevrWindow* sendWin;
+    struct ncclDevrWindow* recvWin;
+    ncclDevrFindWindow(comm, sendbuff, &sendWin);
+    ncclDevrFindWindow(comm, recvbuff, &recvWin);
+    size_t sendoffset = (uint8_t*)sendbuff - (uint8_t*)sendWin->userPtr;
+    size_t recvoffset = (uint8_t*)recvbuff - (uint8_t*)recvWin->userPtr;
+    std::array<T*, kDdaNranks> sendbuffs, recvbuffs; 
+
     ncclSymPtr<char> recvPtr, sendPtr;
     meta::comms::ncclPtrToSymPtr(comm, recvbuff, recvPtr);
     meta::comms::ncclPtrToSymPtr(comm, (void *)sendbuff, sendPtr);
-    T *recvbuffs[kDdaNranks], *sendbuffs[kDdaNranks];
+    //T *recvbuffs[kDdaNranks], *sendbuffs[kDdaNranks];
 #pragma unroll
     for (int r = 0; r < kDdaNranks; ++r) {
       //recvbuffs[r] = (T*)(recvPtr.lsaPtr(r));
       //sendbuffs[r] = (T*)(sendPtr.lsaPtr(r));
-      void *rp = nullptr, *sp = nullptr;
-      NCCLCHECK(ncclGetLsaDevicePointer(recvPtr.window, recvPtr.offset, r, &rp));
-      recvbuffs[r] = (T*)rp;
-      NCCLCHECK(ncclGetLsaDevicePointer(sendPtr.window, sendPtr.offset, r, &sp));
-      sendbuffs[r] = (T*)sp;
+
+      //NCCLCHECK(ncclDevrGetLsaRankPtr(comm, winHost, offset, lsaRank, outPtr));
+      //void *rp = nullptr, *sp = nullptr;
+      //NCCLCHECK(ncclGetLsaDevicePointer(recvPtr.window, recvPtr.offset, r, &rp));
+      //recvbuffs[r] = (T*)rp;
+      //NCCLCHECK(ncclGetLsaDevicePointer(sendPtr.window, sendPtr.offset, r, &sp));
+      //sendbuffs[r] = (T*)sp;
+
+      NCCLCHECK(ncclDevrGetLsaRankPtr(comm, sendWin, sendoffset, r, (void**)&sendbuffs[r]));
+      NCCLCHECK(ncclDevrGetLsaRankPtr(comm, recvWin, recvoffset, r, (void**)&recvbuffs[r]));
     }
 
     meta::comms::ddaAllToAllIpc<T, kDdaNranks, false>

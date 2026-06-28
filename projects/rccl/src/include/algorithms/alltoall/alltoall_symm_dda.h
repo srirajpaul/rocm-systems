@@ -24,11 +24,11 @@ __launch_bounds__(512)
         T* const* __restrict__ ipcbuffs,
         ncclSymPtr<T> recvbuff,
         T* __restrict__ recvbuff1,
-        T* __restrict__ recvbuffs[NRANKS],
+        std::array<T*, NRANKS> recvbuffs,
         size_t count,
         const ncclSymPtr<T> sendbuff,
         const T* __restrict__ sendbuff1,
-        T* __restrict__ sendbuffs[NRANKS],
+        std::array<T*, NRANKS> sendbuffs,
         int selfRank,
         IpcGpuBarrier barrier) {
   // use uint4 to do 16-byte loads to maximize memory efficiency
@@ -55,13 +55,13 @@ __launch_bounds__(512)
     dst[r] = dstSlice.lsaPtr(r);
   }
 #else
-  //ncclSymPtr<T> srcSlice = sendbuff + selfRank * countPerRank;
-  //T *dstPtr = recvbuff.localPtr();
-  //#pragma unroll NRANKS
-  //for (int r = 0; r < NRANKS; ++r) {
-  //  src[r] = srcSlice.lsaPtr(r);
-  //  dst[r] = dstPtr + r * countPerRank;
-  //}
+  ncclSymPtr<T> srcSlice = sendbuff + selfRank * countPerRank;
+  T *dstPtr = recvbuff.localPtr();
+  #pragma unroll NRANKS
+  for (int r = 0; r < NRANKS; ++r) {
+    src[r] = srcSlice.lsaPtr(r);
+    dst[r] = dstPtr + r * countPerRank;
+  }
 
   //const T* __restrict__ sendbuffPtr = sendbuff.localPtr();
   //T* __restrict__ recvbuffPtr = recvbuff.localPtr();
@@ -69,20 +69,21 @@ __launch_bounds__(512)
 
   // It is expensive to launch hipMemcpyAsync on ROCm
   // Move data copy here. Each block copies part of sendbuff data
-  const T* __restrict__ mysendbuff = sendbuff1; //sendbuffs[selfRank];
-  T* __restrict__ myrecvbuff = recvbuff1; //recvbuffs[selfRank];
+  //const T* __restrict__ mysendbuff = sendbuff1; //sendbuffs[selfRank];
+  //T* __restrict__ myrecvbuff = recvbuff1; //recvbuffs[selfRank];
   //const T* __restrict__ mysendbuff = sendbuff.localPtr();
   //T* __restrict__ myrecvbuff = recvbuff.localPtr();
 
-  copyFromSrcToDest<T>(
-      mysendbuff, ipcbuffs[selfRank], idxStart, copyCount, idxStride);
+  //copyFromSrcToDest<T>(
+  //    mysendbuff, ipcbuffs[selfRank], idxStart, copyCount, idxStride);
 
   barrier.syncOnSameBlockIdx<
-      true /* hasPreviousMemAccess */,
+      false /* hasPreviousMemAccess */,
       true /* hasSubsequentMemAccess */>();
 
   //bool inPlace = (sendbuff == recvbuff);
   static_assert(sizeof(T) == 1);
+  bool useRead = true;
 
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
 #pragma unroll NRANKS
@@ -96,8 +97,19 @@ __launch_bounds__(512)
       int srcRank = r;
       int srcIdx = idx + selfRank * idxEnd;
       int destIdx = idx + r * idxEnd;
-      *reinterpret_cast<uint4*>(&myrecvbuff[destIdx]) =
-          reinterpret_cast<const uint4*>(&ipcbuffs[srcRank][srcIdx])[0];
+      //read
+      if (useRead) {
+        *reinterpret_cast<uint4*>(&recvbuff1[destIdx]) =
+            *reinterpret_cast<const uint4*>(&sendbuffs[r][srcIdx]);
+
+          //reinterpret_cast<const uint4*>(&ipcbuffs[srcRank][srcIdx])[0];
+      }
+      else {
+        //write
+        *reinterpret_cast<uint4*>(&recvbuffs[r][srcIdx]) =
+	    *reinterpret_cast<const uint4*>(&sendbuff1[destIdx]);
+      }
+      
     }
   }
   // barrier to ensure remote ranks won't free their buffers until I'm done
