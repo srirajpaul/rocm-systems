@@ -32,6 +32,7 @@ set(SRC_FILES
   dda_reduce_scatter_ipc.cu
   dda_all_gather_ipc.cu
   dda_alltoall_ipc.cu
+  dda_alltoallv_ipc.cu
   device_buffer.cc
   enqueue.cc
   group.cc
@@ -103,6 +104,7 @@ set(SRC_FILES
   include/algorithms/reduce_scatter/reduce_scatter_dda.h
   include/algorithms/all_gather/all_gather_dda.h
   include/algorithms/alltoall/alltoall_dda.h
+  include/algorithms/alltoallv/alltoallv_dda.h
   include/alt_rsmi.h
   include/archinfo.h
   include/api_trace.h
@@ -128,6 +130,7 @@ set(SRC_FILES
   include/dda_reduce_scatter_ipc.h
   include/dda_all_gather_ipc.h
   include/dda_alltoall_ipc.h
+  include/dda_alltoallv_ipc.h
   include/debug.h
   include/dev_runtime.h
   include/device.h
@@ -665,7 +668,8 @@ if(ENABLE_DEVICE_LINKER)
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_reduce_scatter_ipc\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_all_gather_ipc\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_alltoall_ipc\\.cu\\.cpp$")
-  message(STATUS "Device Linker: filtered HIP_SOURCES (removed device .cpp under gensrc/ + subdirs, common.cu, onerank.cu, collectives.cc, dda_all_reduce_ipc.cu.cpp, dda_reduce_scatter_ipc.cu.cpp, dda_all_gather_ipc.cu.cpp, dda_alltoall_ipc.cu.cpp)")
+  list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_alltoallv_ipc\\.cu\\.cpp$")
+  message(STATUS "Device Linker: filtered HIP_SOURCES (removed device .cpp under gensrc/ + subdirs, common.cu, onerank.cu, collectives.cc, dda_all_reduce_ipc.cu.cpp, dda_reduce_scatter_ipc.cu.cpp, dda_all_gather_ipc.cu.cpp, dda_alltoall_ipc.cu.cpp, dda_alltoallv_ipc.cu.cpp)")
 endif()
 
 # Create an initial git_version.cpp file (that will be updated with latest git version)

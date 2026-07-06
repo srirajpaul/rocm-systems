@@ -8,9 +8,13 @@
 
 #include "dda_all_gather_ipc.h"
 #include "dda_alltoall_ipc.h"
+#include "dda_alltoallv_ipc.h"
 #include "dda_reduce_scatter_ipc.h"
 #include "gtest/gtest.h"
 #include "ipc_init_detail.h"
+
+#include <array>
+#include <cstddef>
 
 namespace RcclUnitTesting
 {
@@ -21,6 +25,20 @@ protected:
     DdaIpcMockComm mockComm_;
     void*          sendbuff_{reinterpret_cast<void*>(0x10)};
     void*          recvbuff_{reinterpret_cast<void*>(0x20)};
+
+    // Uniform count/displacement vectors for alltoallv tests.
+    std::array<size_t, nccl_dda_ipc_detail::kDdaNranks> counts_{};
+    std::array<size_t, nccl_dda_ipc_detail::kDdaNranks> displs_{};
+
+    void SetUp() override
+    {
+        const size_t n = nccl_dda_ipc_detail::kDdaNranks;
+        for (size_t i = 0; i < n; ++i)
+        {
+            counts_[i] = 4;
+            displs_[i] = i * 4;
+        }
+    }
 };
 
 TEST_F(DdaIpcEligibilityTest, AllGather_NullComm)
@@ -124,6 +142,116 @@ TEST_F(DdaIpcEligibilityTest, AllToAll_InvalidDatatypeDispatch)
 {
     EXPECT_EQ(ncclAllToAllDdaIpc(
                   sendbuff_, recvbuff_, 4, ncclInt32, mockComm_.get(), nullptr),
+              ncclInvalidArgument);
+}
+
+TEST_F(DdaIpcEligibilityTest, AllToAllv_EligibleFloat32)
+{
+    EXPECT_TRUE(ncclAllToAllvDdaIpcEligible(mockComm_.get(),
+                                            sendbuff_,
+                                            counts_.data(),
+                                            displs_.data(),
+                                            recvbuff_,
+                                            counts_.data(),
+                                            displs_.data(),
+                                            ncclFloat32));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllToAllv_NullComm)
+{
+    EXPECT_FALSE(ncclAllToAllvDdaIpcEligible(nullptr,
+                                             sendbuff_,
+                                             counts_.data(),
+                                             displs_.data(),
+                                             recvbuff_,
+                                             counts_.data(),
+                                             displs_.data(),
+                                             ncclFloat32));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllToAllv_MissingIpcResources)
+{
+    mockComm_.setIpcResourcesPresent(false);
+    EXPECT_FALSE(ncclAllToAllvDdaIpcEligible(mockComm_.get(),
+                                             sendbuff_,
+                                             counts_.data(),
+                                             displs_.data(),
+                                             recvbuff_,
+                                             counts_.data(),
+                                             displs_.data(),
+                                             ncclFloat32));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllToAllv_MultiNode)
+{
+    mockComm_.comm.nNodes = 2;
+    EXPECT_FALSE(ncclAllToAllvDdaIpcEligible(mockComm_.get(),
+                                             sendbuff_,
+                                             counts_.data(),
+                                             displs_.data(),
+                                             recvbuff_,
+                                             counts_.data(),
+                                             displs_.data(),
+                                             ncclFloat32));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllToAllv_WrongRankCount)
+{
+    mockComm_.comm.nRanks = 4;
+    EXPECT_FALSE(ncclAllToAllvDdaIpcEligible(mockComm_.get(),
+                                             sendbuff_,
+                                             counts_.data(),
+                                             displs_.data(),
+                                             recvbuff_,
+                                             counts_.data(),
+                                             displs_.data(),
+                                             ncclFloat32));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllToAllv_UnsupportedDatatype)
+{
+    EXPECT_FALSE(ncclAllToAllvDdaIpcEligible(mockComm_.get(),
+                                             sendbuff_,
+                                             counts_.data(),
+                                             displs_.data(),
+                                             recvbuff_,
+                                             counts_.data(),
+                                             displs_.data(),
+                                             ncclInt32));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllToAllv_InvalidDatatypeDispatch)
+{
+    EXPECT_EQ(ncclAllToAllvDdaIpc(sendbuff_,
+                                  counts_.data(),
+                                  displs_.data(),
+                                  recvbuff_,
+                                  counts_.data(),
+                                  displs_.data(),
+                                  ncclInt32,
+                                  mockComm_.get(),
+                                  nullptr),
+              ncclInvalidArgument);
+}
+
+TEST_F(DdaIpcEligibilityTest, AllToAllv_ChunkExceedsSlotDispatch)
+{
+    // One send chunk larger than a scratch slot (ddaIpcScratchBytes / nRanks)
+    // must be rejected before any kernel launch.
+    const size_t slotElems =
+        mockComm_.comm.ddaIpcScratchBytes /
+        nccl_dda_ipc_detail::kDdaNranks / sizeof(float);
+    auto oversized = counts_;
+    oversized[0]   = slotElems + 4;
+    EXPECT_EQ(ncclAllToAllvDdaIpc(sendbuff_,
+                                  oversized.data(),
+                                  displs_.data(),
+                                  recvbuff_,
+                                  counts_.data(),
+                                  displs_.data(),
+                                  ncclFloat32,
+                                  mockComm_.get(),
+                                  nullptr),
               ncclInvalidArgument);
 }
 

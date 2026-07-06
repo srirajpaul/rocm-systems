@@ -17,6 +17,7 @@
 #include "dda_reduce_scatter_ipc.h"
 #include "dda_all_gather_ipc.h"
 #include "dda_alltoall_ipc.h"
+#include "dda_alltoallv_ipc.h"
 #include "sym_kernels.h"
 
 #ifdef ENABLE_ROCSHMEM
@@ -276,6 +277,12 @@ ncclResult_t ncclAllGather_impl(const void* sendbuff, void* recvbuff, size_t sen
 
 RCCL_PARAM(AlltoAllPivotEnable, "ALL_TO_ALL_PIVOT_ENABLE", 0);
 
+// The DDA alltoallv fast path is opt-in: unlike alltoall its per-rank counts are
+// irregular, so it is only safe when every rank agrees to take it (the decision
+// is made purely from globally-identical comm config) and every per-peer chunk
+// fits in one scratch slot (ddaIpcScratchBytes / nRanks bytes).
+RCCL_PARAM(DdaAlltoallvEnable, "DDA_ALLTOALLV_ENABLE", 0);
+
 NCCL_API(ncclResult_t, ncclAlltoAll, const void* sendbuff, void* recvbuff, size_t count,
     ncclDataType_t datatype, ncclComm* comm, cudaStream_t stream);
 ncclResult_t ncclAlltoAll_impl(const void* sendbuff, void* recvbuff, size_t count,
@@ -393,6 +400,25 @@ ncclResult_t ncclAlltoAllv_impl(const void *sendbuff, const size_t sendcounts[],
         return ret;
     }
 #endif
+
+  // DDA IPC fast path (single node, 8 GPUs, one process per GPU). Gated on
+  // globally-identical comm config only so every rank makes the same choice.
+  if (rcclParamDdaAlltoallvEnable() &&
+      rcclDdaEnabled(comm, 0, 4194304) &&
+      ncclAllToAllvDdaIpcEligible(
+          comm, sendbuff, sendcounts, sdispls, recvbuff, recvcounts, rdispls, datatype)) {
+    NCCLCHECK(ncclAllToAllvDdaIpc(
+        sendbuff,
+        sendcounts,
+        sdispls,
+        recvbuff,
+        recvcounts,
+        rdispls,
+        datatype,
+        comm,
+        stream));
+    return ncclSuccess;
+  }
 
   Recorder::instance().skip(true);
   NCCLCHECK(ncclGroupStart());
