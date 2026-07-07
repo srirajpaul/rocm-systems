@@ -92,7 +92,7 @@ ncclResult_t ncclAllToAllvDdaIpc(
   // a given peer must fit in one slot.
   const size_t slotStride = comm->ddaIpcScratchBytes / kDdaNranks;
 
-  meta::comms::DdaAllToAllvArgs<kDdaNranks> args{};
+  std::array<size_t, kDdaNranks> sendcounts_arr, sdispls_arr, recvcounts_arr, rdispls_arr;
   for (int i = 0; i < kDdaNranks; ++i) {
     const size_t sBytes = sendcounts[i] * typeSize;
     const size_t rBytes = recvcounts[i] * typeSize;
@@ -105,10 +105,10 @@ ncclResult_t ncclAllToAllvDdaIpc(
           slotStride);
       return ncclInvalidArgument;
     }
-    args.sendcounts[i] = sBytes;
-    args.sdispls[i] = sdispls[i] * typeSize;
-    args.recvcounts[i] = rBytes;
-    args.rdispls[i] = rdispls[i] * typeSize;
+    sendcounts_arr[i] = sBytes;
+    sdispls_arr[i] = sdispls[i] * typeSize;
+    recvcounts_arr[i] = rBytes;
+    rdispls_arr[i] = rdispls[i] * typeSize;
   }
 
   auto* barrierState =
@@ -126,11 +126,14 @@ ncclResult_t ncclAllToAllvDdaIpc(
 
   meta::comms::ddaAllToAllvIpc<int8_t, kDdaNranks><<<grid, block, 0, stream>>>(
       d_ipcbuffs,
-      static_cast<int8_t*>(recvbuff),
       static_cast<const int8_t*>(sendbuff),
+      sendcounts_arr,
+      sdispls_arr,
+      static_cast<int8_t*>(recvbuff),
+      recvcounts_arr,
+      rdispls_arr,
       comm->rank,
       slotStride,
-      args,
       barrierHost);
   CUDACHECK(cudaGetLastError());
 

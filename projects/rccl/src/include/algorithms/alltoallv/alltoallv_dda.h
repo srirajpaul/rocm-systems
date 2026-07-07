@@ -18,17 +18,6 @@
 
 namespace meta::comms {
 
-// Per-call layout description passed by value into the kernel.
-// All quantities are expressed in *bytes* (the kernel operates on int8_t so it
-// is datatype agnostic). Arrays are indexed by peer rank.
-template <int NRANKS>
-struct DdaAllToAllvArgs {
-  size_t sendcounts[NRANKS]; // bytes this rank sends to peer d
-  size_t sdispls[NRANKS];    // byte offset into sendbuff of the chunk for d
-  size_t recvcounts[NRANKS]; // bytes this rank receives from peer r
-  size_t rdispls[NRANKS];    // byte offset into recvbuff of the chunk from r
-};
-
 // Copy nbytes from src to dst using every thread in the grid. A 16-byte
 // (uint4) fast path is used when both pointers are 16-byte aligned; otherwise a
 // byte-wise copy is used so arbitrary displacements/counts are handled safely.
@@ -75,41 +64,45 @@ __launch_bounds__(512)
 #endif
     __global__ void ddaAllToAllvIpc(
         T* const* __restrict__ ipcbuffs,
-        T* __restrict__ recvbuff,
         const T* __restrict__ sendbuff,
+        const std::array<size_t, NRANKS> sendcounts,
+        const std::array<size_t, NRANKS> sdispls,
+        T* __restrict__ recvbuff,
+        const std::array<size_t, NRANKS> recvcounts,
+        const std::array<size_t, NRANKS> rdispls,
         int selfRank,
         size_t slotStride,
-        DdaAllToAllvArgs<NRANKS> args,
         IpcGpuBarrier barrier) {
-  const size_t gtIdx = static_cast<size_t>(blockDim.x) * blockIdx.x + threadIdx.x;
-  const size_t nThreads = static_cast<size_t>(gridDim.x) * blockDim.x;
+  // use uint4 to do 16-byte loads to maximize memory efficiency
+  // We assume that count % countPerThread == 0. This assumption is enforced
+  // before kernel launch
+  // TODO: we should be able to deal with left over as well
+  const size_t count = sendcounts[0];
+  const size_t countPerRank = count;
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
 
-  // Phase 1: scatter local send chunks into this rank's own scratch slots.
-  T* myscratch = ipcbuffs[selfRank];
-#pragma unroll
-  for (int d = 0; d < NRANKS; ++d) {
-    ddaCopyLinear<T>(
-        &myscratch[static_cast<size_t>(d) * slotStride],
-        &sendbuff[args.sdispls[d]],
-        args.sendcounts[d],
-        gtIdx,
-        nThreads);
-  }
+  const auto idxStart = gtIdx * countPerThread;
+  const auto idxEnd = countPerRank;
+  const size_t copyCount = count * NRANKS;
+  const auto idxStride = gridDim.x * blockDim.x * countPerThread;
+
+  copyFromSrcToDest<T>(
+      sendbuff, ipcbuffs[selfRank], idxStart, copyCount, idxStride);
 
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,
       true /* hasSubsequentMemAccess */>();
 
-  // Phase 2: gather from every peer's slot that targets this rank.
-  const size_t selfSlotOff = static_cast<size_t>(selfRank) * slotStride;
-#pragma unroll
-  for (int r = 0; r < NRANKS; ++r) {
-    ddaCopyLinear<T>(
-        &recvbuff[args.rdispls[r]],
-        &ipcbuffs[r][selfSlotOff],
-        args.recvcounts[r],
-        gtIdx,
-        nThreads);
+    for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+#pragma unroll NRANKS
+    for (int r = 0; r < NRANKS; ++r) {
+      int srcRank = r;
+      int srcIdx = idx + selfRank * idxEnd;
+      int destIdx = idx + r * idxEnd;
+      *reinterpret_cast<uint4*>(&recvbuff[destIdx]) =
+          reinterpret_cast<const uint4*>(&ipcbuffs[srcRank][srcIdx])[0];
+    }
   }
 
   // barrier to ensure remote ranks won't free/reuse their buffers until I'm done
