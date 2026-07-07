@@ -79,7 +79,7 @@ __launch_bounds__(512)
   // TODO: we should be able to deal with left over as well
   const size_t count = sendcounts[0];
   const size_t countPerRank = count;
-  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  constexpr auto countPerThread = 1; //sizeof(uint4) / sizeof(T);
   const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
 
   const auto idxStart = gtIdx * countPerThread;
@@ -87,22 +87,30 @@ __launch_bounds__(512)
   const size_t copyCount = count * NRANKS;
   const auto idxStride = gridDim.x * blockDim.x * countPerThread;
 
-  copyFromSrcToDest<T>(
-      sendbuff, ipcbuffs[selfRank], idxStart, copyCount, idxStride);
+  //copyFromSrcToDest<T>(
+  //    sendbuff, ipcbuffs[selfRank], idxStart, copyCount, idxStride);
+#pragma unroll NRANKS
+  for (int r = 0; r < NRANKS; ++r) {
+      copyFromSrcToDest1<T>(
+          sendbuff + sdispls[r], ipcbuffs[selfRank] + r * slotStride, idxStart, sendcounts[r], idxStride);
+  }
 
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,
       true /* hasSubsequentMemAccess */>();
 
-    for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
 #pragma unroll NRANKS
-    for (int r = 0; r < NRANKS; ++r) {
-      int srcRank = r;
-      int srcIdx = idx + selfRank * idxEnd;
-      int destIdx = idx + r * idxEnd;
-      *reinterpret_cast<uint4*>(&recvbuff[destIdx]) =
-          reinterpret_cast<const uint4*>(&ipcbuffs[srcRank][srcIdx])[0];
-    }
+  for (int r = 0; r < NRANKS; ++r) {
+      copyFromSrcToDest1<T>(
+          ipcbuffs[r] + selfRank * slotStride, recvbuff + rdispls[r], idxStart, recvcounts[r], idxStride);
+
+    //for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    //  int srcRank = r;
+    //  int srcIdx = idx + selfRank * idxEnd;
+    //  int destIdx = idx + r * idxEnd;
+    //  *reinterpret_cast<uint4*>(&recvbuff[destIdx]) =
+    //      reinterpret_cast<const uint4*>(&ipcbuffs[srcRank][srcIdx])[0];
+    //}
   }
 
   // barrier to ensure remote ranks won't free/reuse their buffers until I'm done

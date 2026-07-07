@@ -91,6 +91,20 @@ static inline __device__ uint4 vecElementAdd(const uint4& a, const uint4& b) {
 }
 
 template <typename T>
+static inline __device__ void copyFromSrcToDest1(
+    const T* __restrict__ srcbuff,
+    T* __restrict__ destbuff,
+    const size_t idxStart,
+    const size_t idxEnd,
+    const size_t idxStride) {
+  static_assert(is_supported_type_v<T>, "dda: unsupported element type");
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    *reinterpret_cast<T*>(&destbuff[idx]) =
+        reinterpret_cast<const T*>(&srcbuff[idx])[0];
+  }
+}
+
+template <typename T>
 static inline __device__ void copyFromSrcToDest(
     const T* __restrict__ srcbuff,
     T* __restrict__ destbuff,
