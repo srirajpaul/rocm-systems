@@ -42,7 +42,8 @@ __global__ void ddaReduceScatterFabric(
 
   barrier.syncOnSameBlockIdx<
       false /* hasPreviousMemAccess */,
-      true /* hasSubsequentMemAccess */>();
+      true /* hasSubsequentMemAccess */,
+      false >();
 
   constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
   const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
@@ -56,7 +57,8 @@ __global__ void ddaReduceScatterFabric(
 
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,
-      false /* hasSubsequentMemAccess */>();
+      false /* hasSubsequentMemAccess */,
+      false >();
 }
 
 } // namespace meta::comms

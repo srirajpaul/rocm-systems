@@ -54,7 +54,8 @@ __global__ void ddaAllToAllFabric(
 
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,
-      true /* hasSubsequentMemAccess */>();
+      true /* hasSubsequentMemAccess */,
+      false >();
 
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
 #pragma unroll kUnroll
@@ -70,7 +71,8 @@ __global__ void ddaAllToAllFabric(
   // barrier to ensure remote ranks won't free their buffers until I'm done
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,
-      false /* hasSubsequentMemAccess */>();
+      false /* hasSubsequentMemAccess */,
+      false >();
 }
 
 } // namespace meta::comms

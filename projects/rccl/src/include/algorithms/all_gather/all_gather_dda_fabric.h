@@ -50,7 +50,8 @@ __global__ void ddaAllGatherFabric(
 
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,
-      true /* hasSubsequentMemAccess */>();
+      true /* hasSubsequentMemAccess */,
+      false >();
 
   allGather<T, NRANKS_CT>(
       ipcbuffs, recvbuff, selfRank, nRanks, idxStart, idxEnd, idxStride, false);
@@ -58,7 +59,8 @@ __global__ void ddaAllGatherFabric(
   // barrier to ensure remote ranks won't free their buffers until I'm done
   barrier.syncOnSameBlockIdx<
       true /* hasPreviousMemAccess */,
-      false /* hasSubsequentMemAccess */>();
+      false /* hasSubsequentMemAccess */,
+      false >();
 }
 
 } // namespace meta::comms

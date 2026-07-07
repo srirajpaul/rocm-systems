@@ -96,14 +96,14 @@ static ncclResult_t ncclAllReduceDdaFabricTyped(
     switch (nRanks) {
     case 4:
       INFO(NCCL_COLL, "DDA fabric AllReduce: tree path, NRANKS_CT=4 (unrolled)");
-      meta::comms::ddaAllReduceTreeFabric<T, 4, false><<<grid, block, 0, stream>>>(
+      meta::comms::ddaAllReduceTreeFabricWrite<T, 4, false><<<grid, block, 0, stream>>>(
           d_ipcbuffs, static_cast<T*>(recvbuff), count,
           static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost,
           nullptr);
       break;
     case 8:
       INFO(NCCL_COLL, "DDA fabric AllReduce: tree path, NRANKS_CT=8 (unrolled)");
-      meta::comms::ddaAllReduceTreeFabric<T, 8, false><<<grid, block, 0, stream>>>(
+      meta::comms::ddaAllReduceTreeFabricWrite<T, 8, false><<<grid, block, 0, stream>>>(
           d_ipcbuffs, static_cast<T*>(recvbuff), count,
           static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost,
           nullptr);
@@ -112,7 +112,7 @@ static ncclResult_t ncclAllReduceDdaFabricTyped(
       INFO(NCCL_COLL,
            "DDA fabric AllReduce: tree path, NRANKS_CT=0 (runtime, nRanks=%d)",
            nRanks);
-      meta::comms::ddaAllReduceTreeFabric<T, 0, false><<<grid, block, 0, stream>>>(
+      meta::comms::ddaAllReduceTreeFabricWrite<T, 0, false><<<grid, block, 0, stream>>>(
           d_ipcbuffs, static_cast<T*>(recvbuff), count,
           static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost,
           nullptr);
@@ -122,14 +122,14 @@ static ncclResult_t ncclAllReduceDdaFabricTyped(
     switch (nRanks) {
     case 4:
       INFO(NCCL_COLL, "DDA fabric AllReduce: flat path, NRANKS_CT=4 (unrolled)");
-      meta::comms::ddaAllReduceFlatFabric<T, 4, false><<<grid, block, 0, stream>>>(
+      meta::comms::ddaAllReduceFlatFabricWrite<T, 4, false><<<grid, block, 0, stream>>>(
           d_ipcbuffs, static_cast<T*>(recvbuff), count,
           static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost,
           nullptr);
       break;
     case 8:
       INFO(NCCL_COLL, "DDA fabric AllReduce: flat path, NRANKS_CT=8 (unrolled)");
-      meta::comms::ddaAllReduceFlatFabric<T, 8, false><<<grid, block, 0, stream>>>(
+      meta::comms::ddaAllReduceFlatFabricWrite<T, 8, false><<<grid, block, 0, stream>>>(
           d_ipcbuffs, static_cast<T*>(recvbuff), count,
           static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost,
           nullptr);
@@ -138,7 +138,7 @@ static ncclResult_t ncclAllReduceDdaFabricTyped(
       INFO(NCCL_COLL,
            "DDA fabric AllReduce: flat path, NRANKS_CT=0 (runtime, nRanks=%d)",
            nRanks);
-      meta::comms::ddaAllReduceFlatFabric<T, 0, false><<<grid, block, 0, stream>>>(
+      meta::comms::ddaAllReduceFlatFabricWrite<T, 0, false><<<grid, block, 0, stream>>>(
           d_ipcbuffs, static_cast<T*>(recvbuff), count,
           static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost,
           nullptr);

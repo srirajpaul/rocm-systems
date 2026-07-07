@@ -51,7 +51,7 @@ class FabricGpuBarrier {
           void* bootstrap,
           struct ncclMemManager* manager);
 
-  template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess>
+  template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess, bool isWrite>
   __device__ __forceinline__ void syncOnSameBlockIdx() {
     enum class MemFenceType {
       RELEASE_ACQUIRE,
@@ -69,6 +69,8 @@ class FabricGpuBarrier {
 
     if constexpr (hasPreviousMemAccess) {
       __syncthreads();
+      if (isWrite)
+	__threadfence();
     }
     // Each thread handles one or more peers in a strided loop so the barrier
     // stays correct when blockDim.x < nRanks_. A small count can launch as few
