@@ -77,22 +77,20 @@ __launch_bounds__(512)
   // We assume that count % countPerThread == 0. This assumption is enforced
   // before kernel launch
   // TODO: we should be able to deal with left over as well
-  const size_t count = sendcounts[0];
-  const size_t countPerRank = count;
-  constexpr auto countPerThread = 1; //sizeof(uint4) / sizeof(T);
+  constexpr auto countPerThread = 1; // sizeof(uint4) / sizeof(T);
   const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
 
   const auto idxStart = gtIdx * countPerThread;
-  const auto idxEnd = countPerRank;
-  const size_t copyCount = count * NRANKS;
   const auto idxStride = gridDim.x * blockDim.x * countPerThread;
 
-  //copyFromSrcToDest<T>(
-  //    sendbuff, ipcbuffs[selfRank], idxStart, copyCount, idxStride);
 #pragma unroll NRANKS
   for (int r = 0; r < NRANKS; ++r) {
-      copyFromSrcToDest1<T>(
-          sendbuff + sdispls[r], ipcbuffs[selfRank] + r * slotStride, idxStart, sendcounts[r], idxStride);
+      const auto idxEnd = sendcounts[r];
+      T* ipcbuff = ipcbuffs[selfRank] + r * slotStride;
+      const T* sendbuff_displ = sendbuff + sdispls[r];
+      for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+          ipcbuff[idx] = sendbuff_displ[idx];
+      }
   }
 
   barrier.syncOnSameBlockIdx<
@@ -101,8 +99,12 @@ __launch_bounds__(512)
 
 #pragma unroll NRANKS
   for (int r = 0; r < NRANKS; ++r) {
-      copyFromSrcToDest1<T>(
-          ipcbuffs[r] + selfRank * slotStride, recvbuff + rdispls[r], idxStart, recvcounts[r], idxStride);
+      const auto idxEnd = recvcounts[r];
+      T* ipcbuff = ipcbuffs[r] + selfRank * slotStride;
+      T* recvbuff_displ = recvbuff + rdispls[r];
+      for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+          recvbuff_displ[idx] = ipcbuff[idx];
+      }
 
     //for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
     //  int srcRank = r;
