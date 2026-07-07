@@ -96,4 +96,46 @@ __global__ void ddaAllReduceTreeIpc(
       false /* hasSubsequentMemAccess */>();
 }
 
+template <typename T, int NRANKS, bool hasAcc>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+__global__ void ddaAllReduceFlatIpcWrite(
+    T* const* __restrict__ ipcbuffs,
+    T* __restrict__ recvbuff,
+    size_t count,
+    const T* __restrict__ sendbuff,
+    int selfRank,
+    IpcGpuBarrier barrier,
+    const T* __restrict__ acc) {
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
+
+  const auto idxStart = gtIdx * countPerThread;
+  const auto idxEnd = count;
+  const auto idxStride = gridDim.x * blockDim.x * countPerThread;
+
+  for (int r = 0; r < NRANKS; r++) {
+    copyFromSrcToDest<T>(
+        sendbuff,
+        ipcbuffs[r] + selfRank * count,
+        idxStart,
+        idxEnd,
+        idxStride);
+  }
+
+  __threadfence();
+
+  barrier.syncOnSameBlockIdx<
+      true /* hasPreviousMemAccess */,
+      true /* hasSubsequentMemAccess */>();
+
+  localReduce<T, NRANKS, hasAcc>(
+      ipcbuffs[selfRank], recvbuff, acc, idxStart, idxEnd, idxStride);
+
+  barrier.syncOnSameBlockIdx<
+      true /* hasPreviousMemAccess */,
+      false /* hasSubsequentMemAccess */>();
+}
+
 } // namespace meta::comms

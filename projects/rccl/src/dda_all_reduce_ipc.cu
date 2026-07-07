@@ -23,6 +23,11 @@
 
 namespace {
 
+#define READ 0
+#define WRITE 1
+
+RCCL_PARAM(DdaAllreduceFlatMode, "DDA_ALLREDUCE_FLAT_MODE", READ);
+
 using nccl_dda_detail::DdaIpcBarrierState;
 using nccl_dda_detail::ddaMaxNBlocksForScratch;
 using nccl_dda_detail::kDdaNranks;
@@ -95,8 +100,9 @@ static ncclResult_t ncclAllReduceDdaIpcTyped(
             barrierHost,
             nullptr);
   } else {
-    meta::comms::ddaAllReduceFlatIpc<T, kDdaNranks, false>
-        <<<grid, block, 0, stream>>>(
+    if (rcclParamDdaAllreduceFlatMode() == READ) {
+      meta::comms::ddaAllReduceFlatIpc<T, kDdaNranks, false>
+          <<<grid, block, 0, stream>>>(
             d_ipcbuffs,
             static_cast<T*>(recvbuff),
             count,
@@ -104,6 +110,19 @@ static ncclResult_t ncclAllReduceDdaIpcTyped(
             comm->rank,
             barrierHost,
             nullptr);
+    }
+    else {
+      meta::comms::ddaAllReduceFlatIpcWrite<T, kDdaNranks, false>
+          <<<grid, block, 0, stream>>>(
+            d_ipcbuffs,
+            static_cast<T*>(recvbuff),
+            count,
+            static_cast<const T*>(sendbuff),
+            comm->rank,
+            barrierHost,
+            nullptr);
+
+    }
   }
 
   CUDACHECK(cudaGetLastError());
