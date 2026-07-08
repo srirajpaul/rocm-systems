@@ -77,6 +77,9 @@ __global__ void ddaAllReduceFlatLL(
 
   // Phase 1: publish my payload into every peer's slot[selfRank].
   for (size_t pk = gtid; pk < nPk; pk += stride) {
+    const uint32_t d0 = in[2 * pk];
+    const uint32_t d1 = in[2 * pk + 1];
+
     #pragma unroll
     for (int r = 1; r < nRanks; ++r) {
         const int peer = (selfRank + r) % nRanks;
@@ -84,7 +87,7 @@ __global__ void ddaAllReduceFlatLL(
             bankOffsetPkts + (size_t)selfRank * slot;
         ddaLLStoreLineB128(
             reinterpret_cast<uint32_t*>(&dst[pk]),
-            in[2 * pk], flag, in[2 * pk + 1], flag);
+            d0, flag, d1, flag);
     }
   }
 
@@ -94,11 +97,9 @@ __global__ void ddaAllReduceFlatLL(
   for (size_t pk = gtid; pk < nPk; pk += stride) {
     uint32_t acc0 = in[2 * pk];
     uint32_t acc1 = in[2 * pk + 1];
-    for (int r = 0; r < nRanks; ++r) {
-      if (r == selfRank) {
-        continue;
-      }
-      volatile LLPacket16* src = myBase + (size_t)r * slot;
+    for (int r = 1; r < nRanks; ++r) {
+      const int peer = (selfRank + r) % nRanks;
+      volatile LLPacket16* src = myBase + (size_t)peer * slot;
       uint32_t d0, f0, d1, f1;
       do {
         ddaLLLoadLineB128(
