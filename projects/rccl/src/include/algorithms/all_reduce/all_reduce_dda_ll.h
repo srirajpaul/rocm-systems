@@ -72,29 +72,28 @@ __global__ void ddaAllReduceFlatLL(
   const size_t gtid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = (size_t)gridDim.x * blockDim.x;
 
-  const uint32_t* sw = reinterpret_cast<const uint32_t*>(sendbuff);
+  const uint32_t* in = reinterpret_cast<const uint32_t*>(sendbuff);
+  uint32_t* out = reinterpret_cast<uint32_t*>(recvbuff);
 
   // Phase 1: publish my payload into every peer's slot[selfRank].
-  for (int peer = 0; peer < nRanks; ++peer) {
-    if (peer == selfRank) {
-      continue;
-    }
-    LLPacket16* dst = reinterpret_cast<LLPacket16*>(peerScratch[peer]) +
-        bankOffsetPkts + (size_t)selfRank * slot;
-    for (size_t pk = gtid; pk < nPk; pk += stride) {
-      ddaLLStoreLineB128(
-          reinterpret_cast<uint32_t*>(&dst[pk]),
-          sw[2 * pk], flag, sw[2 * pk + 1], flag);
+  for (size_t pk = gtid; pk < nPk; pk += stride) {
+    #pragma unroll
+    for (int r = 1; r < nRanks; ++r) {
+        const int peer = (selfRank + r) % nRanks;
+        LLPacket16* dst = reinterpret_cast<LLPacket16*>(peerScratch[peer]) +
+            bankOffsetPkts + (size_t)selfRank * slot;
+        ddaLLStoreLineB128(
+            reinterpret_cast<uint32_t*>(&dst[pk]),
+            in[2 * pk], flag, in[2 * pk + 1], flag);
     }
   }
 
   // Phase 2: poll my slots for the other ranks, reduce with my own data.
   LLPacket16* myBase =
       reinterpret_cast<LLPacket16*>(peerScratch[selfRank]) + bankOffsetPkts;
-  uint32_t* out = reinterpret_cast<uint32_t*>(recvbuff);
   for (size_t pk = gtid; pk < nPk; pk += stride) {
-    uint32_t acc0 = sw[2 * pk];
-    uint32_t acc1 = sw[2 * pk + 1];
+    uint32_t acc0 = in[2 * pk];
+    uint32_t acc1 = in[2 * pk + 1];
     for (int r = 0; r < nRanks; ++r) {
       if (r == selfRank) {
         continue;
