@@ -8,6 +8,7 @@
 
 #include "algorithms/CollCommon.h"
 #include "algorithms/all_reduce/all_reduce_dda.h"
+#include "algorithms/all_reduce/all_reduce_dda_ll.h"
 #include "checks.h"
 #include "comm.h"
 #include "debug.h"
@@ -23,10 +24,8 @@
 
 namespace {
 
-#define READ 0
-#define WRITE 1
-
-RCCL_PARAM(DdaAllreduceFlatMode, "DDA_ALLREDUCE_FLAT_MODE", READ);
+RCCL_PARAM(DdaAllreduceFlatModeWrite, "DDA_ALLREDUCE_FLAT_MODE_WRITE", 0);
+RCCL_PARAM(DdaAllreduceFlatModeLL, "DDA_ALLREDUCE_FLAT_MODE_LL", 0);
 
 using nccl_dda_detail::DdaIpcBarrierState;
 using nccl_dda_detail::ddaMaxNBlocksForScratch;
@@ -100,7 +99,7 @@ static ncclResult_t ncclAllReduceDdaIpcTyped(
             barrierHost,
             nullptr);
   } else {
-    if (rcclParamDdaAllreduceFlatMode() == READ) {
+    if (rcclParamDdaAllreduceFlatModeWrite() == 0) {
       meta::comms::ddaAllReduceFlatIpc<T, kDdaNranks, false>
           <<<grid, block, 0, stream>>>(
             d_ipcbuffs,
@@ -112,16 +111,32 @@ static ncclResult_t ncclAllReduceDdaIpcTyped(
             nullptr);
     }
     else {
-      meta::comms::ddaAllReduceFlatIpcWrite<T, kDdaNranks, false>
-          <<<grid, block, 0, stream>>>(
-            d_ipcbuffs,
-            static_cast<T*>(recvbuff),
-            count,
-            static_cast<const T*>(sendbuff),
-            comm->rank,
-            barrierHost,
-            nullptr);
-
+      if (rcclParamDdaAllreduceFlatModeLL() == 0) {
+        meta::comms::ddaAllReduceFlatIpcWrite<T, kDdaNranks, false>
+            <<<grid, block, 0, stream>>>(
+              d_ipcbuffs,
+              static_cast<T*>(recvbuff),
+              count,
+              static_cast<const T*>(sendbuff),
+              comm->rank,
+              barrierHost,
+              nullptr);
+      }
+      else {
+        static size_t counter = 0;
+        counter++;
+        meta::comms::ddaAllReduceFlatIpcLLArgs args {counter, comm->ddaScratchBytes};
+        meta::comms::ddaAllReduceFlatIpcLL<T, kDdaNranks, false>
+            <<<grid, block, 0, stream>>>(
+              d_ipcbuffs,
+              static_cast<T*>(recvbuff),
+              count,
+              static_cast<const T*>(sendbuff),
+              comm->rank,
+              barrierHost,
+              args,
+              nullptr);
+      }
     }
   }
 

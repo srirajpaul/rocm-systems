@@ -111,6 +111,7 @@ set(SRC_FILES
   include/algorithms/all_gather/all_gather_dda.h
   include/algorithms/alltoall/alltoall_dda.h
   include/algorithms/all_reduce/all_reduce_dda_fabric.h
+  include/algorithms/all_reduce/all_reduce_dda_ll.h
   include/algorithms/reduce_scatter/reduce_scatter_dda_fabric.h
   include/algorithms/all_gather/all_gather_dda_fabric.h
   include/algorithms/alltoall/alltoall_dda_fabric.h

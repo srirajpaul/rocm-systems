@@ -311,4 +311,77 @@ getGridAndBlockDims(size_t count, int typeSize, size_t maxBlocks) {
   return std::make_pair(blocks, threads);
 }
 
+
+// ---------------- LL Protocol types ----------------
+
+typedef __attribute__((address_space(1))) uint64_t* u64_gptr;
+
+// 16B LL packet: 2 x (4B data + 4B flag) pairs.
+union LLPacket16 {
+    struct { uint32_t data0; uint32_t flag0; uint32_t data1; uint32_t flag1; };
+    uint4 raw;
+};
+static_assert(sizeof(LLPacket16) == 16, "LLPacket16 must be exactly 16 bytes");
+
+static constexpr size_t DATA_BYTES_PER_PACKET = 8;
+
+// ---------------- 16B store/load primitives ------------------------------------
+// Two 8B system-scope atomic ops for cross-GPU visibility.
+
+__device__ __forceinline__
+void ll_store_line(uint32_t* dst, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3) {
+    union { uint64_t u64; uint32_t u32[2]; } p0, p1;
+    p0.u32[0] = a0; p0.u32[1] = a1;
+    p1.u32[0] = a2; p1.u32[1] = a3;
+    __hip_atomic_store((u64_gptr)dst,     p0.u64, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    __hip_atomic_store((u64_gptr)dst + 1, p1.u64, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    asm volatile("" ::: "memory");
+}
+
+__device__ __forceinline__
+void ll_load_line(const uint32_t* src, uint32_t& o0, uint32_t& o1, uint32_t& o2, uint32_t& o3) {
+    asm volatile("" ::: "memory");
+    union { uint64_t u64; uint32_t u32[2]; } p0, p1;
+    p0.u64 = __hip_atomic_load((u64_gptr)src,     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    p1.u64 = __hip_atomic_load((u64_gptr)src + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    o0 = p0.u32[0]; o1 = p0.u32[1]; o2 = p1.u32[0]; o3 = p1.u32[1];
+}
+
+// ---------------- Device code (LL protocol) ----------------
+
+__device__ __forceinline__
+void ll_pack_and_write(LLPacket16* __restrict__ dst,
+                       const uint32_t* __restrict__ src,
+                       size_t num_packets,
+                       uint32_t flag_val,
+                       int lane, int stride_threads)
+{
+    for (size_t pkt = lane; pkt < num_packets; pkt += stride_threads) {
+        const uint32_t* s = src + pkt * 2;
+        ll_store_line(reinterpret_cast<uint32_t*>(&dst[pkt]),
+                      s[0], flag_val, s[1], flag_val);
+    }
+}
+
+__device__ __forceinline__
+void ll_poll_and_unpack(uint32_t* __restrict__ dst,
+                        volatile LLPacket16* __restrict__ src,
+                        size_t num_packets,
+                        uint32_t expected_flag,
+                        int lane, int stride_threads)
+{
+    for (size_t pkt = lane; pkt < num_packets; pkt += stride_threads) {
+        uint32_t d0, f0, d1, f1;
+        do {
+            ll_load_line(reinterpret_cast<const uint32_t*>(
+                             const_cast<LLPacket16*>(&src[pkt])),
+                         d0, f0, d1, f1);
+        } while (f0 != expected_flag || f1 != expected_flag);
+
+        uint32_t* d = dst + pkt * 2;
+        d[0] = d0;
+        d[1] = d1;
+    }
+}
+
 } // namespace meta::comms
