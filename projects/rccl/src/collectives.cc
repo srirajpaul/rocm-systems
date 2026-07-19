@@ -178,6 +178,10 @@ RCCL_PARAM(DdaThreshold, "DDA_THRESHOLD", (size_t)(67108864));
 // otherwise the copy-based DDA path handles the call.
 RCCL_PARAM(DdaAllReduceLL, "DDA_ALLREDUCE_LL", 1);
 RCCL_PARAM(DdaAllReduceLLThreshold, "DDA_ALLREDUCE_LL_THRESHOLD", (size_t)(131072));
+// LL128-protocol DDA all-reduce (128B line, IPC path). Opt-in; when enabled it
+// is attempted before the 16B LL path for messages <= its threshold.
+RCCL_PARAM(DdaAllReduceLL128, "DDA_ALLREDUCE_LL128", 0);
+RCCL_PARAM(DdaAllReduceLL128Threshold, "DDA_ALLREDUCE_LL128_THRESHOLD", (size_t)(1048576));
 
 // Returns true when the DDA fast path should be attempted for a collective
 // with the given total byte count.  gfx942Default is the per-collective
@@ -581,6 +585,17 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
         return ncclSuccess;
       }
     } else {
+      // LL128 fast lane (128B line, opt-in). Tried before the 16B LL path when
+      // enabled.
+      if (rcclParamDdaAllReduceLL128() &&
+          (count * ncclTypeSize(datatype)) <= (size_t)rcclParamDdaAllReduceLL128Threshold() &&
+          ncclAllReduceDdaIpcLL128Eligible(comm, sendbuff, recvbuff, count, datatype, op)) {
+        INFO(NCCL_COLL,
+             "AllReduce: taking DDA IPC LL128 path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
+             comm->nRanks, comm->nNodes, count, (int)datatype, count * ncclTypeSize(datatype));
+        NCCLCHECK(ncclAllReduceDdaIpcLL128(sendbuff, recvbuff, count, datatype, op, comm, stream));
+        return ncclSuccess;
+      }
       // Small-message fast lane: LL protocol (no GPU barrier).
       if (rcclParamDdaAllReduceLL() &&
           (count * ncclTypeSize(datatype)) <= (size_t)rcclParamDdaAllReduceLLThreshold() &&

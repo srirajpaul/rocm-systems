@@ -27,6 +27,15 @@ bool ncclAllReduceDdaIpcLLEligible(ncclComm* comm, const void* sendbuff, void* r
 ncclResult_t ncclAllReduceDdaIpcLL(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                    ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
 
+// IPC LL128-protocol path: 128B line (15 payload words + 1 flag word, 16 lanes
+// cooperative) for 93.75% staging efficiency. Reuses the codepath-agnostic
+// ddaAllReduceFlatLL128 kernel and the shared LL AR epoch array.
+bool ncclAllReduceDdaIpcLL128Eligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
+                                      ncclDataType_t datatype, ncclRedOp_t op);
+
+ncclResult_t ncclAllReduceDdaIpcLL128(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
+                                      ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
+
 // Fabric path (runtime nRanks up to kDdaMaxNranks, single- or multi-node).
 bool ncclAllReduceDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
                                     ncclDataType_t datatype, ncclRedOp_t op);
