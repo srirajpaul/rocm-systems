@@ -581,6 +581,16 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
         return ncclSuccess;
       }
     } else {
+      // Small-message fast lane: LL protocol (no GPU barrier).
+      if (rcclParamDdaAllReduceLL() &&
+          (count * ncclTypeSize(datatype)) <= (size_t)rcclParamDdaAllReduceLLThreshold() &&
+          ncclAllReduceDdaIpcLLEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
+        INFO(NCCL_COLL,
+             "AllReduce: taking DDA IPC LL path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
+             comm->nRanks, comm->nNodes, count, (int)datatype, count * ncclTypeSize(datatype));
+        NCCLCHECK(ncclAllReduceDdaIpcLL(sendbuff, recvbuff, count, datatype, op, comm, stream));
+        return ncclSuccess;
+      }
       if (ncclAllReduceDdaIpcEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
         NCCLCHECK(ncclAllReduceDdaIpc(sendbuff, recvbuff, count, datatype, op, comm, stream));
         return ncclSuccess;

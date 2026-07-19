@@ -15,8 +15,12 @@
 
 #include <cuda_runtime.h>
 
+#include <vector>
+
 using nccl_dda_detail::DdaIpcBarrierState;
 using nccl_dda_detail::ddaMaxNBlocksForScratch;
+using nccl_dda_detail::kDdaFabricLLArMaxBlocks;
+using nccl_dda_detail::kDdaLLArEpochSeed;
 using nccl_dda_detail::kDdaNranks;
 
 #define HIP_CALL(cmd) \
@@ -160,6 +164,30 @@ ncclResult_t ncclDdaIpcCommInit(ncclComm* comm) {
   comm->ddaScratchBytes = bytes;
   comm->ddaPeerPtrsDev = peerDev;
   comm->ddaIpcBarrierState = barrierState;
+
+  // Best-effort setup for the LL AllReduce fast lane (small messages). Reuses
+  // the same scratch/peer table as the copy-based IPC path. If any of this
+  // fails, LL simply stays ineligible (ddaLLArEpochDev == nullptr) and the
+  // copy-based IPC path keeps working.
+  // Zero the scratch once so the LL all-reduce's first epoch never false-matches
+  // leftover flag words; later calls rely on monotonic epochs + the 2-bank layout.
+  if (cudaMemset(scratch, 0, bytes) == cudaSuccess) {
+    uint32_t* arEpochDev = nullptr;
+    const size_t arEpochLen = (size_t)kDdaFabricLLArMaxBlocks;
+    if (cudaMalloc(&arEpochDev, arEpochLen * sizeof(uint32_t)) == cudaSuccess) {
+      // Seed to a disjoint high flag namespace (kDdaLLArEpochSeed); bumped on
+      // the device each LL AR launch, so nothing is baked into a HIP graph.
+      std::vector<uint32_t> arSeed(arEpochLen, kDdaLLArEpochSeed);
+      if (cudaMemcpy(arEpochDev, arSeed.data(), arEpochLen * sizeof(uint32_t),
+                     cudaMemcpyHostToDevice) == cudaSuccess) {
+        comm->ddaLLArEpochDev = arEpochDev;
+        comm->ddaLLArEpochLen = kDdaFabricLLArMaxBlocks;
+      } else {
+        CUDACHECKIGNORE(cudaFree(arEpochDev));
+      }
+    }
+  }
+
   INFO(NCCL_INIT, "ncclDdaIpcCommInit: scratch %zu bytes, IpcGpuBarrier nBlocks=%d, peer IPC table on device", bytes,
        nBlocksMax);
   return ncclSuccess;
@@ -175,6 +203,9 @@ ncclResult_t ncclDdaIpcCommFini(ncclComm* comm) {
   }
   CUDACHECKIGNORE(cudaFree(comm->ddaPeerPtrsDev));
   comm->ddaPeerPtrsDev = nullptr;
+  CUDACHECKIGNORE(cudaFree(comm->ddaLLArEpochDev));
+  comm->ddaLLArEpochDev = nullptr;
+  comm->ddaLLArEpochLen = 0;
   if (comm->ddaIpcMemHandler != nullptr) {
     delete comm->ddaIpcMemHandler;
     comm->ddaIpcMemHandler = nullptr;
