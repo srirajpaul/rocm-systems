@@ -11,6 +11,7 @@
 #include "ipc_gpu_barrier.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <new>
@@ -36,6 +37,13 @@ struct DdaFabricBarrierState {
   std::unique_ptr<meta::comms::FabricGpuBarrierResources> resources;
   meta::comms::FabricGpuBarrier barrierHost;
 };
+
+// The LL AllReduce tier is intentionally narrow (tiny messages, latency-bound),
+// so it uses its own small epoch array. This keeps its per-launch epoch reset
+// cheap. Its flags live in a disjoint high namespace (seeded below) so a
+// leftover flag from another tier can never false-match an LL AR flag.
+constexpr int      kDdaFabricLLArMaxBlocks = 24;
+constexpr uint32_t kDdaLLArEpochSeed       = 0x40000000u; // first LL flag = seed+1
 
 inline int ddaMaxNBlocksForScratch() {
   unsigned maxBlocks = DDA_IPC_MAXBLOCKS;

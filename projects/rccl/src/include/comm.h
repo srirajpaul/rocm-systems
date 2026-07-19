@@ -634,6 +634,11 @@ struct ncclComm {
   // True when ddaScratch is VMM (cuMem) backed (fabric path); selects the
   // matching deallocator at teardown.
   bool ddaScratchIsVmm;
+  // Dedicated device epoch array for the LL AllReduce tier (fabric path).
+  // Seeded to kDdaLLArEpochSeed and bumped on the device each LL AR launch so
+  // the per-launch flag is derived on-device (HIP graph-capture safe).
+  uint32_t* ddaLLArEpochDev;
+  int ddaLLArEpochLen;
 
   // Bitmasks for ncclTransportP2pSetup
   struct channelMasks* connectSend;

@@ -26,4 +26,11 @@ bool ncclAllReduceDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* 
 ncclResult_t ncclAllReduceDdaFabric(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                     ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
 
+// LL-protocol fabric path (small-message fast lane, flag-based sync, no barrier).
+bool ncclAllReduceDdaFabricLLEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
+                                      ncclDataType_t datatype, ncclRedOp_t op);
+
+ncclResult_t ncclAllReduceDdaFabricLL(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
+                                      ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
+
 #endif

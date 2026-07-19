@@ -173,6 +173,11 @@ static ncclResult_t rcclDirectAllGather(const void* sendbuff, void* recvbuff, si
 
 RCCL_PARAM(DdaEnable, "DDA_ENABLE", 1);
 RCCL_PARAM(DdaThreshold, "DDA_THRESHOLD", (size_t)(67108864));
+// LL-protocol DDA all-reduce (fabric path).
+// threshold: LL is attempted only when the full-message size is <= threshold,
+// otherwise the copy-based DDA path handles the call.
+RCCL_PARAM(DdaAllReduceLL, "DDA_ALLREDUCE_LL", 1);
+RCCL_PARAM(DdaAllReduceLLThreshold, "DDA_ALLREDUCE_LL_THRESHOLD", (size_t)(131072));
 
 // Returns true when the DDA fast path should be attempted for a collective
 // with the given total byte count.  gfx942Default is the per-collective
@@ -559,6 +564,16 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
 
   if (!symEligible && rcclDdaEnabled(comm, count * ncclTypeSize(datatype), 8388608)) {
     if (IsArchMatch(comm->archName, "gfx1250")) {
+      // Small-message fast lane: LL protocol (no GPU barrier).
+      if (rcclParamDdaAllReduceLL() &&
+          (count * ncclTypeSize(datatype)) <= (size_t)rcclParamDdaAllReduceLLThreshold() &&
+          ncclAllReduceDdaFabricLLEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
+        INFO(NCCL_COLL,
+             "AllReduce: taking DDA fabric LL path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
+             comm->nRanks, comm->nNodes, count, (int)datatype, count * ncclTypeSize(datatype));
+        NCCLCHECK(ncclAllReduceDdaFabricLL(sendbuff, recvbuff, count, datatype, op, comm, stream));
+        return ncclSuccess;
+      }
       if (ncclAllReduceDdaFabricEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
         INFO(NCCL_COLL, "AllReduce: taking DDA fabric (VMM) path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
              comm->nRanks, comm->nNodes, count, (int)datatype, count * ncclTypeSize(datatype));
