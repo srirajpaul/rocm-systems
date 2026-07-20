@@ -12,7 +12,7 @@
 
 #include "dda_all_reduce.h"
 
-#include "algorithms/all_reduce/all_reduce_dda_ll128.h"
+#include "algorithms/all_reduce/all_reduce_dda_ll128_1.h"
 #include "checks.h"
 #include "comm.h"
 #include "dda_init_detail.h" // nccl_dda_detail::kDdaNranks
@@ -27,11 +27,27 @@
 namespace {
 
 using meta::comms::kDdaLL128ArMaxBytes;
+using meta::comms::kDdaLL128ArReserveBytes;
 using meta::comms::kDdaLL128DataElems;
+using meta::comms::kDdaLL128LineElems;
 using meta::comms::kDdaLL128Lanes;
 using meta::comms::LLLine128;
 using nccl_dda_detail::ddaMaxNBlocksForScratch;
 using nccl_dda_detail::kDdaNranks;
+
+// Selects which 128B-line all-reduce kernel/geometry to use:
+//  true  -> ddaAllReduceFlatLL128_1: all kDdaLL128LineElems (16) words are
+//           payload, no in-line flag word.
+//  false -> ddaAllReduceFlatLL128: kDdaLL128DataElems (15) payload words + 1
+//           trailing flag word (flag-based cross-rank sync).
+// The payload words per line drives numLines / slot stride / scratch sizing, so
+// it must match the launched kernel.
+static bool useFullLine = true;
+
+// Payload words per 128B line for the current useFullLine selection.
+static inline int ddaLL128ArElemsPerLine() {
+  return useFullLine ? kDdaLL128LineElems : kDdaLL128DataElems;
+}
 
 // Per-call slot stride in 128B lines. Matches the message exactly (compact
 // layout) so small all-reduces keep their scratch slots close together.
@@ -39,10 +55,12 @@ static inline size_t ddaLL128ArSlotLines(size_t numLines) {
   return numLines;
 }
 
-// LL128 scratch for this call: 2 banks * nRanks slots * slotLines * 128B.
+// LL128 scratch for this call: the reserved 1 MiB front region left untouched by
+// the _ll128_1 variant, plus 2 banks * nRanks slots * slotLines * 128B.
 static inline size_t ddaLL128ArScratchSize(int nRanks, size_t numLines) {
-  return (size_t)2 * (size_t)nRanks * ddaLL128ArSlotLines(numLines) *
-         sizeof(LLLine128);
+  return kDdaLL128ArReserveBytes +
+         (size_t)2 * (size_t)nRanks * ddaLL128ArSlotLines(numLines) *
+             sizeof(LLLine128);
 }
 
 template <typename T>
@@ -55,8 +73,8 @@ static ncclResult_t ncclAllReduceDdaIpcLL128Typed(
   const int nRanks = comm->nRanks;
   const size_t bytes = count * sizeof(T);
   const size_t nWords = bytes >> 3;
-  const size_t numLines =
-      (nWords + (size_t)kDdaLL128DataElems - 1) / (size_t)kDdaLL128DataElems;
+  const size_t lineElems = (size_t)ddaLL128ArElemsPerLine();
+  const size_t numLines = (nWords + lineElems - 1) / lineElems;
   const size_t slotStrideLines = ddaLL128ArSlotLines(numLines);
 
   // 1D grid over line-groups; each block has threads/16 groups.
@@ -91,23 +109,44 @@ static ncclResult_t ncclAllReduceDdaIpcLL128Typed(
       nRanks, bytes, numLines, grid.x, block.x);
 
   // NRANKS_CT 4/8: unrolled reduce loop; 0: runtime fallback. IPC is fixed at
-  // kDdaNranks ranks.
-  switch (nRanks) {
-  case 4:
-    meta::comms::ddaAllReduceFlatLL128<T, 4><<<grid, block, 0, stream>>>(
-        peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
-        count, comm->rank, nRanks, epochDev, epochLen, slotStrideLines);
-    break;
-  case 8:
-    meta::comms::ddaAllReduceFlatLL128<T, 8><<<grid, block, 0, stream>>>(
-        peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
-        count, comm->rank, nRanks, epochDev, epochLen, slotStrideLines);
-    break;
-  default:
-    meta::comms::ddaAllReduceFlatLL128<T, 0><<<grid, block, 0, stream>>>(
-        peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
-        count, comm->rank, nRanks, epochDev, epochLen, slotStrideLines);
-    break;
+  // kDdaNranks ranks. useFullLine picks the full-line (no flag) vs flagged
+  // kernel; both share the same launch signature.
+  if (useFullLine) {
+    switch (nRanks) {
+    case 4:
+      meta::comms::ddaAllReduceFlatLL128_1<T, 4><<<grid, block, 0, stream>>>(
+          peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
+          count, comm->rank, nRanks, epochDev, epochLen, slotStrideLines);
+      break;
+    case 8:
+      meta::comms::ddaAllReduceFlatLL128_1<T, 8><<<grid, block, 0, stream>>>(
+          peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
+          count, comm->rank, nRanks, epochDev, epochLen, slotStrideLines);
+      break;
+    default:
+      meta::comms::ddaAllReduceFlatLL128_1<T, 0><<<grid, block, 0, stream>>>(
+          peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
+          count, comm->rank, nRanks, epochDev, epochLen, slotStrideLines);
+      break;
+    }
+  } else {
+    switch (nRanks) {
+    case 4:
+      meta::comms::ddaAllReduceFlatLL128<T, 4><<<grid, block, 0, stream>>>(
+          peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
+          count, comm->rank, nRanks, epochDev, epochLen, slotStrideLines);
+      break;
+    case 8:
+      meta::comms::ddaAllReduceFlatLL128<T, 8><<<grid, block, 0, stream>>>(
+          peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
+          count, comm->rank, nRanks, epochDev, epochLen, slotStrideLines);
+      break;
+    default:
+      meta::comms::ddaAllReduceFlatLL128<T, 0><<<grid, block, 0, stream>>>(
+          peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
+          count, comm->rank, nRanks, epochDev, epochLen, slotStrideLines);
+      break;
+    }
   }
 
   CUDACHECK(cudaGetLastError());
@@ -160,8 +199,8 @@ bool ncclAllReduceDdaIpcLL128Eligible(
   // Scratch is sized from the actual message (compact per-call slot stride), so
   // eligibility is bounded by the runtime scratch capacity for this size.
   const size_t nWords = bytes >> 3;
-  const size_t numLines =
-      (nWords + (size_t)kDdaLL128DataElems - 1) / (size_t)kDdaLL128DataElems;
+  const size_t lineElems = (size_t)ddaLL128ArElemsPerLine();
+  const size_t numLines = (nWords + lineElems - 1) / lineElems;
   if (ddaLL128ArScratchSize(comm->nRanks, numLines) > comm->ddaScratchBytes) {
     return false;
   }
