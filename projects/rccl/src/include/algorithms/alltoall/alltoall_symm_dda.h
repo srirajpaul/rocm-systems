@@ -16,17 +16,17 @@
 
 namespace meta::comms {
 
-template <typename T, int NRANKS, bool hasAcc>
+template <typename T, int NRANKS, bool hasAcc, bool useHostPtr = true>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
     __global__ void ddaAllToAllIpc(
         T* const* __restrict__ ipcbuffs,
-        ncclSymPtr<T> recvbuff,
+        ncclSymPtr<T> recvSymPtr,
         T* __restrict__ recvbuff1,
         std::array<T*, NRANKS> recvbuffs,
         size_t count,
-        const ncclSymPtr<T> sendbuff,
+        const ncclSymPtr<T> sendSymPtr,
         const T* __restrict__ sendbuff1,
         std::array<T*, NRANKS> sendbuffs,
         int selfRank,
@@ -44,70 +44,41 @@ __launch_bounds__(512)
   const size_t copyCount = count * NRANKS;
   const auto idxStride = gridDim.x * blockDim.x * countPerThread;
 
-  const T *src[NRANKS];
-  T *dst[NRANKS];
-#if USE_WRITE
-  const T* srcPtr = sendbuff.localPtr();
-  ncclSymPtr<T> dstSlice = recvbuff + selfRank * countPerRank;
-#pragma unroll NRANKS
-  for (int r = 0; r < NRANKS; ++r) {
-    src[r] = (T*)srcPtr + r * countPerRank;
-    dst[r] = dstSlice.lsaPtr(r);
+  // Select how this rank obtains its own local send/recv base pointers:
+  //  - useHostPtr == true : use raw pointers resolved on the host (sendbuff1/recvbuff1)
+  //  - useHostPtr == false: derive them on device from the symmetric pointers
+  const T* __restrict__ mysendbuff;
+  T* __restrict__ myrecvbuff;
+  if constexpr (useHostPtr) {
+    mysendbuff = sendbuff1;
+    myrecvbuff = recvbuff1;
+  } else {
+    mysendbuff = sendSymPtr.localPtr();
+    myrecvbuff = recvSymPtr.localPtr();
   }
-#else
-  ncclSymPtr<T> srcSlice = sendbuff + selfRank * countPerRank;
-  T *dstPtr = recvbuff.localPtr();
-  #pragma unroll NRANKS
-  for (int r = 0; r < NRANKS; ++r) {
-    src[r] = srcSlice.lsaPtr(r);
-    dst[r] = dstPtr + r * countPerRank;
-  }
-
-  //const T* __restrict__ sendbuffPtr = sendbuff.localPtr();
-  //T* __restrict__ recvbuffPtr = recvbuff.localPtr();
-#endif
-
-  // It is expensive to launch hipMemcpyAsync on ROCm
-  // Move data copy here. Each block copies part of sendbuff data
-  //const T* __restrict__ mysendbuff = sendbuff1; //sendbuffs[selfRank];
-  //T* __restrict__ myrecvbuff = recvbuff1; //recvbuffs[selfRank];
-  //const T* __restrict__ mysendbuff = sendbuff.localPtr();
-  //T* __restrict__ myrecvbuff = recvbuff.localPtr();
-
-  //copyFromSrcToDest<T>(
-  //    mysendbuff, ipcbuffs[selfRank], idxStart, copyCount, idxStride);
 
   barrier.syncOnSameBlockIdx<
       false /* hasPreviousMemAccess */,
       true /* hasSubsequentMemAccess */>();
 
-  //bool inPlace = (sendbuff == recvbuff);
   static_assert(sizeof(T) == 1);
   bool useRead = true;
 
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
 #pragma unroll NRANKS
     for (int r = 0; r < NRANKS; ++r) {
-      //const size_t peer = (selfRank + r) % NRANKS;
-      //if (peer == selfRank && inPlace) continue;
-
-      //*(reinterpret_cast<uint4*>(dst[r] + idx)) =
-      //(reinterpret_cast<const uint4*>(src[r] + idx))[0];
-
       int srcRank = r;
       int srcIdx = idx + selfRank * idxEnd;
       int destIdx = idx + r * idxEnd;
       //read
       if (useRead) {
-        *reinterpret_cast<uint4*>(&recvbuff1[destIdx]) =
+        *reinterpret_cast<uint4*>(&myrecvbuff[destIdx]) =
             *reinterpret_cast<const uint4*>(&sendbuffs[r][srcIdx]);
-
-          //reinterpret_cast<const uint4*>(&ipcbuffs[srcRank][srcIdx])[0];
       }
       else {
         //write
         *reinterpret_cast<uint4*>(&recvbuffs[r][srcIdx]) =
-	    *reinterpret_cast<const uint4*>(&sendbuff1[destIdx]);
+	          *reinterpret_cast<const uint4*>(&mysendbuff[destIdx]);
       }
       
     }

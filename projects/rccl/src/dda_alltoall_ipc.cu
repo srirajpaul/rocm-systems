@@ -14,6 +14,7 @@
 #include "debug.h"
 #include "ipc_gpu_barrier.h"
 #include "ipc_init_detail.h"
+#include "param.h"
 
 #include <cuda_runtime.h>
 
@@ -21,6 +22,11 @@
 #include <cstdlib>
 #include <memory>
 #include <new>
+
+// Selects how the DDA symmetric alltoall kernel obtains its own rank's local
+// send/recv base pointers: 1 (default) uses host-resolved raw pointers,
+// 0 derives them on device from the symmetric pointers.
+RCCL_PARAM(DdaAllToAllUseHostPtr, "DDA_ALLTOALL_USE_HOST_PTR", 1);
 
 namespace {
 
@@ -72,11 +78,11 @@ static ncclResult_t ncclAllToAllDdaIpcTyped(
     ncclDevrFindWindow(comm, recvbuff, &recvWin);
     size_t sendoffset = (uint8_t*)sendbuff - (uint8_t*)sendWin->userPtr;
     size_t recvoffset = (uint8_t*)recvbuff - (uint8_t*)recvWin->userPtr;
-    std::array<T*, kDdaNranks> sendbuffs, recvbuffs; 
+    std::array<T*, kDdaNranks> sendbuffs, recvbuffs;
 
-    ncclSymPtr<char> recvPtr, sendPtr;
-    meta::comms::ncclPtrToSymPtr(comm, recvbuff, recvPtr);
-    meta::comms::ncclPtrToSymPtr(comm, (void *)sendbuff, sendPtr);
+    ncclSymPtr<char> recvSymPtr, sendSymPtr;
+    meta::comms::ncclPtrToSymPtr(comm, recvbuff, recvSymPtr);
+    meta::comms::ncclPtrToSymPtr(comm, (void *)sendbuff, sendSymPtr);
     //T *recvbuffs[kDdaNranks], *sendbuffs[kDdaNranks];
 #pragma unroll
     for (int r = 0; r < kDdaNranks; ++r) {
@@ -94,20 +100,34 @@ static ncclResult_t ncclAllToAllDdaIpcTyped(
       NCCLCHECK(ncclDevrGetLsaRankPtr(comm, recvWin, recvoffset, r, (void**)&recvbuffs[r]));
     }
 
-    meta::comms::ddaAllToAllIpc<T, kDdaNranks, false>
-        <<<grid, block, 0, stream>>>(
-            d_ipcbuffs,
-            recvPtr,
-            //static_cast<T*>(recvbuff),
-            static_cast<T*>(recvbuffs[comm->rank]),
-            recvbuffs,
-            count,
-            sendPtr,
-            //static_cast<const T*>(sendbuff),
-            static_cast<const T*>(sendbuffs[comm->rank]),
-            sendbuffs,
-            comm->rank,
-            barrierHost);
+    const bool useHostPtr = rcclParamDdaAllToAllUseHostPtr() != 0;
+    if (useHostPtr) {
+      meta::comms::ddaAllToAllIpc<T, kDdaNranks, false, true>
+          <<<grid, block, 0, stream>>>(
+              d_ipcbuffs,
+              recvSymPtr,
+              static_cast<T*>(recvbuffs[comm->rank]),
+              recvbuffs,
+              count,
+              sendSymPtr,
+              static_cast<const T*>(sendbuffs[comm->rank]),
+              sendbuffs,
+              comm->rank,
+              barrierHost);
+    } else {
+      meta::comms::ddaAllToAllIpc<T, kDdaNranks, false, false>
+          <<<grid, block, 0, stream>>>(
+              d_ipcbuffs,
+              recvSymPtr,
+              static_cast<T*>(recvbuffs[comm->rank]),
+              recvbuffs,
+              count,
+              sendSymPtr,
+              static_cast<const T*>(sendbuffs[comm->rank]),
+              sendbuffs,
+              comm->rank,
+              barrierHost);
+    }
   }
   else {
       INFO(NCCL_TUNING, "ncclAllToAllDdaIpcTyped  non-symmetricSupport");
