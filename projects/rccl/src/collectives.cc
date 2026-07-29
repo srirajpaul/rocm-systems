@@ -189,6 +189,11 @@ RCCL_PARAM(DdaLL, "DDA_LL", 1);
 RCCL_PARAM(DdaLLThreshold, "DDA_LL_THRESHOLD", (size_t)(32768));       // 32 KiB
 RCCL_PARAM(DdaLL128, "DDA_LL128", 1);
 RCCL_PARAM(DdaLL128Threshold, "DDA_LL128_THRESHOLD", (size_t)(33554432)); // 32 MiB
+// The IPC path (gfx942/gfx950 AllReduce) can run the same LL kernel, but its
+// crossover against the Simple IPC kernels has not been measured, so it gets its
+// own threshold rather than borrowing the gfx1250-tuned one above. 0 keeps the
+// tier disabled; DDA_LL=0 still switches LL off everywhere.
+RCCL_PARAM(DdaLLIpcThreshold, "DDA_LL_IPC_THRESHOLD", (size_t)(0));
 
 // Returns true when the DDA fast path should be attempted for a collective
 // with the given total byte count.  gfx942Default is the per-collective
@@ -659,6 +664,15 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
         return ncclSuccess;
       }
     } else {
+      // Small-message fast lane: LL protocol (no GPU barrier), same kernel the
+      // fabric tier above runs. Off unless DDA_LL_IPC_THRESHOLD is set.
+      if (rcclParamDdaLL() && msgBytes <= (size_t)rcclParamDdaLLIpcThreshold() &&
+          ncclAllReduceDdaIpcLLEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
+        INFO(NCCL_COLL, "AllReduce: taking DDA IPC LL path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
+             comm->nRanks, comm->nNodes, count, (int)datatype, msgBytes);
+        NCCLCHECK(ncclAllReduceDdaIpcLL(sendbuff, recvbuff, count, datatype, op, comm, stream));
+        return ncclSuccess;
+      }
       if (ncclAllReduceDdaIpcEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
         NCCLCHECK(ncclAllReduceDdaIpc(sendbuff, recvbuff, count, datatype, op, comm, stream));
         return ncclSuccess;

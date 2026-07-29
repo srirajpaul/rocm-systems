@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cstring>
 
 #include "comm.h"
@@ -29,6 +30,10 @@ struct DdaIpcMockComm
         comm.nNodes              = 1;
         comm.nRanks              = nccl_dda_detail::kDdaNranks;
         comm.ddaScratchBytes  = DDA_IPC_BUFFER_SIZE;
+        // The LL all-reduce tier derives its flag and scratch bank from these
+        // cells, so its eligibility check requires them.
+        comm.ddaLLArEpochDev  = reinterpret_cast<uint32_t*>(0x5);
+        comm.ddaLLArEpochLen  = DDA_IPC_MAXBLOCKS;
         setIpcResourcesPresent(true);
     }
 

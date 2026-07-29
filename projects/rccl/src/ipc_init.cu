@@ -16,8 +16,11 @@
 
 #include <cuda_runtime.h>
 
+#include <vector>
+
 using nccl_dda_detail::DdaIpcBarrierState;
 using nccl_dda_detail::ddaMaxNBlocksForScratch;
+using nccl_dda_detail::kDdaLLArEpochSeed;
 using nccl_dda_detail::kDdaNranks;
 
 #define HIP_CALL(cmd) \
@@ -80,9 +83,9 @@ ncclResult_t ncclDdaIpcCommInit(ncclComm* comm) {
   HIP_CALL(hipExtMallocWithFlags((void**)&scratch, bytes, hipDeviceMallocFinegrained));
 #endif
 
-  // Zero the scratch once so the LL all-gather's first epoch (>= 1) never
-  // false-matches leftover flag words (mirrors the fabric path). Harmless for
-  // the copy-based DDA collectives, which overwrite their staging area per op.
+  // Zero the scratch once so the LL all-reduce's first epoch never false-matches
+  // leftover flag words (mirrors the fabric path). Harmless for the copy-based DDA
+  // collectives, which overwrite their staging area per op.
   if (scratch != nullptr) {
     HIP_CALL(hipMemset(scratch, 0, bytes));
   }
@@ -186,11 +189,37 @@ ncclResult_t ncclDdaIpcCommInit(ncclComm* comm) {
   barrierState->resources = std::move(barrierPair.first);
   barrierState->barrierHost = barrierPair.second;
 
+  // Device epoch cells for the LL all-reduce tier, one per block its launcher can
+  // use (the kernel indexes this array by blockIdx.x). Seeded to the same high flag
+  // namespace as the fabric path (kDdaLLArEpochSeed), which keeps LL flags clear of
+  // the low monotonic counters any further flag-synced tier sharing this scratch
+  // would start from.
+  const int arEpochLen = nBlocksMax;
+  uint32_t* arEpochDev = nullptr;
+  const std::vector<uint32_t> arSeed(static_cast<size_t>(arEpochLen), kDdaLLArEpochSeed);
+  ce = cudaMalloc(&arEpochDev, arEpochLen * sizeof(uint32_t));
+  if (ce == cudaSuccess) {
+    ce = cudaMemcpy(arEpochDev, arSeed.data(), arEpochLen * sizeof(uint32_t), cudaMemcpyHostToDevice);
+  }
+  if (ce != cudaSuccess) {
+    CUDACHECKIGNORE(cudaFree(arEpochDev));
+    delete barrierState;
+    free(comm->ddaPeerPtrsHost);
+    comm->ddaPeerPtrsHost = nullptr;
+    CUDACHECKIGNORE(cudaFree(peerDev));
+    delete handler;
+    CUDACHECKIGNORE(cudaFree(scratch));
+    WARN("ncclDdaIpcCommInit: LL all-reduce epoch array failed (%s)", cudaGetErrorString(ce));
+    return ncclSuccess;
+  }
+
   comm->ddaIpcMemHandler = handler;
   comm->ddaScratch = scratch;
   comm->ddaScratchBytes = bytes;
   comm->ddaPeerPtrsDev = peerDev;
   comm->ddaIpcBarrierState = barrierState;
+  comm->ddaLLArEpochDev = arEpochDev;
+  comm->ddaLLArEpochLen = arEpochLen;
   INFO(NCCL_INIT, "ncclDdaIpcCommInit: scratch %zu bytes, IpcGpuBarrier nBlocks=%d, peer IPC table on device", bytes,
        nBlocksMax);
   return ncclSuccess;
@@ -206,6 +235,9 @@ ncclResult_t ncclDdaIpcCommFini(ncclComm* comm) {
   }
   CUDACHECKIGNORE(cudaFree(comm->ddaPeerPtrsDev));
   comm->ddaPeerPtrsDev = nullptr;
+  CUDACHECKIGNORE(cudaFree(comm->ddaLLArEpochDev));
+  comm->ddaLLArEpochDev = nullptr;
+  comm->ddaLLArEpochLen = 0;
   free(comm->ddaPeerPtrsHost);
   comm->ddaPeerPtrsHost = nullptr;
   if (comm->ddaIpcMemHandler != nullptr) {
