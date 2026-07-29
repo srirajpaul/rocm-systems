@@ -31,6 +31,13 @@ struct DdaFabricMockComm
         comm.nRanks             = 8; // any value in [2, kDdaMaxNranks]
         comm.ddaScratchBytes    = DDA_FABRIC_BUFFER_SIZE;
         comm.ddaFabricMaxBlocks = DDA_FABRIC_MAXBLOCKS;
+        // Epoch cells for the LL tiers; a device pointer is never dereferenced
+        // by the host-side eligibility checks, so a placeholder suffices.
+        comm.ddaLLEpochDev = reinterpret_cast<uint32_t*>(0x10);
+        comm.ddaLLEpochLen = static_cast<int>(nccl_dda_detail::ddaLLEpochCount(
+            comm.nRanks, nccl_dda_detail::kDdaFabricLLArMaxBlocks));
+        comm.ddaLLArEpochDev = reinterpret_cast<uint32_t*>(0x11);
+        comm.ddaLLArEpochLen = nccl_dda_detail::kDdaFabricLLArMaxBlocks;
         setFabricResourcesPresent(true);
     }
 
