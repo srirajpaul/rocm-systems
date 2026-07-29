@@ -33,6 +33,17 @@ bool ncclAllReduceDdaFabricLLEligible(ncclComm* comm, const void* sendbuff, void
 ncclResult_t ncclAllReduceDdaFabricLL(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                       ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
 
+// Two-shot (reduce-scatter + all-gather) variant of the LL fabric path. Same
+// tier as the one-shot LL above, but moves nRanks/2 fewer bytes per rank at the
+// cost of a second publish/poll round trip, so it serves the upper part of the
+// LL size range (see DDA_LL_TWOSHOT_MIN_BYTES in collectives.cc).
+bool ncclAllReduceDdaFabricLLTwoShotEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
+                                             ncclDataType_t datatype, ncclRedOp_t op);
+
+ncclResult_t ncclAllReduceDdaFabricLLTwoShot(const void* sendbuff, void* recvbuff, size_t count,
+                                             ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm,
+                                             cudaStream_t stream);
+
 // LL128-protocol fabric path (mid-message fast lane, 128B lines, no barrier).
 bool ncclAllReduceDdaFabricLL128Eligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
                                          ncclDataType_t datatype, ncclRedOp_t op);

@@ -175,7 +175,8 @@ RCCL_PARAM(DdaEnable, "DDA_ENABLE", 1);
 RCCL_PARAM(DdaThreshold, "DDA_THRESHOLD", (size_t)(134217728));  // 128 MiB
 // Common DDA protocol-tier knobs, shared by every fabric collective (no
 // per-collective variants). For a given collective's size:
-//   size <= DdaLLThreshold     -> LL    one-shot (16B lines)
+//   size <= DdaLLThreshold     -> LL    one-shot (16B lines); AllReduce can opt
+//                                 into two-shot, see DdaLLTwoShot below
 //   size <= DdaLL128Threshold  -> LL128 one-shot (128B lines)
 //   otherwise                  -> Simple (flat one-shot / tree two-shot)
 // Constraint: DdaLLThreshold <= DdaLL128Threshold <= DdaThreshold. Setting an
@@ -187,6 +188,18 @@ RCCL_PARAM(DdaThreshold, "DDA_THRESHOLD", (size_t)(134217728));  // 128 MiB
 // x MAXBLOCKS sweep.
 RCCL_PARAM(DdaLL, "DDA_LL", 1);
 RCCL_PARAM(DdaLLThreshold, "DDA_LL_THRESHOLD", (size_t)(32768));       // 32 KiB
+// Within the LL AllReduce tier, messages of at least DdaLLTwoShotMinBytes use
+// the two-shot (reduce-scatter + all-gather) variant, which moves nRanks/2 fewer
+// bytes per rank but pays a second publish/poll round trip; smaller messages
+// stay one-shot. Only applies at nRanks >= 4 and when the message splits evenly
+// into 8-byte packets per rank (see ncclAllReduceDdaFabricLLTwoShotEligible).
+// Off by default: measured on 4x gfx1250 (bf16), one-shot wins across the whole
+// LL range (7.5us vs 11.3us at 32KiB, the widest gap being at the small end),
+// and above the LL threshold LL128 beats two-shot LL as well (10.5us vs 11.5us
+// at 64KiB). The saving scales as nRanks/2, so two-shot needs re-measuring on a
+// wider clique before it can be defaulted on.
+RCCL_PARAM(DdaLLTwoShot, "DDA_LL_TWOSHOT", 0);
+RCCL_PARAM(DdaLLTwoShotMinBytes, "DDA_LL_TWOSHOT_MIN_BYTES", (size_t)(8192)); // 8 KiB
 RCCL_PARAM(DdaLL128, "DDA_LL128", 1);
 RCCL_PARAM(DdaLL128Threshold, "DDA_LL128_THRESHOLD", (size_t)(33554432)); // 32 MiB
 
@@ -636,6 +649,19 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
   if (!symEligible && rcclDdaEnabled(comm, count * ncclTypeSize(datatype), 8388608) &&
       (ddaFabricArch1250 || msgBytes < NCCL_CE_AR_MIN_MSG_BYTES)) {
     if (IsArchMatch(comm->archName, "gfx1250")) {
+      // Upper part of the LL range: two-shot LL trades a second round trip for
+      // nRanks/2 less traffic per rank. Tried first so one-shot keeps everything
+      // below the crossover and anything two-shot cannot serve (odd sizes,
+      // nRanks < 4).
+      if (rcclParamDdaLL() && (count * ncclTypeSize(datatype)) <= (size_t)rcclParamDdaLLThreshold() &&
+          rcclParamDdaLLTwoShot() && (count * ncclTypeSize(datatype)) >= (size_t)rcclParamDdaLLTwoShotMinBytes() &&
+          ncclAllReduceDdaFabricLLTwoShotEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
+        INFO(NCCL_COLL,
+             "AllReduce: taking DDA fabric LL two-shot path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
+             comm->nRanks, comm->nNodes, count, (int)datatype, count * ncclTypeSize(datatype));
+        NCCLCHECK(ncclAllReduceDdaFabricLLTwoShot(sendbuff, recvbuff, count, datatype, op, comm, stream));
+        return ncclSuccess;
+      }
       // Small-message fast lane: LL protocol (no GPU barrier).
       if (rcclParamDdaLL() && (count * ncclTypeSize(datatype)) <= (size_t)rcclParamDdaLLThreshold() &&
           ncclAllReduceDdaFabricLLEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
