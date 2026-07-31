@@ -13,48 +13,8 @@
 #include "ipc_gpu_barrier.h"
 #include "algorithms/CollCommon.h"
 #include "nccl_device/ptr.h"
-#include "nccl_device/rccl_ptr.h"
 
 namespace meta::comms {
-
-// The alltoall copy is routed through these helpers so the local base pointer
-// is passed as a __restrict__ function parameter. Clang only applies the
-// noalias guarantee to function parameters (not to __restrict__ locals), so
-// this lets the compiler prove the stores don't alias the loads and keep
-// multiple memory ops in flight, even when the base is derived on-device via
-// localPtr(). __forceinline__ preserves the noalias info at the call site.
-template <typename T, int NRANKS>
-__device__ __forceinline__ void ddaAllToAllGather(
-    T* __restrict__ dst,
-    const std::array<T*, NRANKS>& src,
-    size_t idxStart, size_t idxEnd, size_t idxStride, int selfRank) {
-  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
-#pragma unroll NRANKS
-    for (int r = 0; r < NRANKS; ++r) {
-      int srcIdx = idx + selfRank * idxEnd;
-      int destIdx = idx + r * idxEnd;
-      *(v4u_gptr)(&dst[destIdx]) = *(v4u_gptr)(&src[r][srcIdx]);
-      //__attribute__((address_space(1))) v4u* dst1 = (__attribute__((address_space(1))) v4u*)&dst[destIdx];
-      //__attribute__((address_space(1))) v4u* src1 = (__attribute__((address_space(1))) v4u*)&src[r][srcIdx];
-      //*dst1 = *src1;
-    }
-  }
-}
-
-template <typename T, int NRANKS>
-__device__ __forceinline__ void ddaAllToAllScatter(
-    const std::array<T*, NRANKS>& dst,
-    const T* __restrict__ src,
-    size_t idxStart, size_t idxEnd, size_t idxStride, int selfRank) {
-  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
-#pragma unroll NRANKS
-    for (int r = 0; r < NRANKS; ++r) {
-      int srcIdx = idx + selfRank * idxEnd;
-      int destIdx = idx + r * idxEnd;
-      *(v4u_gptr)(&dst[r][srcIdx]) = *(v4u_gptr)(&src[destIdx]);
-    }
-  }
-}
 
 template <typename T, int NRANKS, bool hasAcc, bool useHostPtr = true>
 #if defined(USE_ROCM)
@@ -104,12 +64,23 @@ __launch_bounds__(512)
   static_assert(sizeof(T) == 1);
   bool useRead = true;
 
-  if (useRead) {
-    ddaAllToAllGather<T, NRANKS>(
-        myrecvbuff, sendbuffs, idxStart, idxEnd, idxStride, selfRank);
-  } else {
-    ddaAllToAllScatter<T, NRANKS>(
-        recvbuffs, mysendbuff, idxStart, idxEnd, idxStride, selfRank);
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+#pragma unroll NRANKS
+    for (int r = 0; r < NRANKS; ++r) {
+      int srcRank = r;
+      int srcIdx = idx + selfRank * idxEnd;
+      int destIdx = idx + r * idxEnd;
+      //read
+      if (useRead) {
+        *reinterpret_cast<uint4*>(&myrecvbuff[destIdx]) =
+            *reinterpret_cast<const uint4*>(&sendbuffs[r][srcIdx]);
+      }
+      else {
+        //write
+        *reinterpret_cast<uint4*>(&recvbuffs[r][srcIdx]) =
+	          *reinterpret_cast<const uint4*>(&mysendbuff[destIdx]);
+      }
+    }
   }
   // barrier to ensure remote ranks won't free their buffers until I'm done
   barrier.syncOnSameBlockIdx<
