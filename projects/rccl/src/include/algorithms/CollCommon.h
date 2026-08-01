@@ -206,6 +206,18 @@ inline std::pair<dim3, dim3> getGridAndBlockDims(size_t count, int typeSize, siz
   return std::make_pair(blocks, threads);
 }
 
+// 8-byte payload unit: the two data words an LL line carries, without its flags.
+// For the unflagged ends of an LL exchange -- the user buffers -- so they can be
+// moved a whole line's worth of payload at a time instead of word by word.
+union Packet8 {
+  struct {
+    uint32_t d0;
+    uint32_t d1;
+  };
+  uint64_t raw;
+};
+static_assert(sizeof(Packet8) == 8, "Packet8 must be exactly 8 bytes");
+
 // 16-byte LL line: two (4B data, 4B flag) pairs carrying 8B of payload.
 union LLPacket16 {
   struct {

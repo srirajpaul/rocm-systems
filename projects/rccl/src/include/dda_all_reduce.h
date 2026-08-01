@@ -26,6 +26,16 @@ bool ncclAllReduceDdaIpcLLEligible(ncclComm* comm, const void* sendbuff, void* r
 ncclResult_t ncclAllReduceDdaIpcLL(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                    ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
 
+// Two-shot (reduce-scatter + all-gather) variant of the LL IPC path: its own tier,
+// serving the size band above the one-shot variant's. The dispatch picks one or the
+// other per call; both advance the same LL epoch counter, which is what keeps their
+// two scratch layouts from reading each other's stale lines.
+bool ncclAllReduceDdaIpcLLTwoShotEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
+                                          ncclDataType_t datatype, ncclRedOp_t op);
+
+ncclResult_t ncclAllReduceDdaIpcLLTwoShot(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
+                                          ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
+
 // Fabric path (runtime nRanks up to kDdaMaxNranks, single- or multi-node).
 bool ncclAllReduceDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
                                     ncclDataType_t datatype, ncclRedOp_t op);

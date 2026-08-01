@@ -189,11 +189,18 @@ RCCL_PARAM(DdaLL, "DDA_LL", 1);
 RCCL_PARAM(DdaLLThreshold, "DDA_LL_THRESHOLD", (size_t)(32768));       // 32 KiB
 RCCL_PARAM(DdaLL128, "DDA_LL128", 1);
 RCCL_PARAM(DdaLL128Threshold, "DDA_LL128_THRESHOLD", (size_t)(33554432)); // 32 MiB
-// The IPC path (gfx942/gfx950 AllReduce) can run the same LL kernel, but its
-// crossover against the Simple IPC kernels has not been measured, so it gets its
-// own threshold rather than borrowing the gfx1250-tuned one above. 0 keeps the
-// tier disabled; DDA_LL=0 still switches LL off everywhere.
-RCCL_PARAM(DdaLLIpcThreshold, "DDA_LL_IPC_THRESHOLD", (size_t)(0));
+// The IPC path (gfx942/gfx950 AllReduce) runs the same LL kernels, but its
+// crossovers against the Simple IPC kernels have not been measured, so it gets its
+// own thresholds rather than borrowing the gfx1250-tuned ones above:
+//   msgBytes <= DdaLLIpcThreshold        -> LL one-shot (latency-bound sizes)
+//   msgBytes <= DdaLLIpcTwoShotThreshold -> LL two-shot (moves 4x fewer bytes at
+//                                           8 ranks, so it carries the rest of the
+//                                           LL range)
+//   otherwise                            -> Simple
+// Either threshold at 0 disables just that variant and falls through to the next;
+// DDA_LL=0 still switches LL off everywhere.
+RCCL_PARAM(DdaLLIpcThreshold, "DDA_LL_IPC_THRESHOLD", (size_t)(32768));                  // 32 KiB
+RCCL_PARAM(DdaLLIpcTwoShotThreshold, "DDA_LL_IPC_TWOSHOT_THRESHOLD", (size_t)(1048576)); // 1 MiB
 
 // Returns true when the DDA fast path should be attempted for a collective
 // with the given total byte count.  gfx942Default is the per-collective
@@ -664,16 +671,28 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
         return ncclSuccess;
       }
     } else {
-      // Small-message fast lane: LL protocol (no GPU barrier), same kernel the
-      // fabric tier above runs. Off unless DDA_LL_IPC_THRESHOLD is set.
+      // Small-message fast lane: LL protocol (no GPU barrier), same kernels the
+      // fabric tier above runs. One-shot takes the smallest messages, two-shot the
+      // band above it -- see the threshold block near the top of this file.
       if (rcclParamDdaLL() && msgBytes <= (size_t)rcclParamDdaLLIpcThreshold() &&
           ncclAllReduceDdaIpcLLEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
-        INFO(NCCL_COLL, "AllReduce: taking DDA IPC LL path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
+        INFO(NCCL_COLL,
+             "AllReduce: taking DDA IPC LL one-shot path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
              comm->nRanks, comm->nNodes, count, (int)datatype, msgBytes);
         NCCLCHECK(ncclAllReduceDdaIpcLL(sendbuff, recvbuff, count, datatype, op, comm, stream));
         return ncclSuccess;
       }
+      if (rcclParamDdaLL() && msgBytes <= (size_t)rcclParamDdaLLIpcTwoShotThreshold() &&
+          ncclAllReduceDdaIpcLLTwoShotEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
+        INFO(NCCL_COLL,
+             "AllReduce: taking DDA IPC LL two-shot path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
+             comm->nRanks, comm->nNodes, count, (int)datatype, msgBytes);
+        NCCLCHECK(ncclAllReduceDdaIpcLLTwoShot(sendbuff, recvbuff, count, datatype, op, comm, stream));
+        return ncclSuccess;
+      }
       if (ncclAllReduceDdaIpcEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
+        INFO(NCCL_COLL, "AllReduce: taking DDA IPC SIMPLE path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
+             comm->nRanks, comm->nNodes, count, (int)datatype, msgBytes);
         NCCLCHECK(ncclAllReduceDdaIpc(sendbuff, recvbuff, count, datatype, op, comm, stream));
         return ncclSuccess;
       }
