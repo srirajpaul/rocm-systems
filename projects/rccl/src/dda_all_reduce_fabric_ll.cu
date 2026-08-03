@@ -50,8 +50,8 @@ static inline size_t ddaLLArTwoShotScratchSize(int nRanks) {
 // The two tiers stage through one scratch under one epoch, so bank 1 has to
 // start at the same offset for both; otherwise a launch of one could write over
 // lines the other is still polling an epoch later.
-static_assert(kDdaLLArTwoShotSlotStridePkts == kDdaLLArSlotStridePkts,
-              "LL all-reduce tiers share one scratch and epoch; keep their slot strides equal");
+static_assert(kDdaLLArTwoShotSlotStridePkts == kDdaLLArSlotStridePkts / 2,
+              "LL all-reduce tiers share one scratch and epoch; keep LL-ts slot half of LL");
 
 template <typename T>
 static ncclResult_t ncclAllReduceDdaFabricLLTyped(const void* sendbuff, void* recvbuff, size_t count, ncclComm* comm,
@@ -115,7 +115,7 @@ static ncclResult_t ncclAllReduceDdaFabricLLTwoShotTyped(const void* sendbuff, v
                                                          ncclComm* comm, cudaStream_t stream) {
   const int nRanks = comm->nRanks;
   const size_t bytes = count * sizeof(T);
-  const size_t nPk = bytes >> 3; // 8 payload bytes per packet
+  const size_t nPk = (bytes >> 3 ) / (size_t)nRanks; // 8 payload bytes per packet
 
   const unsigned threads = 256;
   int nBlocksMax = std::min(comm->ddaFabricMaxBlocks, nccl_dda_detail::kDdaFabricLLArMaxBlocks);
@@ -242,15 +242,19 @@ bool ncclAllReduceDdaFabricLLTwoShotEligible(ncclComm* comm, const void* sendbuf
   }
 
   const size_t bytes = count * ncclTypeSize(datatype);
-  // Payload is staged as 8-byte LL packets, so it must be a whole number of
-  // packets.
-  if (bytes % 8 != 0) {
+  // Payload is staged as 8-byte LL packets per rank,
+  // so it must be a whole number of packets.
+  if (bytes % (8 * (size_t)comm->nRanks) != 0) {
     return false;
   }
   if (bytes > kDdaLLArTwoShotMaxBytes) {
     return false;
   }
   if (ddaLLArTwoShotScratchSize(comm->nRanks) > comm->ddaScratchBytes) {
+    return false;
+  }
+
+  if ((bytes >> 3) / (size_t)comm->nRanks > kDdaLLArTwoShotSlotStridePkts) {
     return false;
   }
 
