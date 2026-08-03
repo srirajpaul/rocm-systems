@@ -121,7 +121,8 @@ __launch_bounds__(512)
     #pragma unroll
     for (int r = 1; r < nRanks; ++r) {
       const int peer = (selfRank + r) % nRanks;
-      const Packet8* peer_in = reinterpret_cast<const Packet8*>(sendbuff) + peer * nPk_rank;
+      //const Packet8* peer_in = reinterpret_cast<const Packet8*>(sendbuff) + peer * nPk_rank;
+      const Packet8* peer_in = in; //reinterpret_cast<const Packet8*>(sendbuff) + peer * nPk_rank;
       const Packet8 v = peer_in[pk];
       LLPacket16* dst = reinterpret_cast<LLPacket16*>(peerScratch[peer]) + bankOffsetPkts + (size_t)selfRank * slot;
       ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(&dst[pk]), v.d0, flag, v.d1, flag);
@@ -152,14 +153,15 @@ __launch_bounds__(512)
     acc.d1 = acc1;
     out[pk] = acc;
 
-    #pragma unroll
-    for (int r = 1; r < nRanks; ++r) {
-      const int peer = (selfRank + r) % nRanks;
-      LLPacket16* dst = reinterpret_cast<LLPacket16*>(peerScratch[peer]) + bankOffsetPkts_next + (size_t)selfRank * slot;
-      ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(&dst[pk]), acc0, flag, acc1, flag);
-    }
+    //#pragma unroll
+    //for (int r = 1; r < nRanks; ++r) {
+    //  const int peer = (selfRank + r) % nRanks;
+    //  LLPacket16* dst = reinterpret_cast<LLPacket16*>(peerScratch[peer]) + bankOffsetPkts_next + (size_t)selfRank * slot;
+    //  ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(&dst[pk]), acc0, flag, acc1, flag);
+    //}
   }
 
+#if 0
   // Phase 3: poll my slots for the other ranks, read data and write to output.
   myBase = reinterpret_cast<LLPacket16*>(peerScratch[selfRank]) + bankOffsetPkts_next;
   for (size_t pk = gtid; pk < nPk_rank; pk += stride) {
@@ -179,6 +181,7 @@ __launch_bounds__(512)
       peer_out[pk] = v;
     }
   }
+#endif
 
   ddaLLEpochEnd(epochDev, flatBlockId, total, epochLen, flag);
 }
