@@ -31,12 +31,24 @@ namespace meta::comms {
 
 // Per-rank staging slot capacity and hard per-message cap (enforced in the
 // eligibility check). Fixes the slot stride at compile time so the
-// double-buffered layout is identical on every rank and call. LL is a
-// small-message fast lane, so the full-message payload is well under this cap.
+// double-buffered layout is identical on every rank and call.
 // Footprint = 2 banks * nRanks * (kDdaLLArMaxBytes * 2) for the 8B->16B
-// expansion; 4 MiB at 128 KiB / 8 ranks, within the 64 MiB DDA scratch.
-constexpr size_t kDdaLLArMaxBytes = 131072;                 // 128 KiB
-constexpr size_t kDdaLLArSlotStridePkts = kDdaLLArMaxBytes / 8;   // 16384
+// expansion; 128 MiB at 8 ranks and 1.1 GiB at 72, within the 10 GiB DDA scratch.
+//
+// Set to match kDdaLLArTwoShotMaxBytes rather than to the largest message the
+// tier is expected to serve (DDA_LL_THRESHOLD gates that, and is far lower). The
+// two-shot kernel banks over two stages of half-size slots, so equal caps make
+// its bank stride and this one both nRanks * 524288 packets: the two all-reduce
+// variants then agree on where bank 1 starts and neither can write over scratch
+// the other is still polling at an adjacent epoch.
+//
+// The AllGather, ReduceScatter and AllToAll LL kernels share this scratch and the
+// same epoch counter but keep their own 128 KiB caps, so they do not share these
+// bank boundaries -- an all-reduce running at an epoch adjacent to one of theirs
+// can overwrite scratch it is still polling. Raising all four caps together is
+// what would close that.
+constexpr size_t kDdaLLArMaxBytes = 4194304;                // 4 MiB
+constexpr size_t kDdaLLArSlotStridePkts = kDdaLLArMaxBytes / 8;   // 524288
 
 // LL flat all-reduce kernel. 1D grid over packets (8B payload each).
 //

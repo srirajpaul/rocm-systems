@@ -33,6 +33,17 @@ bool ncclAllReduceDdaFabricLLEligible(ncclComm* comm, const void* sendbuff, void
 ncclResult_t ncclAllReduceDdaFabricLL(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                       ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
 
+// Two-shot (reduce-scatter + all-gather) variant of the LL fabric path: its own
+// tier, serving the size band above the one-shot variant's. The dispatch picks one
+// or the other per call; both advance the same LL epoch counter, which is what
+// keeps their two scratch layouts from reading each other's stale lines.
+bool ncclAllReduceDdaFabricLLTwoShotEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
+                                             ncclDataType_t datatype, ncclRedOp_t op);
+
+ncclResult_t ncclAllReduceDdaFabricLLTwoShot(const void* sendbuff, void* recvbuff, size_t count,
+                                             ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm,
+                                             cudaStream_t stream);
+
 // LL128-protocol fabric path (mid-message fast lane, 128B lines, no barrier).
 bool ncclAllReduceDdaFabricLL128Eligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
                                          ncclDataType_t datatype, ncclRedOp_t op);

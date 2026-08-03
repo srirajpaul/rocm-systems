@@ -187,6 +187,18 @@ RCCL_PARAM(DdaThreshold, "DDA_THRESHOLD", (size_t)(134217728));  // 128 MiB
 // x MAXBLOCKS sweep.
 RCCL_PARAM(DdaLL, "DDA_LL", 1);
 RCCL_PARAM(DdaLLThreshold, "DDA_LL_THRESHOLD", (size_t)(32768));       // 32 KiB
+// AllReduce only: a second LL tier sitting between LL one-shot and LL128. It
+// exchanges shards in two flag-synced rounds instead of broadcasting the whole
+// message, which moves nRanks/2 fewer bytes per rank at the cost of a second
+// round trip, so it takes over where the one-shot tier stops paying:
+//   size <= DdaLLThreshold        -> LL one-shot
+//   size <= DdaLLTwoShotThreshold -> LL two-shot
+// Its crossovers on the fabric path have not been measured, so it ships off (0);
+// the kernel itself accepts up to 4 MiB. The two all-reduce LL tiers bank scratch
+// on the same stride and are safe to alternate; AllGather/ReduceScatter/AllToAll
+// LL do not -- see the bank-stride note in all_reduce_dda_ll.h before mixing them
+// with all-reduce. DDA_LL=0 still switches LL off entirely.
+RCCL_PARAM(DdaLLTwoShotThreshold, "DDA_LL_TWOSHOT_THRESHOLD", (size_t)(0));
 RCCL_PARAM(DdaLL128, "DDA_LL128", 0);
 RCCL_PARAM(DdaLL128Threshold, "DDA_LL128_THRESHOLD", (size_t)(33554432)); // 32 MiB
 
@@ -642,6 +654,16 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
         INFO(NCCL_COLL, "AllReduce: taking DDA fabric LL path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
              comm->nRanks, comm->nNodes, count, (int)datatype, count * ncclTypeSize(datatype));
         NCCLCHECK(ncclAllReduceDdaFabricLL(sendbuff, recvbuff, count, datatype, op, comm, stream));
+        return ncclSuccess;
+      }
+      // Above the one-shot band, still LL: two-shot (reduce-scatter + all-gather)
+      // trades a second round trip for a fraction of the write volume.
+      if (rcclParamDdaLL() && (count * ncclTypeSize(datatype)) <= (size_t)rcclParamDdaLLTwoShotThreshold() &&
+          ncclAllReduceDdaFabricLLTwoShotEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
+        INFO(NCCL_COLL,
+             "AllReduce: taking DDA fabric LL two-shot path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
+             comm->nRanks, comm->nNodes, count, (int)datatype, count * ncclTypeSize(datatype));
+        NCCLCHECK(ncclAllReduceDdaFabricLLTwoShot(sendbuff, recvbuff, count, datatype, op, comm, stream));
         return ncclSuccess;
       }
       // Mid-size fast lane: LL128 protocol (128B lines, no GPU barrier).
