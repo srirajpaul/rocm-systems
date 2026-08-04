@@ -187,11 +187,11 @@ RCCL_PARAM(DdaThreshold, "DDA_THRESHOLD", (size_t)(134217728));  // 128 MiB
 // x MAXBLOCKS sweep.
 RCCL_PARAM(DdaLL, "DDA_LL", 1);
 RCCL_PARAM(DdaLLThreshold, "DDA_LL_THRESHOLD", (size_t)(32768));       // 32 KiB
-// Two-shot LL tier. Its kernel is still a copy of the one-shot's, so it is left
-// inert by default (threshold 0 matches no message) rather than allowed to claim
-// traffic the one-shot tier already serves identically. Raising
-// DDA_LL_TWOSHOT_THRESHOLD is what opts a run into it; setting DDA_LL_THRESHOLD=0
-// alongside is what hands the same sizes over from one tier to the other.
+// Two-shot LL tier: transports one shard per rank instead of the whole message.
+// Left inert by default (threshold 0 matches no message) until its range is
+// tuned. Raising DDA_LL_TWOSHOT_THRESHOLD is what opts a run into it; setting
+// DDA_LL_THRESHOLD=0 alongside is what hands the same sizes over from the
+// one-shot tier.
 RCCL_PARAM(DdaLLTwoShot, "DDA_LL_TWOSHOT", 1);
 RCCL_PARAM(DdaLLTwoShotThreshold, "DDA_LL_TWOSHOT_THRESHOLD", (size_t)(0));
 RCCL_PARAM(DdaLL128, "DDA_LL128", 0);
