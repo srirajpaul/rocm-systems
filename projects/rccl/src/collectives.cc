@@ -669,24 +669,13 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
   info.ceGraphDecisionValid = true;
   if (rcclAllReduceShouldTakeDdaPath(comm, count, datatype, symEligible, ceAllReduceAllowed)) {
     if (IsArchMatch(comm->archName, "gfx1250")) {
-      const int64_t llThresh = rcclParamDdaLLThreshold();
       const int64_t ll128Thresh = rcclParamDdaLL128Threshold();
-      // Small-message fast lane: LL protocol (no GPU barrier).
-      if (rcclParamDdaLL() && llThresh > 0 && (count * ncclTypeSize(datatype)) <= (size_t)llThresh &&
-          ncclAllReduceDdaFabricLLEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
+      // Small-message fast lane: LL protocol (no GPU barrier). Eligible covers
+      // both the one-shot and two-shot variants and the entry point picks between them.
+      if (ncclAllReduceDdaFabricLLEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
         INFO(NCCL_COLL, "AllReduce: taking DDA fabric LL path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
              comm->nRanks, comm->nNodes, count, (int)datatype, count * ncclTypeSize(datatype));
         NCCLCHECK(ncclAllReduceDdaFabricLL(sendbuff, recvbuff, count, datatype, op, comm, stream));
-        return ncclSuccess;
-      }
-      // Two-shot LL tier, tried after the one-shot so a run can hand sizes from
-      // one to the other by moving the two thresholds.
-      if (rcclParamDdaLLTwoShot() && (count * ncclTypeSize(datatype)) <= (size_t)rcclParamDdaLLTwoShotThreshold() &&
-          ncclAllReduceDdaFabricLLTwoShotEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
-        INFO(NCCL_COLL,
-             "AllReduce: taking DDA fabric LL two-shot path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
-             comm->nRanks, comm->nNodes, count, (int)datatype, count * ncclTypeSize(datatype));
-        NCCLCHECK(ncclAllReduceDdaFabricLLTwoShot(sendbuff, recvbuff, count, datatype, op, comm, stream));
         return ncclSuccess;
       }
       // Mid-size fast lane: LL128 protocol (128B lines, no GPU barrier).
