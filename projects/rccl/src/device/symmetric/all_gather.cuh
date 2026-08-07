@@ -311,6 +311,190 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_TmaSTMC(ncclSymkDevWorkArg
   ncclSymkRun_AllGather_STMC_impl</*EnableTma=*/true>(args);
 }
 
+// Pull counterpart of bcastDeep: instead of storing our own contribution into
+// every peer's output window, we load every peer's contribution out of their
+// input window and store it locally. Same bytes on the fabric, but the fabric
+// traffic is reads instead of writes and only the input window has to be
+// symmetrically registered.
+//
+// `output` addresses peer 0's slot; peer r's slot is `nAllBytes` further along.
+// The caller guarantees `nAllBytes % BytePerPack == 0` so that one alignment
+// test covers every peer's slot.
+template <int BytePerPack, int UnrollPacks, int UnrollPeers>
+static __device__ void gatherDeep(ncclSymkArgsHandler const& handler, int tn, int t, bool waitNeeded,
+                                  ncclLsaBarrierSession<ncclCoopCta>& bar, ncclSymPtr<char> input,
+                                  ncclSymPtr<char> output, size_t nAllBytes, bool inPlace, int nIters) {
+  using Pack = BytePack<BytePerPack>;
+  int wn = tn / WARP_SIZE;
+  int w = t / WARP_SIZE;
+  int lane = t % WARP_SIZE;
+  int const& rank = handler.comm.rank;
+  int const& nRanks = handler.comm.nRanks;
+  size_t packPerRank = nAllBytes / BytePerPack;
+
+  ncclSymPtr<Pack> inpPacks = (ncclSymPtr<Pack>)input + intptr_t(w) * UnrollPacks * WARP_SIZE + lane;
+  Pack* outPacks = (Pack*)output.localPtr() + intptr_t(w) * UnrollPacks * WARP_SIZE + lane;
+
+  nIters -= w;
+
+  if (waitNeeded) bar.wait(ncclCoopCta(), NCCL_MEM_ORDER_RELAXED);
+
+  if (0 < nIters) {
+    while (true) {
+      // Our own slot is just a local copy, and it is already in place when the
+      // caller aliases the buffers.
+      int dr = inPlace ? 1 : 0;
+      int r = rank + dr;
+      if (r == nRanks) r = 0;
+#pragma unroll 2
+      for (int partial = 0; partial <= 1; partial++) {
+#pragma unroll 1
+        for (int i = 0; partial ? i < 1 : (dr + UnrollPeers <= nRanks); partial ? i++ : (dr += UnrollPeers)) {
+          if (partial && dr == nRanks) break;
+          Pack tmp[UnrollPeers][UnrollPacks];
+          int rBeg = r;
+          // Issue the whole batch of peer loads before consuming any of them so
+          // the fabric round trips overlap.
+#pragma unroll
+          for (int ur = 0; ur < UnrollPeers - partial; ur++) {
+            if (partial && ur != 0 && dr + ur == nRanks) break;
+#pragma unroll UnrollPacks
+            for (int u = 0; u < UnrollPacks; u++) {
+              tmp[ur][u] = inpPacks.lsaPtr(r)[u * WARP_SIZE];
+            }
+            if (++r == nRanks) r = 0;
+          }
+          r = rBeg;
+#pragma unroll
+          for (int ur = 0; ur < UnrollPeers - partial; ur++) {
+            if (partial && ur != 0 && dr + ur == nRanks) break;
+            Pack* dst = outPacks + r * packPerRank;
+#pragma unroll UnrollPacks
+            for (int u = 0; u < UnrollPacks; u++) {
+              dst[u * WARP_SIZE] = tmp[ur][u];
+            }
+            if (++r == nRanks) r = 0;
+          }
+        }
+      }
+
+      inpPacks += intptr_t(wn) * UnrollPacks * WARP_SIZE;
+      outPacks += intptr_t(wn) * UnrollPacks * WARP_SIZE;
+      nIters -= wn;
+      if (nIters <= 0) break;
+    }
+  }
+}
+
+template <int UnrollPeers, typename T>
+static __device__ void gatherEnds(ncclSymkArgsHandler const& handler, int tn, int t, ncclSymPtr<T> input,
+                                  ncclSymPtr<T> output, bool inPlace, size_t nElts, size_t nAllElts,
+                                  uint32_t nPreElts, size_t nSufElts) {
+  int const& rank = handler.comm.rank;
+  int const& nRanks = handler.comm.nRanks;
+  ncclSymPtr<BytePack<sizeof(T)>> inpPacks = (ncclSymPtr<BytePack<sizeof(T)>>)input;
+  BytePack<sizeof(T)>* outPacks = (BytePack<sizeof(T)>*)output.localPtr();
+#pragma unroll 1
+  for (size_t i = t; i < nPreElts + nSufElts; i += tn) {
+    size_t elt = i < nPreElts ? i : nElts - nPreElts - nSufElts + i;
+    int dr = inPlace ? 1 : 0;
+    int r = rank + dr;
+    if (r == nRanks) r = 0;
+#pragma unroll 1
+    for (; dr + UnrollPeers <= nRanks; dr += UnrollPeers) {
+#pragma unroll UnrollPeers
+      for (int u = 0; u < UnrollPeers; u++) {
+        outPacks[r * nAllElts + elt] = inpPacks.lsaPtr(r)[elt];
+        if (++r == nRanks) r = 0;
+      }
+    }
+#pragma unroll UnrollPeers
+    for (int u = 0; u < UnrollPeers; u++) {
+      if (dr + u == nRanks) break;
+      outPacks[r * nAllElts + elt] = inpPacks.lsaPtr(r)[elt];
+      if (++r == nRanks) r = 0;
+    }
+  }
+}
+
+template <typename T>
+static __device__ void gather(ncclSymkArgsHandler const& handler, int tn, int t, int nBlocks, bool waitNeeded,
+                              ncclLsaBarrierSession<ncclCoopCta>& bar, ncclSymPtr<T> input, ncclSymPtr<T> output,
+                              size_t nElts, size_t nAllElts) {
+  int const& rank = handler.comm.rank;
+  bool inPlace = (input == output + rank * nAllElts);
+  size_t nBytes = nElts * sizeof(T);
+  size_t nAllBytes = nAllElts * sizeof(T);
+  uint32_t nBlocks_rcp32 = nccl::utility::idivRcp32_upto64(nBlocks);
+
+  // Loads land at `input.offset` on every peer while stores land at
+  // `output.offset + r*nAllBytes`, so the per-rank stride has to be packed too
+  // for a single alignment test to hold across all peers.
+  uint32_t alignment = uint32_t(input.offset - output.offset);
+  uint32_t nPreBytes = (16 - input.offset) % 16;
+  nPreBytes = min((size_t)nPreBytes, nBytes);
+  uintptr_t cursor = nPreBytes;
+
+  constexpr int MinWarpPerBlock = 4;
+
+  if (alignment % 16 == 0 && nAllBytes % 16 == 0) {
+    constexpr int BytePerPack = 16, UnrollPacks = 4, UnrollPeers = 2;
+    constexpr int BytePerChunk = MinWarpPerBlock * UnrollPacks * WARP_SIZE * BytePerPack;
+    uint32_t chunks = (nBytes - cursor) / BytePerChunk;
+    chunks -= imodFast32(chunks, nBlocks, nBlocks_rcp32);
+    if (chunks != 0) {
+      uintptr_t cursorAfter = cursor + uintptr_t(chunks) * BytePerChunk;
+      gatherDeep<BytePerPack, UnrollPacks, UnrollPeers>(handler, tn, t, waitNeeded, bar,
+                                                        (ncclSymPtr<char>)input + cursor,
+                                                        (ncclSymPtr<char>)output + cursor, nAllBytes, inPlace,
+                                                        chunks * MinWarpPerBlock);
+      cursor = cursorAfter;
+      waitNeeded = false;
+    }
+  }
+
+  if (sizeof(T) == 4 || (sizeof(T) < 4 && alignment % 4 == 0 && nAllBytes % 4 == 0)) {
+    constexpr int BytePerPack = 4, UnrollPacks = 4, UnrollPeers = 4;
+    constexpr int BytePerChunk = MinWarpPerBlock * UnrollPacks * WARP_SIZE * BytePerPack;
+    uint32_t chunks = (nBytes - cursor) / BytePerChunk;
+    chunks -= imodFast32(chunks, nBlocks, nBlocks_rcp32);
+    if (chunks != 0) {
+      uintptr_t cursorAfter = cursor + uintptr_t(chunks) * BytePerChunk;
+      gatherDeep<(sizeof(T) <= BytePerPack ? BytePerPack : 0), UnrollPacks, UnrollPeers>(
+        handler, tn, t, waitNeeded, bar, (ncclSymPtr<char>)input + cursor, (ncclSymPtr<char>)output + cursor, nAllBytes,
+        inPlace, chunks * MinWarpPerBlock);
+      cursor = cursorAfter;
+      waitNeeded = false;
+    }
+  }
+
+  if (waitNeeded) bar.wait(ncclCoopCta(), NCCL_MEM_ORDER_RELAXED);
+
+  constexpr int UnrollPeers = 8;
+  size_t nSufElts = (nBytes - cursor) / sizeof(T);
+  gatherEnds<UnrollPeers>(handler, tn, t, input, output, inPlace, nElts, nAllElts, nPreBytes / sizeof(T), nSufElts);
+}
+
+__device__ __forceinline__ void ncclSymkRun_AllGather_LD(ncclSymkDevWorkArgs const* args) {
+  ncclSymkArgsHandler handler{args};
+  ncclLsaBarrierSession<ncclCoopCta> bar{ncclCoopCta(), handler.comm, ncclTeamTagLsa(), blockIdx.x};
+
+  bar.arrive(ncclCoopCta(), NCCL_MEM_ORDER_RELAXED);
+
+  bool waitNeeded = true;
+  handler.forEachWork<char>([&] __device__(int block, int nBlocks, size_t nElts, size_t nAllElts,
+                                           ncclSymPtr<char> input, ncclSymPtr<char> output) {
+        // Threads numbered over rank.
+    int bt =
+      flattenIx(threadIdx.x % WARP_SIZE, WARP_SIZE, block, nBlocks, threadIdx.x / WARP_SIZE, blockDim.x / WARP_SIZE);
+    int btn = nBlocks * blockDim.x;
+    gather<char>(handler, btn, bt, nBlocks, waitNeeded, bar, input, output, nElts, nAllElts);
+    waitNeeded = false;
+  });
+
+  bar.sync(ncclCoopCta(), NCCL_MEM_ORDER_RELEASE);
+}
+
 template <typename EltType>
 static __device__ void allgather_LL_body(ncclSymkArgsHandler& handler, ncclLLA2ASession<ncclCoopCta>& lla2a,
                                          EltType* input, EltType* output, int nElts, int nPacks, int nStrideElts) {

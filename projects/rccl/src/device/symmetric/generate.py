@@ -91,7 +91,7 @@ ty_to_cxxtype = {
 }
 
 def enumerate_kernels():
-  for algo in ["LL","ST"]:
+  for algo in ["LL","ST","LD"]:
     yield Rec(coll="AllGather", algo=algo)
   for red in all_reds:
     for ty in all_tys:

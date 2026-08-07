@@ -24,6 +24,7 @@ constexpr char const* kernelName[] = {
   "AllGather_LLMC",
   "AllGather_TmaST",
   "AllGather_ST",
+  "AllGather_LD",
   "AllGather_TmaSTMC",
   "AllGather_STMC",
   "AllGather_RailRing_LsaSTMC",
@@ -52,7 +53,14 @@ constexpr uint32_t kernelMask_LL = 1 << ncclSymkKernelId_AllReduce_AGxLL_R | 1 <
 constexpr uint32_t kernelMask_AG = 1 << ncclSymkKernelId_AllGather_LL | 1 << ncclSymkKernelId_AllGather_LLMC |
                                    1 << ncclSymkKernelId_AllGather_ST | 1 << ncclSymkKernelId_AllGather_STMC |
                                    1 << ncclSymkKernelId_AllGather_TmaST | 1 << ncclSymkKernelId_AllGather_TmaSTMC |
+                                   1 << ncclSymkKernelId_AllGather_LD |
                                    1 << ncclSymkKernelId_AllGather_RailRing_LsaSTMC;
+
+// Pull kernels load the peers' input windows and store locally, so they need a
+// registered send buffer. Push kernels store into the peers' output windows and
+// need a registered recv buffer instead.
+constexpr uint32_t kernelMask_AG_Pull = 1 << ncclSymkKernelId_AllGather_LD;
+constexpr uint32_t kernelMask_AG_Push = kernelMask_AG & ~kernelMask_AG_Pull & ~kernelMask_LL;
 
 constexpr uint32_t kernelMask_AR = 1 << ncclSymkKernelId_AllReduce_AGxLLMC_R | 1 << ncclSymkKernelId_AllReduce_AGxLL_R |
                                    1 << ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC |
@@ -70,7 +78,8 @@ constexpr uint32_t kernelMask_LSA =
   1 << ncclSymkKernelId_AllReduce_RSxTmaLD_AGxTmaST | 1 << ncclSymkKernelId_AllGather_LL |
   1 << ncclSymkKernelId_AllGather_LLMC | 1 << ncclSymkKernelId_AllGather_ST | 1 << ncclSymkKernelId_AllGather_STMC |
   1 << ncclSymkKernelId_AllGather_TmaST | 1 << ncclSymkKernelId_AllGather_TmaSTMC |
-  1 << ncclSymkKernelId_ReduceScatter_LL | 1 << ncclSymkKernelId_ReduceScatter_LD |
+  1 << ncclSymkKernelId_AllGather_LD | 1 << ncclSymkKernelId_ReduceScatter_LL |
+  1 << ncclSymkKernelId_ReduceScatter_LD |
   1 << ncclSymkKernelId_ReduceScatter_LDMC | 1 << ncclSymkKernelId_ReduceScatter_TmaLD;
 
 constexpr uint32_t kernelMask_Gin = 1 << ncclSymkKernelId_ReduceScatter_RailA2A_LsaLD |
@@ -437,6 +446,8 @@ static void queryModel_lsa(struct ncclComm* comm, ncclSymkKernelId k, size_t nBy
     break;
   case ncclSymkKernelId_AllGather_TmaST:
   case ncclSymkKernelId_AllGather_ST:
+  case ncclSymkKernelId_AllGather_LD:
+    // Pull moves the same bytes as push, just as reads rather than writes.
     busBytes = (nRanks - 1) * nBytes;
     break;
   case ncclSymkKernelId_AllGather_TmaSTMC:
@@ -691,7 +702,12 @@ ncclResult_t ncclSymkPickKernel(struct ncclComm* comm, ncclFunc_t coll, int /*nc
   if (coll == ncclFuncAllReduce) {
     if (winRegType != ncclSymSendRegRecvReg) kmask &= kernelMask_LL;
   } else if (coll == ncclFuncAllGather) {
-    if (winRegType != ncclSymSendRegRecvReg && winRegType != ncclSymSendNonregRecvReg) kmask &= kernelMask_LL;
+    if (winRegType != ncclSymSendRegRecvReg) {
+      uint32_t allowed = kernelMask_LL;
+      if (winRegType == ncclSymSendNonregRecvReg) allowed |= kernelMask_AG_Push;
+      if (winRegType == ncclSymSendRegRecvNonreg) allowed |= kernelMask_AG_Pull;
+      kmask &= allowed;
+    }
     if (winRegType != ncclSymSendRegRecvReg && comm->nNodes > 1) kmask &= ~kernelMask_Gin;
   } else if (coll == ncclFuncReduceScatter) {
     if (winRegType != ncclSymSendRegRecvReg && winRegType != ncclSymSendRegRecvNonreg) kmask &= kernelMask_LL;
