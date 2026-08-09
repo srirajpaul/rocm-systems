@@ -17,12 +17,12 @@
 
 namespace meta::comms {
 
-// symmetric-memory DDA all-gather kernel (IPC path). Unlike the copy-based
+// symmetric-memory DDA all-gather kernel (IPC path)
 template <typename T, int NRANKS, int inplace>
 __device__ void gather_symm_dda(
-    T* __restrict__ recvPtr,
+    T* __restrict__ (&recvPtr)[NRANKS],
     size_t count,
-    T* __restrict__ sendPtr[NRANKS],
+    T* __restrict__ (&sendPtr)[NRANKS],
     int selfRank) {
   // use uint4 to do 16-byte loads to maximize memory efficiency
   // We assume that count % countPerThread == 0. This assumption is enforced
@@ -35,19 +35,19 @@ __device__ void gather_symm_dda(
   const auto idxEnd = count;
   const auto idxStride = gridDim.x * blockDim.x * countPerThread;
 
-  #if 0
+  #if 1
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
-    uint4 tmp[NRANKS];
+    v4u tmp[NRANKS];
     #pragma unroll NRANKS
     for (int r = inplace; r < NRANKS; ++r) {
       int peer = (selfRank + r) % NRANKS;
-      tmp[r] = *reinterpret_cast<const uint4*>(&sendPtr[peer][idx]);
+      tmp[r] = *(v4u_gptr)(&sendPtr[peer][idx]);
     }
     #pragma unroll NRANKS
     for (int r = inplace; r < NRANKS; ++r) {
       int peer = (selfRank + r) % NRANKS;
       size_t dstIdx = peer * count + idx;
-      *reinterpret_cast<uint4*>(&recvPtr1[dstIdx]) = tmp[r];
+      *(v4u_gptr)(&recvPtr[selfRank][dstIdx]) = tmp[r];
     }
   }
   #else
@@ -56,8 +56,7 @@ __device__ void gather_symm_dda(
     for (int r = inplace; r < NRANKS; ++r) {
         int peer = (selfRank + r) % NRANKS;
         size_t dstIdx = peer * count + idx;
-        size_t srcIdx = inplace ? dstIdx : idx;
-        *(v4u_gptr)(&recvPtr[dstIdx]) = *(v4u_gptr)(&sendPtr[peer][srcIdx]);
+        *(v4u_gptr)(&recvPtr[selfRank][dstIdx]) = *(v4u_gptr)(&sendPtr[peer][idx]);
     }
   }
   #endif
@@ -82,19 +81,22 @@ __launch_bounds__(512)
 
   T* __restrict__ recvPtr[NRANKS];
   T* __restrict__ sendPtr[NRANKS];
-
-  #pragma unroll
-  for (int i = 0; i < NRANKS; i++) {
-      recvPtr[i] = recvSymPtr.lsaPtr(i);
-      sendPtr[i] = sendSymPtr.lsaPtr(i);
-  }
-
   const int inplace = sendSymPtr == recvSymPtr + count * selfRank;
   if (inplace) {
-    gather_symm_dda<T, NRANKS, 1>(recvPtr[selfRank], count, recvPtr, selfRank);
+    #pragma unroll
+    for (int i = 0; i < NRANKS; i++) {
+        recvPtr[i] = recvSymPtr.lsaPtr(i);
+        sendPtr[i] = recvSymPtr.lsaPtr(i) + count * i;
+    }
+    gather_symm_dda<T, NRANKS, 1>(recvPtr, count, sendPtr, selfRank);
   }
   else {
-    gather_symm_dda<T, NRANKS, 0>(recvPtr[selfRank], count, sendPtr, selfRank);
+    #pragma unroll
+    for (int i = 0; i < NRANKS; i++) {
+        recvPtr[i] = recvSymPtr.lsaPtr(i);
+        sendPtr[i] = sendSymPtr.lsaPtr(i);
+    }
+    gather_symm_dda<T, NRANKS, 0>(recvPtr, count, sendPtr, selfRank);
   }
 
   // barrier to ensure remote ranks won't free their buffers until I'm done
