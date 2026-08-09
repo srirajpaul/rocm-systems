@@ -103,6 +103,7 @@ set(SRC_FILES
   include/algorithms/all_reduce/all_reduce_dda.h
   include/algorithms/reduce_scatter/reduce_scatter_dda.h
   include/algorithms/all_gather/all_gather_dda.h
+  include/algorithms/all_gather/all_gather_symm_dda.h
   include/algorithms/alltoall/alltoall_dda.h
   include/algorithms/alltoall/alltoall_symm_dda.h
   include/alt_rsmi.h

@@ -8,6 +8,7 @@
 
 #include "algorithms/CollCommon.h"
 #include "algorithms/all_gather/all_gather_dda.h"
+#include "algorithms/all_gather/all_gather_symm_dda.h"
 #include "checks.h"
 #include "comm.h"
 #include "debug.h"
@@ -62,14 +63,28 @@ static ncclResult_t ncclAllGatherDdaIpcTyped(
   void* peerPtrsDev = comm->ddaIpcPeerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
 
-  meta::comms::ddaAllGatherIpc<T, kDdaNranks, false>
-      <<<grid, block, 0, stream>>>(
-          d_ipcbuffs,
-          static_cast<T*>(recvbuff),
-          sendcount,
-          static_cast<const T*>(sendbuff),
-          comm->rank,
-          barrierHost);
+  if (comm->symmetricSupport) {
+    ncclSymPtr<char> recvSymPtr, sendSymPtr;
+    NCCLCHECK(meta::comms::ncclPtrToSymPtr(comm, recvbuff, recvSymPtr));
+    NCCLCHECK(meta::comms::ncclPtrToSymPtr(comm, (void*)sendbuff, sendSymPtr));
+
+    meta::comms::ddaAllGatherIpcSymm<T, kDdaNranks, false>
+        <<<grid, block, 0, stream>>>(
+            recvSymPtr,
+            sendcount,
+            sendSymPtr,
+            comm->rank,
+            barrierHost);
+  } else {
+    meta::comms::ddaAllGatherIpc<T, kDdaNranks, false>
+        <<<grid, block, 0, stream>>>(
+            d_ipcbuffs,
+            static_cast<T*>(recvbuff),
+            sendcount,
+            static_cast<const T*>(sendbuff),
+            comm->rank,
+            barrierHost);
+  }
 
   CUDACHECK(cudaGetLastError());
 
@@ -107,7 +122,10 @@ bool ncclAllGatherDdaIpcEligible(
 
   size_t need = sendcount * ncclTypeSize(datatype);
   if (need > comm->ddaIpcScratchBytes) {
-    return false;
+    // symmetric does not need scratch buffer
+    if (!comm->symmetricSupport) {
+      return false;
+    }
   }
 
   // Check for data size divisible by 16
