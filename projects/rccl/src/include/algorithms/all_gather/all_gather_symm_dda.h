@@ -35,13 +35,16 @@ __device__ void gather_symm_dda(
   const auto idxEnd = count;
   const auto idxStride = gridDim.x * blockDim.x * countPerThread;
 
+  T* __restrict__ (&sendPtr_use)[NRANKS] = inplace ? recvPtr : sendPtr;
+
   #if 1
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
     v4u tmp[NRANKS];
     #pragma unroll NRANKS
     for (int r = inplace; r < NRANKS; ++r) {
       int peer = (selfRank + r) % NRANKS;
-      tmp[r] = *(v4u_gptr)(&sendPtr[peer][idx]);
+      size_t srcIdx = inplace ? idx + count * peer : idx;
+      tmp[r] = *(v4u_gptr)(&sendPtr_use[peer][srcIdx]);
     }
     #pragma unroll NRANKS
     for (int r = inplace; r < NRANKS; ++r) {
@@ -56,7 +59,8 @@ __device__ void gather_symm_dda(
     for (int r = inplace; r < NRANKS; ++r) {
         int peer = (selfRank + r) % NRANKS;
         size_t dstIdx = peer * count + idx;
-        *(v4u_gptr)(&recvPtr[selfRank][dstIdx]) = *(v4u_gptr)(&sendPtr[peer][idx]);
+        size_t srcIdx = inplace ? idx + count * peer : idx;
+        *(v4u_gptr)(&recvPtr[selfRank][dstIdx]) = *(v4u_gptr)(&sendPtr_use[peer][srcIdx]);
     }
   }
   #endif
@@ -81,21 +85,18 @@ __launch_bounds__(512)
 
   T* __restrict__ recvPtr[NRANKS];
   T* __restrict__ sendPtr[NRANKS];
+
+  #pragma unroll
+  for (int i = 0; i < NRANKS; i++) {
+      recvPtr[i] = recvSymPtr.lsaPtr(i);
+      sendPtr[i] = sendSymPtr.lsaPtr(i);
+  }
+
   const int inplace = sendSymPtr == recvSymPtr + count * selfRank;
   if (inplace) {
-    #pragma unroll
-    for (int i = 0; i < NRANKS; i++) {
-        recvPtr[i] = recvSymPtr.lsaPtr(i);
-        sendPtr[i] = recvSymPtr.lsaPtr(i) + count * i;
-    }
     gather_symm_dda<T, NRANKS, 1>(recvPtr, count, sendPtr, selfRank);
   }
   else {
-    #pragma unroll
-    for (int i = 0; i < NRANKS; i++) {
-        recvPtr[i] = recvSymPtr.lsaPtr(i);
-        sendPtr[i] = sendSymPtr.lsaPtr(i);
-    }
     gather_symm_dda<T, NRANKS, 0>(recvPtr, count, sendPtr, selfRank);
   }
 
