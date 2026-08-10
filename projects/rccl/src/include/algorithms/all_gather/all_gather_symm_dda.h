@@ -43,7 +43,7 @@ __device__ void gather_symm_dda(
     #pragma unroll NRANKS
     for (int r = inplace; r < NRANKS; ++r) {
       int peer = (selfRank + r) % NRANKS;
-      size_t srcIdx = inplace ? idx + count * peer : idx;
+      size_t srcIdx = inplace * count * peer + idx;
       tmp[r] = *(v4u_gptr)(&sendPtr_use[peer][srcIdx]);
     }
     #pragma unroll NRANKS
@@ -59,7 +59,7 @@ __device__ void gather_symm_dda(
     for (int r = inplace; r < NRANKS; ++r) {
         int peer = (selfRank + r) % NRANKS;
         size_t dstIdx = peer * count + idx;
-        size_t srcIdx = inplace ? idx + count * peer : idx;
+        size_t srcIdx = inplace * count * peer + idx;
         *(v4u_gptr)(&recvPtr[selfRank][dstIdx]) = *(v4u_gptr)(&sendPtr_use[peer][srcIdx]);
     }
   }
