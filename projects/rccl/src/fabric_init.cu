@@ -24,7 +24,6 @@ using meta::comms::kDdaMaxNranks;
 using nccl_dda_detail::ddaFabricMaxNBlocksForScratch;
 using nccl_dda_detail::ddaLLEpochCount;
 using nccl_dda_detail::DdaFabricBarrierState;
-using nccl_dda_detail::kDdaFabricLLArMaxBlocks;
 
 bool ncclDdaUseFabricPath(ncclComm* comm) {
   if (comm == nullptr) {

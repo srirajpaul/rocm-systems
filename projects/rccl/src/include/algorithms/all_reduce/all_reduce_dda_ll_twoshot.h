@@ -171,10 +171,12 @@ __launch_bounds__(512)
     }
   }
 
-  if (threadIdx.x == 0) {
-    for (int e = flatBlockId; e < epochLen; e += total) {
-      epochDev[e] = flag;
-    }
+  // Refresh the epoch cells. Cell e stays owned by block (e % total), so no
+  // block can clobber the cell another block read at entry, but within that
+  // residue class the stores are spread over the block's threads: at total == 1
+  // one lane would otherwise serialize all epochLen stores on the exit path.
+  for (int e = flatBlockId + (int)threadIdx.x * total; e < epochLen; e += total * (int)blockDim.x) {
+    epochDev[e] = flag;
   }
 }
 

@@ -35,7 +35,7 @@ namespace meta::comms {
 // a whole message here, since this tier stages the full payload per peer.
 // Footprint = 2 banks * nRanks * kDdaLLArSlotStridePkts * 16B, i.e. nRanks * 16
 // MiB: 128 MiB at 8 ranks and 1.125 GiB at 72, within the 10 GiB DDA scratch.
-constexpr size_t kDdaLLArMaxBytes = 4194304;                      // 4 MiB
+constexpr size_t kDdaLLArMaxBytes = 16777216;                      // 16 MiB
 constexpr size_t kDdaLLArSlotStridePkts = kDdaLLArMaxBytes / 8;   // 524288 packets
 
 // LL flat all-reduce kernel. 1D grid over packets (8B payload each).
@@ -120,10 +120,12 @@ __launch_bounds__(512)
     out[2 * pk + 1] = acc1;
   }
 
-  if (threadIdx.x == 0) {
-    for (int e = flatBlockId; e < epochLen; e += total) {
-      epochDev[e] = flag;
-    }
+  // Refresh the epoch cells. Cell e stays owned by block (e % total), so no
+  // block can clobber the cell another block read at entry, but within that
+  // residue class the stores are spread over the block's threads: at total == 1
+  // one lane would otherwise serialize all epochLen stores on the exit path.
+  for (int e = flatBlockId + (int)threadIdx.x * total; e < epochLen; e += total * (int)blockDim.x) {
+    epochDev[e] = flag;
   }
 }
 
