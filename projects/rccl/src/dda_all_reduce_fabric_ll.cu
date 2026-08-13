@@ -61,17 +61,17 @@ static inline size_t ddaLLArScratchSize(int nRanks) {
   return (size_t)2 * (size_t)nRanks * kDdaLLArSlotStridePkts * sizeof(LLPacket16);
 }
 
-// Two-shot footprint, sized off that tier's own slot constant so it tracks the
-// tier it guards rather than the one-shot's.
+// Two-shot footprint, 2 banks * nRanks slots * slotStride packets * 16B  * 2 phases.
 static inline size_t ddaLLArTwoShotScratchSize(int nRanks) {
-  return (size_t)2 * (size_t)nRanks * kDdaLLArTwoShotSlotStridePkts * sizeof(LLPacket16);
+  return (size_t)2 * (size_t)nRanks * kDdaLLArTwoShotSlotStridePkts * sizeof(LLPacket16) * 2;
 }
 
 // The two tiers stage through one scratch under one epoch, so bank 1 has to
 // start at the same offset for both; otherwise a launch of one could write over
 // lines the other is still polling an epoch later.
 static_assert(kDdaLLArTwoShotSlotStridePkts == kDdaLLArSlotStridePkts / 2,
-              "LL all-reduce tiers share one scratch and epoch; keep LL-ts slot half of LL");
+              "LL all-reduce tiers share one scratch and epoch; \
+              keep LL-ts slot half of LL becuase the scratch is used in two phases");
 
 template <typename T>
 static ncclResult_t ncclAllReduceDdaFabricLLTyped(const void* sendbuff, void* recvbuff, size_t count, ncclComm* comm,
@@ -207,9 +207,8 @@ static bool ddaLLArOneShotEligible(ncclComm* comm, const void* sendbuff, void* r
   }
 
   const size_t bytes = count * ncclTypeSize(datatype);
-  // Payload is staged as 8-byte LL packets, so it must be a whole number of
-  // packets.
-  if (bytes % 8 != 0) {
+
+  if (bytes % 16 != 0) {
     return false;
   }
   if (bytes > kDdaLLArMaxBytes) {
@@ -248,19 +247,22 @@ static bool ddaLLArTwoShotEligible(ncclComm* comm, const void* sendbuff, void* r
   }
 
   const size_t bytes = count * ncclTypeSize(datatype);
-  // Payload is staged as 8-byte LL packets per rank,
-  // so it must be a whole number of packets.
-  if (bytes % (8 * (size_t)comm->nRanks) != 0) {
-    return false;
-  }
-  if (bytes > kDdaLLArTwoShotMaxBytes) {
-    return false;
-  }
-  if (ddaLLArTwoShotScratchSize(comm->nRanks) > comm->ddaScratchBytes) {
+
+  if (bytes % (size_t)comm->nRanks != 0) {
     return false;
   }
 
-  if ((bytes >> 3) / (size_t)comm->nRanks > kDdaLLArTwoShotSlotStridePkts) {
+  const size_t bytesPerRank = bytes / (size_t)comm->nRanks;
+
+  if (bytesPerRank % 16 != 0) {
+    return false;
+  }
+
+  if (bytesPerRank > kDdaLLArTwoShotMaxBytes) {
+    return false;
+  }
+
+  if (ddaLLArTwoShotScratchSize(comm->nRanks) > comm->ddaScratchBytes) {
     return false;
   }
 
