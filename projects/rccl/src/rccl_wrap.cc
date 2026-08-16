@@ -555,7 +555,7 @@ bool rcclDdaEnabled(const ncclComm* comm, size_t totalBytes, size_t gfx942Defaul
     threshold = gfx1250Default ? gfx1250Default : static_cast<size_t>(rcclParamDdaThreshold());
   } else if (IsArchMatch(comm->archName, "gfx942") || IsArchMatch(comm->archName, "gfx950")) {
     if (comm->nRanks < 8) return false;
-    if (IsArchMatch(comm->archName, "gfx942")) {
+    if (false && IsArchMatch(comm->archName, "gfx942")) {
       threshold = gfx942Default;
     } else {
       threshold = gfx950Default ? gfx950Default : static_cast<size_t>(rcclParamDdaThreshold());
