@@ -475,11 +475,60 @@ static __device__ void gather(ncclSymkArgsHandler const& handler, int tn, int t,
   gatherEnds<UnrollPeers>(handler, tn, t, input, output, inPlace, nElts, nAllElts, nPreBytes / sizeof(T), nSufElts);
 }
 
+// symmetric-memory DDA all-gather kernel (IPC path)
+template <typename T, int NRANKS, int inplace>
+__device__ void gather_symm_dda(
+    T* __restrict__ (&recvPtr)[NRANKS],
+    size_t count,
+    T* __restrict__ (&sendPtr)[NRANKS],
+    int selfRank) {
+  // use uint4 to do 16-byte loads to maximize memory efficiency
+  // We assume that count % countPerThread == 0. This assumption is enforced
+  // before kernel launch.
+  static_assert(sizeof(T) == 1);
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
+
+  const auto idxStart = gtIdx * countPerThread;
+  const auto idxEnd = count;
+  const auto idxStride = gridDim.x * blockDim.x * countPerThread;
+
+  T* __restrict__ (&sendPtr_use)[NRANKS] = inplace ? recvPtr : sendPtr;
+
+  #if 1
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    v4u tmp[NRANKS];
+    #pragma unroll NRANKS
+    for (int r = inplace; r < NRANKS; ++r) {
+      int peer = (selfRank + r) % NRANKS;
+      size_t srcIdx = inplace * count * peer + idx;
+      tmp[r] = *(v4u_gptr)(&sendPtr_use[peer][srcIdx]);
+    }
+    #pragma unroll NRANKS
+    for (int r = inplace; r < NRANKS; ++r) {
+      int peer = (selfRank + r) % NRANKS;
+      size_t dstIdx = peer * count + idx;
+      *(v4u_gptr)(&recvPtr[selfRank][dstIdx]) = tmp[r];
+    }
+  }
+  #else
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    #pragma unroll NRANKS
+    for (int r = inplace; r < NRANKS; ++r) {
+        int peer = (selfRank + r) % NRANKS;
+        size_t dstIdx = peer * count + idx;
+        size_t srcIdx = inplace * count * peer + idx;
+        *(v4u_gptr)(&recvPtr[selfRank][dstIdx]) = *(v4u_gptr)(&sendPtr_use[peer][srcIdx]);
+    }
+  }
+  #endif
+}
+
 __device__ __forceinline__ void ncclSymkRun_AllGather_LD(ncclSymkDevWorkArgs const* args) {
   ncclSymkArgsHandler handler{args};
   ncclLsaBarrierSession<ncclCoopCta> bar{ncclCoopCta(), handler.comm, ncclTeamTagLsa(), blockIdx.x};
 
-  bar.arrive(ncclCoopCta(), NCCL_MEM_ORDER_RELAXED);
+  bar.sync(ncclCoopCta(), NCCL_MEM_ORDER_RELAXED);
 
   bool waitNeeded = true;
   handler.forEachWork<char>([&] __device__(int block, int nBlocks, size_t nElts, size_t nAllElts,
@@ -488,8 +537,31 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_LD(ncclSymkDevWorkArgs con
     int bt =
       flattenIx(threadIdx.x % WARP_SIZE, WARP_SIZE, block, nBlocks, threadIdx.x / WARP_SIZE, blockDim.x / WARP_SIZE);
     int btn = nBlocks * blockDim.x;
-    gather<char>(handler, btn, bt, nBlocks, waitNeeded, bar, input, output, nElts, nAllElts);
-    waitNeeded = false;
+
+    int const& rank = handler.comm.rank;
+    int const& nRanks = handler.comm.nRanks;
+    const size_t count = nElts;
+    const int inplace = input == output + count * rank;
+
+    constexpr int NR = 8;
+    char* __restrict__ recvPtr[NR];
+    char* __restrict__ sendPtr[NR];
+
+    #pragma unroll
+    for (int i = 0; i < nRanks; i++) {
+        recvPtr[i] = output.lsaPtr(i);
+        sendPtr[i] = input.lsaPtr(i);
+    }
+
+    assert(nRanks == 8);
+    if (inplace) {
+      gather_symm_dda<char, NR, 1>(recvPtr, count, sendPtr, rank);
+    }
+    else {
+      gather_symm_dda<char, NR, 0>(recvPtr, count, sendPtr, rank);
+    }
+
+    //gather<char>(handler, btn, bt, nBlocks, waitNeeded, bar, input, output, nElts, nAllElts);
   });
 
   bar.sync(ncclCoopCta(), NCCL_MEM_ORDER_RELEASE);
