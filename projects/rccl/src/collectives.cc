@@ -335,6 +335,10 @@ ncclResult_t ncclAllGather_impl(const void* sendbuff, void* recvbuff, size_t sen
   bool symEligible =
     isSymmetricKernelRequested(comm, ncclFuncAllGather, (int)ncclDevSum, datatype, sendcount, sendbuff, recvbuff);
 
+  // RCCL_DDA_SYMM hands registered symmetric windows to the DDA symm kernel instead,
+  // which is otherwise shadowed by the symmetric collective kernels above.
+  if (symEligible && rcclParamDdaSymm()) symEligible = false;
+
   if (!symEligible && rcclDdaEnabled(comm, nRanks * sendcount * ncclTypeSize(datatype), 8388608)) {
     if (IsArchMatch(comm->archName, "gfx1250")) {
       const int64_t llThresh = rcclParamDdaLLThreshold();

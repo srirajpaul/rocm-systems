@@ -33,6 +33,7 @@ using bf162 = __nv_bfloat162;
 #endif
 
 #include "nccl_device/rccl_ptr.h"
+#include "dev_runtime.h"
 
 namespace meta::comms {
 
@@ -266,6 +267,18 @@ __device__ __forceinline__ void ddaLLLoadLineB128(const uint32_t* src, uint32_t&
   o2 = __builtin_nontemporal_load((u32_gptr)src + 2);
   o3 = __builtin_nontemporal_load((u32_gptr)src + 3);
 #endif
+}
+
+// returns ncclSuccess if ptr is in a symmetric window,
+// ncclInvalidArgument if not.
+inline ncclResult_t ncclPtrToSymPtr(struct ncclComm* comm, void* ptr, ncclSymPtr<char>& out) {
+  struct ncclDevrWindow* win = nullptr;
+  NCCLCHECK(ncclDevrFindWindow(comm, ptr, &win));
+  if (win == nullptr) return ncclInvalidArgument;
+
+  out.window = win->vidmem;
+  out.offset = (uint8_t*)ptr - (uint8_t*)win->userPtr;
+  return ncclSuccess;
 }
 
 } // namespace meta::comms

@@ -16,7 +16,7 @@
 #include <memory>
 #include <new>
 
-#define DDA_IPC_MAXBLOCKS 24
+#define DDA_IPC_MAXBLOCKS 16
 #define DDA_IPC_BUFFER_SIZE 268435456
 
 #define DDA_FABRIC_MAXBLOCKS 256

@@ -8,6 +8,7 @@
 
 #include "algorithms/CollCommon.h"
 #include "algorithms/all_gather/all_gather_dda.h"
+#include "algorithms/all_gather/all_gather_symm_dda.h"
 #include "checks.h"
 #include "comm.h"
 #include "debug.h"
@@ -27,16 +28,33 @@ using nccl_dda_detail::DdaIpcBarrierState;
 using nccl_dda_detail::ddaMaxNBlocksForScratch;
 using nccl_dda_detail::kDdaNranks;
 
+// The symmetric kernel reaches peers through their windows, so it needs neither the
+// staging scratch nor the host-resolved peer pointer array. It does require both user
+// buffers to live in symmetric windows, which comm->symmetricSupport alone does not
+// imply -- that flag only says the comm *can* host windows.
+static bool ddaAllGatherUseSymm(ncclComm* comm, const void* sendbuff, void* recvbuff, ncclSymPtr<char>& recvSymPtr,
+                                ncclSymPtr<char>& sendSymPtr) {
+  if (!comm->symmetricSupport) return false;
+  if (meta::comms::ncclPtrToSymPtr(comm, recvbuff, recvSymPtr) != ncclSuccess) return false;
+  if (meta::comms::ncclPtrToSymPtr(comm, const_cast<void*>(sendbuff), sendSymPtr) != ncclSuccess) return false;
+  return true;
+}
+
 template <typename T>
 static ncclResult_t ncclAllGatherDdaIpcTyped(const void* sendbuff, void* recvbuff, size_t sendcount, ncclComm* comm,
                                              cudaStream_t stream) {
-  if (comm->ddaIpcMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr ||
-      comm->ddaIpcBarrierState == nullptr) {
+  ncclSymPtr<char> recvSymPtr, sendSymPtr;
+  const bool useSymm = ddaAllGatherUseSymm(comm, sendbuff, recvbuff, recvSymPtr, sendSymPtr);
+
+  if (comm->ddaIpcMemHandler == nullptr || comm->ddaIpcBarrierState == nullptr) {
+    return ncclInvalidUsage;
+  }
+  if (!useSymm && (comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr)) {
     return ncclInvalidUsage;
   }
 
   const size_t totalCount = sendcount * comm->nRanks;
-  if (totalCount * sizeof(T) > comm->ddaScratchBytes) {
+  if (!useSymm && totalCount * sizeof(T) > comm->ddaScratchBytes) {
     WARN("DDA IPC allgather: send element count %zu needs %zu bytes; comm scratch is %zu bytes", sendcount,
          totalCount * sizeof(T), comm->ddaScratchBytes);
     return ncclInvalidArgument;
@@ -51,11 +69,20 @@ static ncclResult_t ncclAllGatherDdaIpcTyped(const void* sendbuff, void* recvbuf
   auto* barrierState = static_cast<DdaIpcBarrierState*>(comm->ddaIpcBarrierState);
   meta::comms::IpcGpuBarrier barrierHost = barrierState->barrierHost;
 
-  void* peerPtrsDev = comm->ddaPeerPtrsDev;
-  T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
+  // Must be useSymm, not comm->symmetricSupport: the latter only says the comm can host
+  // windows, so gating on it launches the symmetric kernel with null-window symmetric
+  // pointers whenever the user buffers are not registered.
+  if (useSymm) {
+    INFO(NCCL_COLL, "ddaAllGatherIpcSymm count %zu", sendcount);
+    meta::comms::ddaAllGatherIpcSymm<T, kDdaNranks, false><<<grid, block, 0, stream>>>(
+      recvSymPtr, sendcount, sendSymPtr, comm->rank, barrierHost);
+  } else {
+    INFO(NCCL_COLL, "ddaAllGatherIpc count %zu", sendcount);
+    T** d_ipcbuffs = reinterpret_cast<T**>(comm->ddaPeerPtrsDev);
 
-  meta::comms::ddaAllGatherIpc<T, kDdaNranks, false><<<grid, block, 0, stream>>>(
-    d_ipcbuffs, static_cast<T*>(recvbuff), sendcount, static_cast<const T*>(sendbuff), comm->rank, barrierHost);
+    meta::comms::ddaAllGatherIpc<T, kDdaNranks, false><<<grid, block, 0, stream>>>(
+      d_ipcbuffs, static_cast<T*>(recvbuff), sendcount, static_cast<const T*>(sendbuff), comm->rank, barrierHost);
+  }
 
   CUDACHECK(cudaGetLastError());
 
@@ -69,8 +96,12 @@ bool ncclAllGatherDdaIpcEligible(ncclComm* comm, const void* sendbuff, void* rec
   if (comm == nullptr || comm->bootstrap == nullptr) {
     return false;
   }
-  if (comm->ddaIpcMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr ||
-      comm->ddaIpcBarrierState == nullptr) {
+  if (comm->ddaIpcMemHandler == nullptr || comm->ddaIpcBarrierState == nullptr) {
+    return false;
+  }
+  ncclSymPtr<char> recvSymPtr, sendSymPtr;
+  const bool useSymm = ddaAllGatherUseSymm(comm, sendbuff, recvbuff, recvSymPtr, sendSymPtr);
+  if (!useSymm && (comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr)) {
     return false;
   }
   if (sendcount == 0) {
@@ -87,7 +118,7 @@ bool ncclAllGatherDdaIpcEligible(ncclComm* comm, const void* sendbuff, void* rec
   }
 
   size_t need = sendcount * ncclTypeSize(datatype);
-  if (need > comm->ddaScratchBytes) {
+  if (!useSymm && need > comm->ddaScratchBytes) {
     return false;
   }
 
