@@ -39,21 +39,24 @@ namespace {
 
 using meta::comms::kDdaLLArSlotStridePkts;
 using meta::comms::kDdaLLArTwoShotSlotStridePkts;
-using meta::comms::kDdaLL128ArSlotStridePkts;
+using meta::comms::kDdaLL128ArSlotWords;
 using meta::comms::kDdaLLMaxBytes;
 using meta::comms::LLPacket16;
 
-using meta::comms::kDdaLL128DataElems;
-using meta::comms::kDdaLL128Lanes;
+using meta::comms::ddaLL128ArDataBytesPerSlice;
+using meta::comms::ddaLL128ArMaxSlices;
+using meta::comms::ddaLL128ArSlices;
+using meta::comms::ddaLL128ArWireWordPerSlice;
 
 // LL scratch footprint: 2 banks * nRanks slots * slotStride packets * 16B.
 static inline size_t ddaLLArScratchSize(int nRanks) {
   return (size_t)2 * (size_t)nRanks * kDdaLLArSlotStridePkts * sizeof(LLPacket16);
 }
 
-// LL128 one-shot footprint matches LL one-shot until the LL128 kernel is updated.
+// LL128 one-shot footprint: 2 banks * nRanks slots * slotWords * 8B. Sized off
+// kDdaLLMaxBytes so it matches the LL tiers exactly; see kDdaLL128ArSlotWords.
 static inline size_t ddaLL128ArOneShotScratchSize(int nRanks) {
-  return (size_t)2 * (size_t)nRanks * kDdaLL128ArSlotStridePkts * sizeof(meta::comms::PackType);
+  return (size_t)2 * (size_t)nRanks * kDdaLL128ArSlotWords * sizeof(uint64_t);
 }
 
 // Two-shot footprint, 2 banks * nRanks slots * slotStride packets * 16B  * 2 phases.
@@ -123,15 +126,21 @@ static ncclResult_t ncclAllReduceDdaFabricLL128OneShotTyped(const void* sendbuff
                                                             ncclComm* comm, cudaStream_t stream) {
   const int nRanks = comm->nRanks;
   const size_t bytes = count * sizeof(T);
-  const size_t nPk = bytes / sizeof(meta::comms::PackType); // payload bytes per packet
+  const int wireWordPerSlice = ddaLL128ArWireWordPerSlice(comm->WarpSize);
+  const int dataBytesPerSlice = ddaLL128ArDataBytesPerSlice(comm->WarpSize, comm->ll128LineElems);
+  const size_t slices = (float)ddaLL128ArSlices(bytes, comm->WarpSize, comm->ll128LineElems);
+  const size_t slotWords = meta::comms::kDdaLL128ArSlotWords;
 
+  // One warp per slice, 1D grid: unlike all-gather there is no per-peer column,
+  // because every output word folds contributions from every rank.
   const unsigned threads = 1024;
+  const size_t warpsPerBlock = threads / (unsigned)comm->WarpSize;
   int nBlocksMax = comm->ddaFabricMaxBlocks;
   if (nBlocksMax < 1) {
     nBlocksMax = 1;
   }
-  const float nPkCeil = std::ceil((float)nPk * kDdaLL128Lanes / kDdaLL128DataElems);
-  unsigned blocks = (unsigned)std::min<size_t>((nPkCeil + threads - 1) / threads, (size_t)nBlocksMax);
+  unsigned blocks =
+    (unsigned)std::min<size_t>((slices + warpsPerBlock - 1) / warpsPerBlock, (size_t)nBlocksMax);
   if (blocks == 0) {
     blocks = 1;
   }
@@ -142,21 +151,27 @@ static ncclResult_t ncclAllReduceDdaFabricLL128OneShotTyped(const void* sendbuff
   uint32_t* epochDev = comm->ddaLLEpochDev;
   const int epochLen = comm->ddaLLEpochLen;
 
-  INFO(NCCL_COLL, "DDA fabric AllReduce LL128 one-shot: nRanks=%d bytes=%zu nPk=%zu grid=%u block=%u", nRanks, bytes,
-       nPk, grid.x, block.x);
+  INFO(NCCL_COLL,
+       "DDA fabric AllReduce LL128 one-shot: nRanks=%d bytes=%zu slices=%zu grid=%u block=%u "
+       "wave=%d lineElems=%d wire=%dB data=%dB slotWords=%zu",
+       nRanks, bytes, slices, grid.x, block.x, comm->WarpSize, comm->ll128LineElems,
+       wireWordPerSlice * 8, dataBytesPerSlice, slotWords);
 
   switch (nRanks) {
   case 4:
     meta::comms::ddaAllReduceFlatLL128<T, 4><<<grid, block, 0, stream>>>(
-      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), count, comm->rank, nRanks, epochDev, epochLen);
+      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), bytes, comm->rank, nRanks, epochDev, epochLen,
+      slices, slotWords, wireWordPerSlice, dataBytesPerSlice);
     break;
   case 8:
     meta::comms::ddaAllReduceFlatLL128<T, 8><<<grid, block, 0, stream>>>(
-      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), count, comm->rank, nRanks, epochDev, epochLen);
+      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), bytes, comm->rank, nRanks, epochDev, epochLen,
+      slices, slotWords, wireWordPerSlice, dataBytesPerSlice);
     break;
   default:
     meta::comms::ddaAllReduceFlatLL128<T, 0><<<grid, block, 0, stream>>>(
-      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), count, comm->rank, nRanks, epochDev, epochLen);
+      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), bytes, comm->rank, nRanks, epochDev, epochLen,
+      slices, slotWords, wireWordPerSlice, dataBytesPerSlice);
     break;
   }
 
@@ -362,13 +377,18 @@ bool ddaLL128ArOneShotEligible(ncclComm* comm, const void* sendbuff, void* recvb
 
   const size_t bytes = count * ncclTypeSize(datatype);
 
+  // The LL128 line format packs 16B-aligned data with no chunk straddling a
+  // line, so a partial 16B chunk has nowhere to go.
   if (bytes % 16 != 0) {
     return false;
   }
-  if (bytes * 2 > kDdaLLMaxBytes) {
+  if (ddaLL128ArOneShotScratchSize(comm->nRanks) > comm->ddaScratchBytes) {
     return false;
   }
-  if (ddaLL128ArOneShotScratchSize(comm->nRanks) > comm->ddaScratchBytes) {
+  // A slot is a fixed kDdaLL128ArSlotWords, so the message has to fit the slices
+  // that stride holds.
+  if (ddaLL128ArSlices(bytes, comm->WarpSize, comm->ll128LineElems) >
+      ddaLL128ArMaxSlices(comm->WarpSize)) {
     return false;
   }
 

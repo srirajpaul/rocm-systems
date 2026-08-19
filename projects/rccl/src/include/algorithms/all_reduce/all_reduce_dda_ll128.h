@@ -1,15 +1,11 @@
 /*************************************************************************
  * Copyright (c) 2026, Advanced Micro Devices, Inc. All rights reserved.
  *
- * LL128-protocol all-reduce device kernel for the DDA path. Each 16-byte line
- * holds 8 bytes of payload and two 4-byte flags; the flags carry cross-rank
- * sync, so no GPU barrier is needed. Staging uses the DDA scratch
- * (comm->ddaScratch, reachable via comm->ddaPeerPtrsDev).
- *
- * This is the all-reduce analogue of all_gather_dda_fabric_ll128.h. The kernel is
- * codepath-agnostic (it only needs the peer scratch table), so the same kernel
- * backs the fabric launcher (dda_all_reduce_fabric_ll.cu) and can equally back
- * an IPC launcher.
+ * LL128-protocol all-reduce device kernel for the DDA path following RCCL LL128
+ * protocol. All-reduce counterpart of all_gather_dda_ll128.h: same slice / wire
+ * geometry and the same ll128_pack.h pack-poll-unpack helpers, but every block
+ * fans out to all peers instead of owning one peer column, because a reduced
+ * output word depends on every rank.
  *
  * See LICENSE.txt for license information.
  ************************************************************************/
@@ -27,102 +23,157 @@
 
 #include "algorithms/CollCommon.h"
 #include "algorithms/CollCommon_ll128.h"
+#include "algorithms/ll128_pack.h"
 
 namespace meta::comms {
 
-using PackType = uint64_t;
+// Host-side mirrors of the wire layout, the LL128 counterparts of the LL path's
+// kDdaLLArSlotStridePkts. Pass comm->WarpSize / comm->ll128LineElems: the device
+// macros must not be used for host logic, they default to the gfx9 values there.
+inline int ddaLL128ArWireWordPerSlice(int warpSize) {
+  return warpSize * ll128::kWordsPerThread;
+}
 
-// LL128 is for mid-size messages, so the full payload is well under the staging cap.
-// each packet takes 16 bytes.
-constexpr size_t kDdaLL128ArSlotStridePkts = kDdaLLMaxBytes / sizeof(PackType);
+// One word per line carries the flag, so a slice's payload is its wire size
+// scaled by (lineElems - 1) / lineElems: 16/15 on gfx1250, 8/7 on gfx9.
+inline int ddaLL128ArDataBytesPerSlice(int warpSize, int lineElems) {
+  const int wire = ddaLL128ArWireWordPerSlice(warpSize);
+  return (wire - wire / lineElems) * 8;
+}
 
-// LL128 flat all-reduce kernel. 1D grid over packets (8B payload each).
+inline size_t ddaLL128ArSlices(size_t bytes, int warpSize, int lineElems) {
+  const size_t d = (size_t)ddaLL128ArDataBytesPerSlice(warpSize, lineElems);
+  return (bytes + d - 1) / d;
+}
+
+// Words per slot, fixed for the comm rather than derived from a call's slice
+// count, so consecutive epochs always occupy disjoint banks whatever the message
+// size. With a size-dependent stride a small call's bank can land inside a large
+// call's region, and because a rank may run a whole epoch ahead of a peer, its
+// stores then overwrite flag words that peer is still polling, wedging it.
 //
-// Phase 1 (publish): rank selfRank writes its full sendbuff into every peer's
-// scratch at slot selfRank, as LL lines carrying the epoch flag.
-// Phase 2 (reduce): rank selfRank polls its own scratch slot for each other
-// rank (waiting on the flag), and sums those with its own sendbuff into
-// recvbuff. The flag polling provides the cross-rank ordering, so no GPU
-// barrier is used.
+// The value is kDdaLLMaxBytes worth of words on purpose: this tier shares one
+// scratch and one epoch counter with the two LL all-reduce tiers, so bank 1 has
+// to start at the same byte offset (nRanks * kDdaLLMaxBytes) for all three.
+constexpr size_t kDdaLL128ArSlotWords = kDdaLLMaxBytes / sizeof(uint64_t);
+
+// Slices one slot can hold, and hence the largest message this tier can stage.
+inline size_t ddaLL128ArMaxSlices(int warpSize) {
+  return kDdaLL128ArSlotWords / (size_t)ddaLL128ArWireWordPerSlice(warpSize);
+}
+
+// LL128 flat all-reduce kernel. One warp owns one slice at a time; the grid is
+// 1D over slices and each block fans out to every remote peer.
 //
-// Scratch is double-buffered: bank = epoch & 1, selected via bankOffsetPkts.
-// Self does not round-trip through scratch; its contribution is read directly
-// from sendbuff in the reduce.
+// Phase 1 (publish): pack this rank's slice into registers once, then push it
+// onto the wire in every peer's scratch at slot selfRank, flag word embedded.
+// Phase 2 (reduce): for each peer, poll that peer's slot in our own scratch and
+// fold the arriving words into an accumulator seeded with our own payload, then
+// unpack the accumulator into recvbuff. Flag polling supplies the cross-rank
+// ordering, so no GPU barrier is used.
+//
+// Self does not round-trip through scratch; its contribution seeds the
+// accumulator straight from sendbuff. Scratch is double buffered: bank = flag & 1.
 template <typename T, int NRANKS_CT>
 #if defined(USE_ROCM)
 __launch_bounds__(1024)
 #endif
-  __global__ void ddaAllReduceFlatLL128(T* const* __restrict__ peerScratch,    // ddaPeerPtrsDev: nRanks scratch bases
-                                        T* __restrict__ recvbuff,              // local user output
-                                        const T* __restrict__ sendbuff,        // local user input
-                                        size_t count,                          // full-message element count
-                                        int selfRank, int nRanksRt,
-                                        uint32_t* __restrict__ epochDev,       // per-block LL epoch cells (shared AG+AR)
-                                        int epochLen) {                        // number of cells in epochDev
+__global__ void ddaAllReduceFlatLL128(
+    T* const* __restrict__ peerScratch,    // ddaPeerPtrsDev: nRanks scratch bases
+    T* __restrict__ recvbuff,              // local user output
+    const T* __restrict__ sendbuff,        // local user input
+    size_t bytes,                          // full-message payload; multiple of 16
+    int selfRank,
+    int nRanksRt,
+    uint32_t* __restrict__ epochDev,       // per-block LL epoch cells
+    int epochLen,                          // number of cells in epochDev
+    size_t slicesTotal,                    // slices this call actually uses
+    size_t slotWords,                      // fixed per-slot stride, from host
+    int wireWordPerSlice,                  // u64 words on the wire per slice
+    int dataBytesPerSlice) {               // payload bytes per slice
 
   const int nRanks = NRANKS_CT ? NRANKS_CT : nRanksRt;
-  const size_t bytes = count * sizeof(T);
-  const size_t nWords = bytes / sizeof(PackType);           // 8B payload words
-  const size_t numLines = ddaLL128NumLines(nWords); // 128B lines this size
-  const size_t slot = kDdaLL128ArSlotStridePkts;
 
-  const uint32_t flag = ddaGetLLEpochInc(epochDev, blockIdx.x, 1);
-  const size_t bankOffsetPkts = (size_t)(flag & 1u) * (size_t)nRanks * slot;
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  const int lane = tid % ll128::kWarp;
+  const int warp = tid / ll128::kWarp;
+  const int nwarps = nthreads / ll128::kWarp;
+  const bool flagLane = ll128::isFlagLane(lane);
 
+  const int flatBlockId = (int)blockIdx.x;
+  const int total = (int)gridDim.x;
+  uint32_t f = epochDev[flatBlockId] + 1u;
+  if (f == 0u) f = 2u;                     // skip 0 sentinel; keep bank parity
+  const uint32_t flag32 = f;
+  const uint64_t flag = ((uint64_t)flag32 << 32) | (uint64_t)flag32;
+  const uint32_t bank = flag32 & 1u;
 
-  const size_t gtid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t stride = (size_t)gridDim.x * blockDim.x;
+  const uint64_t bankWords =
+      (uint64_t)bank * (uint64_t)nRanks * (uint64_t)slotWords;
 
-  // 16 lanes cooperate on one 128B line; grid-stride over line-groups.
-  const int group = threadIdx.x / kDdaLL128Lanes;
-  const int lane = threadIdx.x % kDdaLL128Lanes;
-  const bool isDataLane = lane < kDdaLL128DataElems;
-  const int groups = blockDim.x / kDdaLL128Lanes;
-  const size_t groupBase = (size_t)blockIdx.x * (size_t)groups + (size_t)group;
-  const size_t groupStride = (size_t)gridDim.x * (size_t)groups;
+  // Slices stride by warp across the whole grid.
+  const size_t gwarp = (size_t)blockIdx.x * (size_t)nwarps + (size_t)warp;
+  const size_t wstride = (size_t)gridDim.x * (size_t)nwarps;
 
-  const PackType* in = reinterpret_cast<const PackType*>(sendbuff);
-  PackType* out = reinterpret_cast<PackType*>(recvbuff);
+  const int8_t* srcBytes = reinterpret_cast<const int8_t*>(sendbuff);
+  int8_t* dstBytes = reinterpret_cast<int8_t*>(recvbuff);
+  const uint64_t* gatherBase =
+      reinterpret_cast<const uint64_t*>(peerScratch[selfRank]) + bankWords;
 
-  // Phase 1: publish my payload into every peer's slot[selfRank], flag-last.
-  for (size_t ln = groupBase; ln < numLines; ln += groupStride) {
-    const size_t base = ln * (size_t)kDdaLL128DataElems;
-    const size_t e = base + (size_t)lane;
-    const PackType v = (isDataLane && e < nWords) ? in[e]
-                       : (lane == kDdaLL128FlagElem) ? static_cast<PackType>(flag) : 0ull;
+  // Phase 1: pack each slice once, then push it to every peer's slot[selfRank].
+  for (size_t s = gwarp; s < slicesTotal; s += wstride) {
+    const size_t dataByte = s * (size_t)dataBytesPerSlice;
+    const size_t rem = bytes - dataByte;
+    const int eltInSlice =
+        rem < (size_t)dataBytesPerSlice ? (int)rem : dataBytesPerSlice;
+    uint64_t regs[ll128::kWordsPerThread] = {};
+    ll128::loadRegs<int8_t>(regs, srcBytes + dataByte, eltInSlice, lane, flagLane);
 
 #pragma unroll
     for (int r = 1; r < nRanks; ++r) {
       const int peer = (selfRank + r) % nRanks;
-      PackType* dst_pack = reinterpret_cast<PackType*>(peerScratch[peer]) + bankOffsetPkts + (size_t)selfRank * slot;
-      LLLine128* dst = reinterpret_cast<LLLine128*>(dst_pack);
-      ddaLL128StoreWord(&dst[ln].w[lane], v);
+      uint64_t* scatterSlot = reinterpret_cast<uint64_t*>(peerScratch[peer]) +
+          bankWords + (uint64_t)selfRank * slotWords;
+      ll128::storeWire(scatterSlot + s * (size_t)wireWordPerSlice + 2 * lane,
+                       regs, flag, flagLane);
     }
   }
 
-  // Phase 2: poll my slots for the other ranks, reduce with my own data.
-  PackType* myBase = reinterpret_cast<PackType*>(peerScratch[selfRank]) + bankOffsetPkts;
-  for (size_t ln = groupBase; ln < numLines; ln += groupStride) {
-    const size_t base = ln * (size_t)kDdaLL128DataElems;
-    const size_t e = base + (size_t)lane;
-    const bool hasWord = isDataLane && (e < nWords);
-    PackType acc = hasWord ? in[e] : 0ull;
+  // Phase 2: poll every peer's slot for the same slices and fold them in.
+  for (size_t s = gwarp; s < slicesTotal; s += wstride) {
+    const size_t dataByte = s * (size_t)dataBytesPerSlice;
+    const size_t rem = bytes - dataByte;
+    const int eltInSlice =
+        rem < (size_t)dataBytesPerSlice ? (int)rem : dataBytesPerSlice;
+
+    // Seed with our own payload; peers are folded on top.
+    uint64_t acc[ll128::kWordsPerThread] = {};
+    ll128::loadRegs<int8_t>(acc, srcBytes + dataByte, eltInSlice, lane, flagLane);
+
     for (int r = 1; r < nRanks; ++r) {
       const int peer = (selfRank + r) % nRanks;
-      PackType* src_pack = myBase + (size_t)peer * slot;
-      LLLine128* src = reinterpret_cast<LLLine128*>(src_pack);
-      // All 16 lanes poll the shared flag word (broadcast); unfenced.
-      while (ddaLL128LoadWord(&src[ln].w[kDdaLL128FlagElem]) != (uint64_t)flag) {
+      const uint64_t* gatherSlot = gatherBase + (uint64_t)peer * slotWords;
+      uint64_t vr[ll128::kWordsPerThread];
+      ll128::pollWire(gatherSlot + s * (size_t)wireWordPerSlice + 2 * lane,
+                      vr, flag, lane);
+      // On a flag lane the odd words hold flags rather than payload, so the sums
+      // landing there are meaningless -- storeRegs re-derives those slots from
+      // the even ones and never writes them out, so folding blind is cheaper
+      // than predicating the loop.
+#pragma unroll
+      for (int u = 0; u < ll128::kWordsPerThread; ++u) {
+        acc[u] = ddaLL128AddWord<T>(acc[u], vr[u]);
       }
-      const uint64_t d = ddaLL128LoadWord(&src[ln].w[lane]);
-      acc = ddaLL128AddWord<T>(acc, d);
     }
-    if (hasWord) {
-      out[e] = acc;
-    }
+
+    ll128::storeRegs<int8_t>(dstBytes + dataByte, acc, eltInSlice, lane, flagLane);
   }
 
-  ddaSetLLEpoch(epochDev, epochLen, blockIdx.x, gridDim.x, flag);
+  __syncthreads();
+  for (int e = flatBlockId + tid * total; e < epochLen; e += total * nthreads) {
+    epochDev[e] = flag32;
+  }
 }
 
 } // namespace meta::comms
