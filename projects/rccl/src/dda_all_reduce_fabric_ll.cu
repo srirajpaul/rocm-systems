@@ -35,6 +35,15 @@ RCCL_PARAM_DECLARE(DdaLLOneShotThreshold);
 RCCL_PARAM_DECLARE(DdaLLTwoShotThreshold);
 RCCL_PARAM_DECLARE(DdaLL128OneShotThreshold);
 
+// Threads per block for the LL128 one-shot tier. A block covers
+// (threads / warpSize) slices, so this sets the smallest message that can spread
+// over more than one CU: 1024 threads keeps everything under ~61KB on a single
+// workgroup, which costs up to 2.3x on mid-size messages. 256 measured best or
+// within noise of best across 4KB-64MB at 4 ranks; going lower wins nothing small
+// and loses badly past 4MB, where the grid is capped at ddaFabricMaxBlocks and
+// fewer threads per block simply means fewer warps in flight.
+RCCL_PARAM(DdaAllReduceLL128Threads, "DDA_ALLREDUCE_LL128_THREADS", 256);
+
 namespace {
 
 using meta::comms::kDdaLLArSlotStridePkts;
@@ -47,6 +56,19 @@ using meta::comms::ddaLL128ArDataBytesPerSlice;
 using meta::comms::ddaLL128ArMaxSlices;
 using meta::comms::ddaLL128ArSlices;
 using meta::comms::ddaLL128ArWireWordPerSlice;
+
+// Clamped to [warpSize, 1024] and rounded down to a whole number of warps, since
+// a partial warp owns no slice.
+static inline unsigned ddaLL128ArThreads(int warpSize) {
+  int64_t t = rcclParamDdaAllReduceLL128Threads();
+  if (t < warpSize) {
+    t = warpSize;
+  }
+  if (t > 1024) {
+    t = 1024;
+  }
+  return (unsigned)((t / warpSize) * warpSize);
+}
 
 // LL scratch footprint: 2 banks * nRanks slots * slotStride packets * 16B.
 static inline size_t ddaLLArScratchSize(int nRanks) {
@@ -133,7 +155,7 @@ static ncclResult_t ncclAllReduceDdaFabricLL128OneShotTyped(const void* sendbuff
 
   // One warp per slice, 1D grid: unlike all-gather there is no per-peer column,
   // because every output word folds contributions from every rank.
-  const unsigned threads = 1024;
+  const unsigned threads = ddaLL128ArThreads(comm->WarpSize);
   const size_t warpsPerBlock = threads / (unsigned)comm->WarpSize;
   int nBlocksMax = comm->ddaFabricMaxBlocks;
   if (nBlocksMax < 1) {
