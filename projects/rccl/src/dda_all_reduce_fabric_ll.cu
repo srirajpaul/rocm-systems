@@ -5,17 +5,18 @@
  * All-reduce analogue of dda_all_gather_fabric_ll.cu; reuses the codepath-
  * agnostic ddaAllReduceFlatLL kernel from all_reduce_dda_ll.h.
  *
- * Carries both LL all-reduce tiers: the one-shot kernel above and the two-shot
- * kernel from all_reduce_dda_ll_twoshot.h, which transports one shard per rank
- * instead of the whole message. They share a scratch layout and epoch counter, so
- * keeping both launchers in one translation unit also keeps the invariant that
- * ties them (the static_assert below) next to the code it constrains.
+ * Carries the LL all-reduce tiers (one-shot and two-shot) and the LL128 one-shot
+ * tier. The two LL variants share a scratch layout and epoch counter, so keeping
+ * both launchers in one translation unit also keeps the invariant that ties them
+ * (the static_assert below) next to the code it constrains. LL128 one-shot uses
+ * the same DDA_LL enable and its own threshold.
  * See LICENSE.txt for license information.
  ************************************************************************/
 
 #include "dda_all_reduce.h"
 
 #include "algorithms/all_reduce/all_reduce_dda_ll.h"
+#include "algorithms/all_reduce/all_reduce_dda_ll128.h"
 #include "algorithms/all_reduce/all_reduce_dda_ll_twoshot.h"
 #include "checks.h"
 #include "comm.h"
@@ -32,17 +33,27 @@
 RCCL_PARAM_DECLARE(DdaLL);
 RCCL_PARAM_DECLARE(DdaLLOneShotThreshold);
 RCCL_PARAM_DECLARE(DdaLLTwoShotThreshold);
+RCCL_PARAM_DECLARE(DdaLL128OneShotThreshold);
 
 namespace {
 
 using meta::comms::kDdaLLArSlotStridePkts;
 using meta::comms::kDdaLLArTwoShotSlotStridePkts;
+using meta::comms::kDdaLL128ArSlotStridePkts;
 using meta::comms::kDdaLLMaxBytes;
 using meta::comms::LLPacket16;
+
+using meta::comms::kDdaLL128DataElems;
+using meta::comms::kDdaLL128Lanes;
 
 // LL scratch footprint: 2 banks * nRanks slots * slotStride packets * 16B.
 static inline size_t ddaLLArScratchSize(int nRanks) {
   return (size_t)2 * (size_t)nRanks * kDdaLLArSlotStridePkts * sizeof(LLPacket16);
+}
+
+// LL128 one-shot footprint matches LL one-shot until the LL128 kernel is updated.
+static inline size_t ddaLL128ArOneShotScratchSize(int nRanks) {
+  return (size_t)2 * (size_t)nRanks * kDdaLL128ArSlotStridePkts * sizeof(meta::comms::PackType);
 }
 
 // Two-shot footprint, 2 banks * nRanks slots * slotStride packets * 16B  * 2 phases.
@@ -98,6 +109,53 @@ static ncclResult_t ncclAllReduceDdaFabricLLTyped(const void* sendbuff, void* re
     break;
   default:
     meta::comms::ddaAllReduceFlatLL<T, 0><<<grid, block, 0, stream>>>(
+      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), count, comm->rank, nRanks, epochDev, epochLen);
+    break;
+  }
+
+  CUDACHECK(cudaGetLastError());
+
+  return ncclSuccess;
+}
+
+template <typename T>
+static ncclResult_t ncclAllReduceDdaFabricLL128OneShotTyped(const void* sendbuff, void* recvbuff, size_t count,
+                                                            ncclComm* comm, cudaStream_t stream) {
+  const int nRanks = comm->nRanks;
+  const size_t bytes = count * sizeof(T);
+  const size_t nPk = bytes / sizeof(meta::comms::PackType); // payload bytes per packet
+
+  const unsigned threads = 1024;
+  int nBlocksMax = comm->ddaFabricMaxBlocks;
+  if (nBlocksMax < 1) {
+    nBlocksMax = 1;
+  }
+  const float nPkCeil = std::ceil((float)nPk * kDdaLL128Lanes / kDdaLL128DataElems);
+  unsigned blocks = (unsigned)std::min<size_t>((nPkCeil + threads - 1) / threads, (size_t)nBlocksMax);
+  if (blocks == 0) {
+    blocks = 1;
+  }
+  dim3 block(threads);
+  dim3 grid(blocks);
+
+  T** peers = reinterpret_cast<T**>(comm->ddaPeerPtrsDev);
+  uint32_t* epochDev = comm->ddaLLEpochDev;
+  const int epochLen = comm->ddaLLEpochLen;
+
+  INFO(NCCL_COLL, "DDA fabric AllReduce LL128 one-shot: nRanks=%d bytes=%zu nPk=%zu grid=%u block=%u", nRanks, bytes,
+       nPk, grid.x, block.x);
+
+  switch (nRanks) {
+  case 4:
+    meta::comms::ddaAllReduceFlatLL128<T, 4><<<grid, block, 0, stream>>>(
+      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), count, comm->rank, nRanks, epochDev, epochLen);
+    break;
+  case 8:
+    meta::comms::ddaAllReduceFlatLL128<T, 8><<<grid, block, 0, stream>>>(
+      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), count, comm->rank, nRanks, epochDev, epochLen);
+    break;
+  default:
+    meta::comms::ddaAllReduceFlatLL128<T, 0><<<grid, block, 0, stream>>>(
       peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), count, comm->rank, nRanks, epochDev, epochLen);
     break;
   }
@@ -270,14 +328,60 @@ bool ddaLLArTwoShotEligible(ncclComm* comm, const void* sendbuff, void* recvbuff
   return true;
 }
 
+// Shape/resource eligibility for the LL128 one-shot variant.
+bool ddaLL128ArOneShotEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
+                               ncclDataType_t datatype, ncclRedOp_t op) {
+  (void)sendbuff;
+  (void)recvbuff;
+  if (rcclParamDdaLL() == 0) {
+    return false;
+  }
+
+  if (count * ncclTypeSize(datatype) > (size_t)rcclParamDdaLL128OneShotThreshold()) {
+    return false;
+  }
+
+  if (comm == nullptr || comm->bootstrap == nullptr) {
+    return false;
+  }
+  if (comm->ddaFabricMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr) {
+    return false;
+  }
+  if (comm->nRanks < 2 || comm->nRanks > meta::comms::kDdaMaxNranks) {
+    return false;
+  }
+  if (count == 0) {
+    return false;
+  }
+  if (op != ncclSum) {
+    return false;
+  }
+  if (datatype != ncclFloat32 && datatype != ncclFloat16 && datatype != ncclBfloat16) {
+    return false;
+  }
+
+  const size_t bytes = count * ncclTypeSize(datatype);
+
+  if (bytes % 16 != 0) {
+    return false;
+  }
+  if (bytes * 2 > kDdaLLMaxBytes) {
+    return false;
+  }
+  if (ddaLL128ArOneShotScratchSize(comm->nRanks) > comm->ddaScratchBytes) {
+    return false;
+  }
+
+  return true;
+}
+
 // Tier selection: enabled, within this tier's threshold, and shape-eligible.
-// One-shot is tested first, so a message that qualifies for both takes it; a run
-// hands sizes over to two-shot by lowering DDA_LL_THRESHOLD and raising
-// DDA_LL_TWOSHOT_THRESHOLD.
+// LL one-shot is tested first, then LL two-shot, then LL128 one-shot.
 bool ncclAllReduceDdaFabricLLEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
                                       ncclDataType_t datatype, ncclRedOp_t op) {
   return ddaLLArOneShotEligible(comm, sendbuff, recvbuff, count, datatype, op) ||
-         ddaLLArTwoShotEligible(comm, sendbuff, recvbuff, count, datatype, op);
+         ddaLLArTwoShotEligible(comm, sendbuff, recvbuff, count, datatype, op) ||
+         ddaLL128ArOneShotEligible(comm, sendbuff, recvbuff, count, datatype, op);
 }
 
 ncclResult_t ncclAllReduceDdaFabricLL(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
@@ -315,8 +419,25 @@ ncclResult_t ncclAllReduceDdaFabricLL(const void* sendbuff, void* recvbuff, size
     }
   }
 
+  if (ddaLL128ArOneShotEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
+    INFO(NCCL_COLL,
+         "AllReduce: taking DDA fabric LL128 one-shot path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
+         comm->nRanks, comm->nNodes, count, (int)datatype, bytes);
+    (void)op;
+    switch (datatype) {
+    case ncclFloat32:
+      return ncclAllReduceDdaFabricLL128OneShotTyped<float>(sendbuff, recvbuff, count, comm, stream);
+    case ncclFloat16:
+      return ncclAllReduceDdaFabricLL128OneShotTyped<half>(sendbuff, recvbuff, count, comm, stream);
+    case ncclBfloat16:
+      return ncclAllReduceDdaFabricLL128OneShotTyped<bf16>(sendbuff, recvbuff, count, comm, stream);
+    default:
+      return ncclInvalidArgument;
+    }
+  }
+
   // Callers gate on ncclAllReduceDdaFabricLLEligible, which is the disjunction of
-  // the two selectors above, so neither matching means the caller skipped it.
+  // the tier selectors above, so none matching means the caller skipped it.
   WARN("ncclAllReduceDdaFabricLL called for a message no LL tier claims: count=%zu datatype=%d bytes=%zu", count,
        (int)datatype, bytes);
   return ncclInternalError;
