@@ -47,7 +47,7 @@ constexpr size_t kDdaLLArSlotStridePkts = kDdaLLMaxBytes / sizeof(LLPacket16);
 // from sendbuff in the reduce.
 template <typename T, int NRANKS_CT>
 #if defined(USE_ROCM)
-__launch_bounds__(512)
+__launch_bounds__(1024)
 #endif
   __global__ void ddaAllReduceFlatLL(T* const* __restrict__ peerScratch,    // ddaPeerPtrsDev: nRanks scratch bases
                                      T* __restrict__ recvbuff,              // local user output
