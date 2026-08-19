@@ -42,7 +42,14 @@ constexpr int kLineBytes = 64;
 
 constexpr int kLineElems = kLineBytes / 8;                   // 16 (LL128) or 8 (LL64)
 constexpr int kLineSkip = 2 * kWarp / kLineElems;            // 4 or 16
-constexpr int kWordsPerThread = 8;
+// Words each thread owns on the wire, and so the slice size a warp covers
+// (kWordsPerThread * kWarp * 8 bytes). This is the knob that separates work
+// granularity from occupancy: 8 words made a slice 2048B, which forced a choice
+// between few blocks (coarse granularity, bad below 4MB) and few warps per block
+// (bad above it). 4 words halves the slice and the register arrays, and measured
+// 15-25% faster across 16KB-32MB. 2 is not valid: the flag-lane shuffle in
+// loadRegs/storeRegs needs at least two register pairs.
+constexpr int kWordsPerThread = 4;
 constexpr int kPairs = kWordsPerThread / 2;                  // register pairs / thread
 
 // The last lane of each line's lane group owns that line's flag word: lanes
@@ -105,6 +112,30 @@ __device__ __forceinline__ void load128(const uint64_t* src, uint64_t& lo, uint6
 #endif
 }
 
+// 16B access to the user buffers. These are device-local, so unlike the wire
+// they need neither system scope nor the compiler barrier: sendbuff is read once
+// per phase and recvbuff written once, and pushing them through the cache-
+// bypassing system-scope path just gives up the caches for nothing.
+__device__ __forceinline__ void loadLocal128(const uint64_t* src, uint64_t& lo, uint64_t& hi) {
+  union {
+    uint4 v;
+    uint64_t w[2];
+  } u;
+  u.v = *reinterpret_cast<const uint4*>(src);
+  lo = u.w[0];
+  hi = u.w[1];
+}
+
+__device__ __forceinline__ void storeLocal128(uint64_t* dst, uint64_t lo, uint64_t hi) {
+  union {
+    uint4 v;
+    uint64_t w[2];
+  } u;
+  u.w[0] = lo;
+  u.w[1] = hi;
+  *reinterpret_cast<uint4*>(dst) = u.v;
+}
+
 // (1) Dense load of a slice's payload from `src` into registers, then the
 // flag-lane shuffle (== loadRegsBegin aligned-path + loadRegsFinish). `eltN` is
 // the number of T elements in this slice (<= dataBytesPerSlice/sizeof(T)).
@@ -117,8 +148,8 @@ __device__ __forceinline__ void loadRegs(
     if (!flag || g % 2 == 0) {
       int ix = chunkIx(g, wid);
       if (ix * EltPer16B < eltN)
-        load128(reinterpret_cast<const uint64_t*>(src + ix * EltPer16B),
-                regs[2 * g], regs[2 * g + 1]);
+        loadLocal128(reinterpret_cast<const uint64_t*>(src + ix * EltPer16B),
+                     regs[2 * g], regs[2 * g + 1]);
     }
   }
 #pragma unroll
@@ -142,14 +173,13 @@ __device__ __forceinline__ void storeWire(
 // attempt, flag lanes test their high word, and the warp retries as a unit.
 __device__ __forceinline__ void pollWire(
   const uint64_t* wire, uint64_t (&vr)[kWordsPerThread], uint64_t flag, int wid) {
-const bool flagLane = isFlagLane(wid);
+const int fo = flagWordOffset(wid);
 bool needReload;
 do {
   needReload = false;
 #pragma unroll
   for (int u = 0; u < kWordsPerThread; u += 2) {
-    load128(wire + u * kWarp, vr[u], vr[u + 1]);
-    needReload |= flagLane && (vr[u + 1] != flag);
+    needReload |= (loadWord(wire + u * kWarp + fo) != flag);
   }
 } while (__any(needReload));
 #pragma unroll
@@ -171,8 +201,8 @@ __device__ __forceinline__ void storeRegs(
     if (!flag || g % 2 == 0) {
       int ix = chunkIx(g, wid);
       if (ix * EltPer16B < eltN)
-        store128(reinterpret_cast<uint64_t*>(dst + ix * EltPer16B),
-                 regs[2 * g], regs[2 * g + 1]);
+        storeLocal128(reinterpret_cast<uint64_t*>(dst + ix * EltPer16B),
+                      regs[2 * g], regs[2 * g + 1]);
     }
   }
 }

@@ -37,12 +37,13 @@ RCCL_PARAM_DECLARE(DdaLL128OneShotThreshold);
 
 // Threads per block for the LL128 one-shot tier. A block covers
 // (threads / warpSize) slices, so this sets the smallest message that can spread
-// over more than one CU: 1024 threads keeps everything under ~61KB on a single
-// workgroup, which costs up to 2.3x on mid-size messages. 256 measured best or
-// within noise of best across 4KB-64MB at 4 ranks; going lower wins nothing small
-// and loses badly past 4MB, where the grid is capped at ddaFabricMaxBlocks and
-// fewer threads per block simply means fewer warps in flight.
-RCCL_PARAM(DdaAllReduceLL128Threads, "DDA_ALLREDUCE_LL128_THREADS", 256);
+// over more than one CU, while the thread count sets how many warps are in flight
+// once the grid saturates ddaFabricMaxBlocks. Both matter, and ll128::
+// kWordsPerThread is what keeps them independent: at 4 words a slice is 960B, so
+// 512 threads gives a fine enough block (15KB) for small messages and still 16
+// warps for large ones. 768 and above fall off a cliff below 64KB, where the grid
+// collapses to a single block again.
+RCCL_PARAM(DdaAllReduceLL128Threads, "DDA_ALLREDUCE_LL128_THREADS", 512);
 
 namespace {
 
