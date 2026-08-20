@@ -101,11 +101,7 @@ __global__ void ddaAllReduceFlatLL128(
   const int nwarps = nthreads / ll128::kWarp;
   const bool flagLane = ll128::isFlagLane(lane);
 
-  const int flatBlockId = (int)blockIdx.x;
-  const int total = (int)gridDim.x;
-  uint32_t f = epochDev[flatBlockId] + 1u;
-  if (f == 0u) f = 2u;                     // skip 0 sentinel; keep bank parity
-  const uint32_t flag32 = f;
+  const uint32_t flag32 = ddaGetLLEpochInc(epochDev, blockIdx.x, 1);
   const uint64_t flag = ((uint64_t)flag32 << 32) | (uint64_t)flag32;
   const uint32_t bank = flag32 & 1u;
 
@@ -170,10 +166,7 @@ __global__ void ddaAllReduceFlatLL128(
     ll128::storeRegs<int8_t>(dstBytes + dataByte, acc, eltInSlice, lane, flagLane);
   }
 
-  __syncthreads();
-  for (int e = flatBlockId + tid * total; e < epochLen; e += total * nthreads) {
-    epochDev[e] = flag32;
-  }
+  ddaSetLLEpoch(epochDev, epochLen, blockIdx.x, gridDim.x, flag32);
 }
 
 } // namespace meta::comms
