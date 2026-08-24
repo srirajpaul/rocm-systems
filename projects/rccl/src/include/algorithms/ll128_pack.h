@@ -112,30 +112,6 @@ __device__ __forceinline__ void load128(const uint64_t* src, uint64_t& lo, uint6
 #endif
 }
 
-// 16B access to the user buffers. These are device-local, so unlike the wire
-// they need neither system scope nor the compiler barrier: sendbuff is read once
-// per phase and recvbuff written once, and pushing them through the cache-
-// bypassing system-scope path just gives up the caches for nothing.
-__device__ __forceinline__ void loadLocal128(const uint64_t* src, uint64_t& lo, uint64_t& hi) {
-  union {
-    uint4 v;
-    uint64_t w[2];
-  } u;
-  u.v = *reinterpret_cast<const uint4*>(src);
-  lo = u.w[0];
-  hi = u.w[1];
-}
-
-__device__ __forceinline__ void storeLocal128(uint64_t* dst, uint64_t lo, uint64_t hi) {
-  union {
-    uint4 v;
-    uint64_t w[2];
-  } u;
-  u.w[0] = lo;
-  u.w[1] = hi;
-  *reinterpret_cast<uint4*>(dst) = u.v;
-}
-
 // (1) Dense load of a slice's payload from `src` into registers, then the
 // flag-lane shuffle (== loadRegsBegin aligned-path + loadRegsFinish). `eltN` is
 // the number of T elements in this slice (<= dataBytesPerSlice/sizeof(T)).
@@ -148,7 +124,7 @@ __device__ __forceinline__ void loadRegs(
     if (!flag || g % 2 == 0) {
       int ix = chunkIx(g, wid);
       if (ix * EltPer16B < eltN)
-        loadLocal128(reinterpret_cast<const uint64_t*>(src + ix * EltPer16B),
+        load128(reinterpret_cast<const uint64_t*>(src + ix * EltPer16B),
                      regs[2 * g], regs[2 * g + 1]);
     }
   }
@@ -201,7 +177,7 @@ __device__ __forceinline__ void storeRegs(
     if (!flag || g % 2 == 0) {
       int ix = chunkIx(g, wid);
       if (ix * EltPer16B < eltN)
-        storeLocal128(reinterpret_cast<uint64_t*>(dst + ix * EltPer16B),
+        store128(reinterpret_cast<uint64_t*>(dst + ix * EltPer16B),
                       regs[2 * g], regs[2 * g + 1]);
     }
   }
