@@ -41,6 +41,9 @@ inline int ddaLL128ArDataBytesPerSlice(int warpSize, int lineElems) {
   return (wire - wire / lineElems) * 8;
 }
 
+// Warp-sized work units this message needs. A slice is the quantum: the tail one
+// ships whole even when only partly filled, because the reader polls a slice's
+// flags as a unit.
 inline size_t ddaLL128ArSlices(size_t bytes, int warpSize, int lineElems) {
   const size_t d = (size_t)ddaLL128ArDataBytesPerSlice(warpSize, lineElems);
   return (bytes + d - 1) / d;
@@ -74,7 +77,7 @@ inline size_t ddaLL128ArMaxSlices(int warpSize) {
 //
 // Self does not round-trip through scratch; its contribution seeds the
 // accumulator straight from sendbuff. Scratch is double buffered: bank = flag & 1.
-template <typename T, int NRANKS_CT>
+template <typename T, int NRANKS_CT, int kWordsPerThread>
 #if defined(USE_ROCM)
 __launch_bounds__(1024)
 #endif
@@ -96,9 +99,9 @@ __global__ void ddaAllReduceFlatLL128(
 
   const int tid = threadIdx.x;
   const int nthreads = blockDim.x;
-  const int lane = tid % ll128::kWarp;
-  const int warp = tid / ll128::kWarp;
-  const int nwarps = nthreads / ll128::kWarp;
+  const int lane = tid % warpSize;
+  const int warp = tid / warpSize;
+  const int nwarps = nthreads / warpSize;
   const bool flagLane = ll128::isFlagLane(lane);
 
   const uint32_t flag32 = ddaGetLLEpochInc(epochDev, blockIdx.x, 1);
@@ -108,7 +111,9 @@ __global__ void ddaAllReduceFlatLL128(
   const uint64_t bankWords =
       (uint64_t)bank * (uint64_t)nRanks * (uint64_t)slotWords;
 
-  // Slices stride by warp across the whole grid.
+  // Slices stride by warp across the whole grid. The bound has to be the slice
+  // count, not the warp count: the grid is capped at ddaFabricMaxBlocks, so a
+  // large message has more slices than warps and each warp must take several.
   const size_t gwarp = (size_t)blockIdx.x * (size_t)nwarps + (size_t)warp;
   const size_t wstride = (size_t)gridDim.x * (size_t)nwarps;
 
@@ -123,7 +128,7 @@ __global__ void ddaAllReduceFlatLL128(
     const size_t rem = bytes - dataByte;
     const int eltInSlice =
         rem < (size_t)dataBytesPerSlice ? (int)rem : dataBytesPerSlice;
-    uint64_t regs[ll128::kWordsPerThread] = {};
+    uint64_t regs[kWordsPerThread] = {};
     ll128::loadRegs<int8_t>(regs, srcBytes + dataByte, eltInSlice, lane, flagLane);
 
 #pragma unroll
@@ -144,13 +149,13 @@ __global__ void ddaAllReduceFlatLL128(
         rem < (size_t)dataBytesPerSlice ? (int)rem : dataBytesPerSlice;
 
     // Seed with our own payload; peers are folded on top.
-    uint64_t acc[ll128::kWordsPerThread] = {};
+    uint64_t acc[kWordsPerThread] = {};
     ll128::loadRegs<int8_t>(acc, srcBytes + dataByte, eltInSlice, lane, flagLane);
 
     for (int r = 1; r < nRanks; ++r) {
       const int peer = (selfRank + r) % nRanks;
       const uint64_t* gatherSlot = gatherBase + (uint64_t)peer * slotWords;
-      uint64_t vr[ll128::kWordsPerThread];
+      uint64_t vr[kWordsPerThread];
       ll128::pollWire(gatherSlot + s * (size_t)wireWordPerSlice + 2 * lane,
                       vr, flag, lane);
       // On a flag lane the odd words hold flags rather than payload, so the sums
@@ -158,7 +163,7 @@ __global__ void ddaAllReduceFlatLL128(
       // the even ones and never writes them out, so folding blind is cheaper
       // than predicating the loop.
 #pragma unroll
-      for (int u = 0; u < ll128::kWordsPerThread; ++u) {
+      for (int u = 0; u < kWordsPerThread; ++u) {
         acc[u] = ddaLL128AddWord<T>(acc[u], vr[u]);
       }
     }
