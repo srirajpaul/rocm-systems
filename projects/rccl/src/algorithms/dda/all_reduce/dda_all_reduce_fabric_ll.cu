@@ -17,6 +17,7 @@
 
 #include "algorithms/dda/all_reduce/all_reduce_dda_ll.h"
 #include "algorithms/dda/all_reduce/all_reduce_dda_ll128.h"
+#include "algorithms/dda/all_reduce/all_reduce_dda_ll128_twoshot.h"
 #include "algorithms/dda/all_reduce/all_reduce_dda_ll_twoshot.h"
 #include "checks.h"
 #include "comm.h"
@@ -35,18 +36,21 @@ RCCL_PARAM_DECLARE(DdaLL);
 RCCL_PARAM_DECLARE(DdaLLOneShotThreshold);
 RCCL_PARAM_DECLARE(DdaLLTwoShotThreshold);
 RCCL_PARAM_DECLARE(DdaLL128OneShotThreshold);
+RCCL_PARAM_DECLARE(DdaLL128TwoShotThreshold);
 
 namespace {
 
 using dda::common::kDdaLLArSlotStridePkts;
 using dda::common::kDdaLLArTwoShotSlotStridePkts;
 using dda::common::kDdaLL128ArSlotWords;
+using dda::common::kDdaLL128ArTwoShotSlotWords;
 using dda::common::kDdaLLMaxBytes;
 using dda::common::LLPacket16;
 
 using dda::common::ddaLL128ArDataBytesPerSlice;
 using dda::common::ddaLL128ArMaxSlices;
 using dda::common::ddaLL128ArSlices;
+using dda::common::ddaLL128ArTwoShotMaxSlices;
 using dda::common::ddaLL128ArWireWordPerSlice;
 
 // LL scratch footprint: 2 banks * nRanks slots * slotStride packets * 16B.
@@ -64,6 +68,18 @@ static inline size_t ddaLL128ArOneShotScratchSize(int nRanks) {
 static inline size_t ddaLLArTwoShotScratchSize(int nRanks) {
   return (size_t)2 * (size_t)nRanks * kDdaLLArTwoShotSlotStridePkts * sizeof(LLPacket16) * 2;
 }
+
+// LL128 two-shot footprint: 2 banks * nRanks slots * slotWords * 8B * 2 stages.
+// Comes out equal to the LL128 one-shot's, which is the point of the halving.
+static inline size_t ddaLL128ArTwoShotScratchSize(int nRanks) {
+  return (size_t)2 * (size_t)nRanks * kDdaLL128ArTwoShotSlotWords * sizeof(uint64_t) * 2;
+}
+
+// Same invariant as the LL pair above, for the LL128 pair: all four tiers stage
+// through one scratch under one epoch, so bank 1 must start at the same offset.
+static_assert(kDdaLL128ArTwoShotSlotWords == kDdaLL128ArSlotWords / 2,
+              "LL128 all-reduce tiers share one scratch and epoch; \
+              keep LL128-ts slot half of LL128 because the scratch is used in two stages");
 
 // The two tiers stage through one scratch under one epoch, so bank 1 has to
 // start at the same offset for both; otherwise a launch of one could write over
@@ -261,6 +277,79 @@ static ncclResult_t ncclAllReduceDdaFabricLLTwoShotTyped(const void* sendbuff, v
   return ncclSuccess;
 }
 
+// Like the LL two-shot, every phase loops over one shard with the peer fan-out
+// inside it, so the grid covers a shard's slices rather than the message's.
+template <typename T>
+static ncclResult_t ncclAllReduceDdaFabricLL128TwoShotTyped(const void* sendbuff, void* recvbuff, size_t count,
+                                                            ncclComm* comm, cudaStream_t stream) {
+  const int nRanks = comm->nRanks;
+  const size_t bytes = count * sizeof(T);
+  const size_t shardBytes = bytes / (size_t)nRanks;
+  const int wireWordPerSlice = ddaLL128ArWireWordPerSlice(comm->WarpSize);
+  const int dataBytesPerSlice = ddaLL128ArDataBytesPerSlice(comm->WarpSize, comm->ll128LineElems);
+  const size_t slices = ddaLL128ArSlices(shardBytes, comm->WarpSize, comm->ll128LineElems);
+  const size_t slotWords = dda::common::kDdaLL128ArTwoShotSlotWords;
+
+  const unsigned threads = 512;
+
+  // word is uint64_t (8 bytes)
+  using word_type = uint64_t;
+  constexpr size_t kWordsPerThread = 4;
+  constexpr size_t kBytesPerThread = kWordsPerThread * sizeof(word_type);
+
+  // kLineWords is 16 for LL128, i.e. 16 uint64_t together form 128B
+  const int kLineWords = comm->ll128LineElems;
+  // total bytes with flags. we use 1 word from kLineWords as flag
+  const size_t total_bytes = std::ceil((double)shardBytes * kLineWords / (kLineWords - 1));
+
+  const size_t nPk = std::ceil((double)total_bytes / kBytesPerThread);
+
+  int nBlocksMax = comm->ddaFabricMaxBlocks;
+  if (nBlocksMax < 1) {
+    nBlocksMax = 1;
+  }
+  unsigned blocks =
+    (unsigned)std::min<size_t>((nPk + threads - 1) / threads, (size_t)nBlocksMax);
+  if (blocks == 0) {
+    blocks = 1;
+  }
+  dim3 block(threads);
+  dim3 grid(blocks);
+
+  T** peers = reinterpret_cast<T**>(comm->ddaPeerPtrsDev);
+  // Same epoch counter every other LL/LL128 tier uses.
+  uint32_t* epochDev = comm->ddaLLEpochDev;
+  const int epochLen = comm->ddaLLEpochLen;
+
+  INFO(NCCL_COLL,
+       "DDA fabric AllReduce LL128 two-shot: nRanks=%d bytes=%zu shardBytes=%zu slices=%zu grid=%u block=%u "
+       "wave=%d lineElems=%d wire=%dB data=%dB slotWords=%zu",
+       nRanks, bytes, shardBytes, slices, grid.x, block.x, comm->WarpSize, comm->ll128LineElems,
+       wireWordPerSlice * 8, dataBytesPerSlice, slotWords);
+
+  switch (nRanks) {
+  case 4:
+    dda::common::ddaAllReduceTwoShotLL128<T, 4, kWordsPerThread><<<grid, block, 0, stream>>>(
+      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), shardBytes, comm->rank, nRanks, epochDev,
+      epochLen, slices, slotWords, wireWordPerSlice, dataBytesPerSlice);
+    break;
+  case 8:
+    dda::common::ddaAllReduceTwoShotLL128<T, 8, kWordsPerThread><<<grid, block, 0, stream>>>(
+      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), shardBytes, comm->rank, nRanks, epochDev,
+      epochLen, slices, slotWords, wireWordPerSlice, dataBytesPerSlice);
+    break;
+  default:
+    dda::common::ddaAllReduceTwoShotLL128<T, 0, kWordsPerThread><<<grid, block, 0, stream>>>(
+      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), shardBytes, comm->rank, nRanks, epochDev,
+      epochLen, slices, slotWords, wireWordPerSlice, dataBytesPerSlice);
+    break;
+  }
+
+  CUDACHECK(cudaGetLastError());
+
+  return ncclSuccess;
+}
+
 } // namespace
 
 // Shape/resource eligibility for the one-shot variant, independent of whether
@@ -423,13 +512,73 @@ bool ddaLL128ArOneShotEligible(ncclComm* comm, const void* sendbuff, void* recvb
   return true;
 }
 
+// Shape/resource eligibility for the LL128 two-shot variant.
+bool ddaLL128ArTwoShotEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
+                               ncclDataType_t datatype, ncclRedOp_t op) {
+  (void)sendbuff;
+  (void)recvbuff;
+  if (rcclParamDdaLL() == 0) {
+    return false;
+  }
+
+  if (count * ncclTypeSize(datatype) > (size_t)rcclParamDdaLL128TwoShotThreshold()) {
+    return false;
+  }
+
+  if (comm == nullptr || comm->bootstrap == nullptr) {
+    return false;
+  }
+  if (comm->ddaFabricMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr) {
+    return false;
+  }
+  if (comm->nRanks < 2 || comm->nRanks > dda::common::kDdaMaxNranks) {
+    return false;
+  }
+  if (count == 0) {
+    return false;
+  }
+  if (op != ncclSum) {
+    return false;
+  }
+  if (datatype != ncclFloat32 && datatype != ncclFloat16 && datatype != ncclBfloat16) {
+    return false;
+  }
+
+  const size_t bytes = count * ncclTypeSize(datatype);
+
+  // Every rank owns exactly one shard, and the LL128 line format packs 16B-aligned
+  // data with no chunk straddling a line, so the shard itself must be a whole
+  // number of 16B chunks.
+  if (bytes % (size_t)comm->nRanks != 0) {
+    return false;
+  }
+
+  const size_t shardBytes = bytes / (size_t)comm->nRanks;
+
+  if (shardBytes % 16 != 0) {
+    return false;
+  }
+  if (ddaLL128ArTwoShotScratchSize(comm->nRanks) > comm->ddaScratchBytes) {
+    return false;
+  }
+
+  // A two-shot slot is half the one-shot's, so the shard has to fit the slices
+  // that halved stride holds.
+  if (ddaLL128ArSlices(shardBytes, comm->WarpSize, comm->ll128LineElems) >
+      ddaLL128ArTwoShotMaxSlices(comm->WarpSize)) {
+    return false;
+  }
+
+  return true;
+}
+
 // Tier selection: enabled, within this tier's threshold, and shape-eligible.
-// LL one-shot is tested first, then LL two-shot, then LL128 one-shot.
 bool ncclAllReduceDdaFabricLLEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
                                       ncclDataType_t datatype, ncclRedOp_t op) {
   return ddaLLArOneShotEligible(comm, sendbuff, recvbuff, count, datatype, op) ||
          ddaLLArTwoShotEligible(comm, sendbuff, recvbuff, count, datatype, op) ||
-         ddaLL128ArOneShotEligible(comm, sendbuff, recvbuff, count, datatype, op);
+         ddaLL128ArOneShotEligible(comm, sendbuff, recvbuff, count, datatype, op) ||
+         ddaLL128ArTwoShotEligible(comm, sendbuff, recvbuff, count, datatype, op);
 }
 
 ncclResult_t ncclAllReduceDdaFabricLL(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
@@ -479,6 +628,22 @@ ncclResult_t ncclAllReduceDdaFabricLL(const void* sendbuff, void* recvbuff, size
       return ncclAllReduceDdaFabricLL128OneShotTyped<half>(sendbuff, recvbuff, count, comm, stream);
     case ncclBfloat16:
       return ncclAllReduceDdaFabricLL128OneShotTyped<bf16>(sendbuff, recvbuff, count, comm, stream);
+    default:
+      return ncclInvalidArgument;
+    }
+  }
+
+  if (ddaLL128ArTwoShotEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
+    INFO(NCCL_COLL,
+         "AllReduce: taking DDA fabric LL128 two-shot path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
+         comm->nRanks, comm->nNodes, count, (int)datatype, bytes);
+    switch (datatype) {
+    case ncclFloat32:
+      return ncclAllReduceDdaFabricLL128TwoShotTyped<float>(sendbuff, recvbuff, count, comm, stream);
+    case ncclFloat16:
+      return ncclAllReduceDdaFabricLL128TwoShotTyped<half>(sendbuff, recvbuff, count, comm, stream);
+    case ncclBfloat16:
+      return ncclAllReduceDdaFabricLL128TwoShotTyped<bf16>(sendbuff, recvbuff, count, comm, stream);
     default:
       return ncclInvalidArgument;
     }

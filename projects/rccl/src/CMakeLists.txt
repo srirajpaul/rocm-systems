@@ -126,6 +126,7 @@ set(SRC_FILES
   algorithms/dda/all_reduce/all_reduce_dda.h
   algorithms/dda/all_reduce/all_reduce_dda_ll.h
   algorithms/dda/all_reduce/all_reduce_dda_ll128.h
+  algorithms/dda/all_reduce/all_reduce_dda_ll128_twoshot.h
   algorithms/dda/all_reduce/all_reduce_dda_ll_twoshot.h
   algorithms/dda/all_reduce/all_reduce_dda_fabric_ll128.h
   algorithms/dda/reduce_scatter/reduce_scatter_dda.h
