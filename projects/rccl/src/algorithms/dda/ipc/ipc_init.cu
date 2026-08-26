@@ -13,10 +13,18 @@
 #include "debug.h"
 #include "algorithms/dda/dda_init_detail.h"
 #include "algorithms/dda/ipc/ipc_mem_handler.h"
+#include "param.h"
+#include "rccl_common.h"
 
 #include <cuda_runtime.h>
 
+// Runtime override for the IPC scratch allocation, the IPC counterpart of
+// RCCL_DDA_FABRIC_BUFFER_SIZE. -1 derives the size from the DDA params;
+// 0 disables the IPC DDA path. Env: RCCL_DDA_IPC_BUFFER_SIZE.
+RCCL_PARAM(DdaIpcBufferSizeForScratch, "DDA_IPC_BUFFER_SIZE", -1);
+
 using nccl_dda_detail::DdaIpcBarrierState;
+using nccl_dda_detail::ddaIpcScratchSizing;
 using nccl_dda_detail::ddaLLEpochCount;
 using nccl_dda_detail::ddaMaxNBlocksForScratch;
 using nccl_dda_detail::kDdaNranks;
@@ -69,7 +77,9 @@ ncclResult_t ncclDdaIpcCommInit(ncclComm* comm) {
     }
   }
 
-  size_t bytes = DDA_IPC_BUFFER_SIZE;
+  const int64_t ipcScratchOverride = rcclParamDdaIpcBufferSizeForScratch();
+  const int64_t llEnabled = rcclParamDdaLL();
+  size_t bytes = ddaIpcScratchSizing(kDdaNranks, ipcScratchOverride, llEnabled);
   if (bytes == 0) {
     return ncclSuccess;
   }
@@ -81,12 +91,18 @@ ncclResult_t ncclDdaIpcCommInit(ncclComm* comm) {
   HIP_CALL(hipExtMallocWithFlags((void**)&scratch, bytes, hipDeviceMallocFinegrained));
 #endif
 
+  // The LL-derived size is large (2 banks * nRanks * kDdaLLMaxBytes), so a
+  // failed allocation is a realistic outcome rather than an OOM edge case;
+  // skip DDA IPC and let the comm fall back to the normal RCCL path.
+  if (scratch == nullptr) {
+    INFO(NCCL_INIT, "ncclDdaIpcCommInit: scratch alloc of %zu bytes failed; skipping DDA IPC path", bytes);
+    return ncclSuccess;
+  }
+
   // Zero the scratch once so the LL all-gather's first epoch (>= 1) never
   // false-matches leftover flag words (mirrors the fabric path). Harmless for
   // the copy-based DDA collectives, which overwrite their staging area per op.
-  if (scratch != nullptr) {
-    HIP_CALL(hipMemset(scratch, 0, bytes));
-  }
+  HIP_CALL(hipMemset(scratch, 0, bytes));
 
   auto* handler = new (std::nothrow) ncclIpcMemHandler(comm->bootstrap, comm->rank, comm->nRanks);
   if (handler == nullptr) {
@@ -212,8 +228,11 @@ ncclResult_t ncclDdaIpcCommInit(ncclComm* comm) {
   comm->ddaLLEpochDev = epochDev;
   comm->ddaLLEpochLen = epochDev != nullptr ? (int)epochLen : 0;
   INFO(NCCL_INIT,
-       "ncclDdaIpcCommInit: scratch %zu bytes, IpcGpuBarrier nBlocks=%d, peer IPC table on device, LL epoch cells=%zu",
-       bytes, nBlocksMax, epochDev != nullptr ? epochLen : 0);
+       "ncclDdaIpcCommInit: nRanks %d, scratch %zu bytes (derived from RCCL DDA params; "
+       "RCCL_DDA_IPC_BUFFER_SIZE=%lld), LL enabled=%lld, IpcGpuBarrier nBlocks=%d, peer IPC table on device, "
+       "LL epoch cells=%zu",
+       kDdaNranks, bytes, (long long)ipcScratchOverride, (long long)llEnabled, nBlocksMax,
+       epochDev != nullptr ? epochLen : 0);
   return ncclSuccess;
 }
 

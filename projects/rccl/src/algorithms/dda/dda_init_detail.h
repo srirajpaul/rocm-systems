@@ -74,6 +74,28 @@ inline size_t ddaFabricScratchSizing(int nRanks, int64_t overrideBytes, int64_t 
   return bytes;
 }
 
+// Compute the IPC scratch allocation from the runtime configuration.
+// An explicit buffer-size override takes precedence over derived sizing.
+//
+// The derived size is max(DDA_IPC_BUFFER_SIZE, llFloor), where llFloor is
+// 2 banks * nRanks * kDdaLLMaxBytes when LL is enabled. All four LL all-reduce
+// tiers (LL/LL128 x one-shot/two-shot) share that one bank layout and so come
+// out to exactly llFloor; without it the base DDA_IPC_BUFFER_SIZE is far too
+// small and every tier fails its scratch-capacity check.
+inline size_t ddaIpcScratchSizing(int nRanks, int64_t overrideBytes, int64_t llEnabled) {
+  if (overrideBytes >= 0) {
+    return overrideBytes > 0 ? (size_t)overrideBytes : 0;
+  }
+
+  if (nRanks < 1) nRanks = 1;
+
+  size_t bytes = (size_t)DDA_IPC_BUFFER_SIZE;
+  const size_t llFloor = llEnabled ? (size_t)2 * nRanks * kDdaLLMaxBytes : 0;
+  if (llFloor > bytes) bytes = llFloor;
+
+  return bytes;
+}
+
 // Per-comm IPC barrier state stored in ncclComm::ddaIpcBarrierState.
 struct DdaIpcBarrierState {
   std::unique_ptr<dda::common::IpcGpuBarrierResources> resources;
@@ -87,8 +109,23 @@ struct DdaFabricBarrierState {
 };
 
 inline int ddaMaxNBlocksForScratch() {
-  unsigned maxBlocks = DDA_IPC_MAXBLOCKS;
-  return static_cast<int>(maxBlocks);
+  static int maxBlocks = -1;
+  if (maxBlocks < 0) {
+    int n = DDA_IPC_MAXBLOCKS;
+    const char* s = getenv("RCCL_DDA_IPC_MAXBLOCKS");
+    if (s != nullptr) {
+      n = atoi(s);
+    }
+    if (n < 1) {
+      n = 1;
+    }
+    if (n > 256) {
+      n = 256;
+    }
+    maxBlocks = n;
+  }
+  return maxBlocks;
+
 }
 
 inline int ddaFabricMaxNBlocksForScratch() {
