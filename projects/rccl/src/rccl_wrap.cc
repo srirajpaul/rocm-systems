@@ -626,6 +626,7 @@ ncclResult_t rcclGetAlgoName(int algo, const char** algoName) {
       *algoName = "DDA";
       break;
     case rcclAddonAlgos_t::RCCL_DDA_IPC:
+    case rcclAddonAlgos_t::RCCL_DDA_IPC_LL:
       *algoName = "DDA-IPC";
       break;
     default:
@@ -955,6 +956,12 @@ ncclResult_t rcclSelectAllReduce(struct ncclComm* comm, const void* sendbuff, vo
         return ncclSuccess;
       }
     } else {
+      if (ncclAllReduceDdaIpcLLEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
+        decision->algo = RCCL_DDA_IPC_LL;
+        decision->protocol = NCCL_PROTO_LL;
+        decision->nMaxChannels = ncclAllReduceDdaIpcLLBlocks(comm, count, datatype);
+        return ncclSuccess;
+      }
       if (ncclAllReduceDdaIpcEligible(comm, sendbuff, recvbuff, count, datatype, op)) {
         decision->algo = RCCL_DDA_IPC;
         decision->nMaxChannels = ncclAllReduceDdaIpcBlocks(comm, count, datatype);

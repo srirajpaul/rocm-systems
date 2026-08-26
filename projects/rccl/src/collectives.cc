@@ -658,6 +658,11 @@ ncclResult_t ncclAllReduce_impl(const void* sendbuff, void* recvbuff, size_t cou
          comm->nRanks, comm->nNodes, count, (int)datatype, count * ncclTypeSize(datatype));
     NCCLCHECK(ncclAllReduceDdaFabric(sendbuff, recvbuff, count, datatype, op, comm, stream));
     return ncclSuccess;
+  case RCCL_DDA_IPC_LL:
+    INFO(NCCL_COLL, "AllReduce: taking DDA IPC LL path: nRanks=%d nNodes=%d count=%zu datatype=%d bytes=%zu",
+         comm->nRanks, comm->nNodes, count, (int)datatype, count * ncclTypeSize(datatype));
+    NCCLCHECK(ncclAllReduceDdaIpcLL(sendbuff, recvbuff, count, datatype, op, comm, stream));
+    return ncclSuccess;
   case RCCL_DDA_IPC:
     NCCLCHECK(ncclAllReduceDdaIpc(sendbuff, recvbuff, count, datatype, op, comm, stream));
     return ncclSuccess;

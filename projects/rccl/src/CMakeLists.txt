@@ -31,6 +31,7 @@ set(SRC_FILES
   dev_runtime_segments.cc
   dev_runtime_internal.h
   algorithms/dda/all_reduce/dda_all_reduce_ipc.cu
+  algorithms/dda/all_reduce/dda_all_reduce_ipc_ll.cu
   algorithms/dda/reduce_scatter/dda_reduce_scatter_ipc.cu
   algorithms/dda/all_gather/dda_all_gather_ipc.cu
   algorithms/dda/alltoall/dda_alltoall_ipc.cu
@@ -807,6 +808,7 @@ if(ENABLE_DEVICE_LINKER)
   list(FILTER HIP_SOURCES EXCLUDE REGEX "onerank\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "collectives\\.cc$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_all_reduce_ipc\\.cu\\.cpp$")
+  list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_all_reduce_ipc_ll\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_reduce_scatter_ipc\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_all_gather_ipc\\.cu\\.cpp$")
   list(FILTER HIP_SOURCES EXCLUDE REGEX "dda_alltoall_ipc\\.cu\\.cpp$")

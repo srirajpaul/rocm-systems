@@ -21,6 +21,27 @@ bool ncclAllReduceDdaIpcEligible(ncclComm* comm, const void* sendbuff, void* rec
 ncclResult_t ncclAllReduceDdaIpc(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                  ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
 
+// LL-protocol IPC path (small-message fast lane, flag-based sync, no barrier).
+// Same four tiers as the fabric LL launcher (LL/LL128 × one-shot/two-shot);
+// picking between them is internal to dda_all_reduce_ipc_ll.cu.
+bool ncclAllReduceDdaIpcLLEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
+                                   ncclDataType_t datatype, ncclRedOp_t op);
+
+bool ddaLLArOneShotIpcEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
+                               ncclDataType_t datatype, ncclRedOp_t op);
+
+bool ddaLLArTwoShotIpcEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
+                               ncclDataType_t datatype, ncclRedOp_t op);
+
+bool ddaLL128ArOneShotIpcEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
+                                  ncclDataType_t datatype, ncclRedOp_t op);
+
+bool ddaLL128ArTwoShotIpcEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
+                                  ncclDataType_t datatype, ncclRedOp_t op);
+
+ncclResult_t ncclAllReduceDdaIpcLL(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
+                                   ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
+
 // Fabric path (runtime nRanks up to kDdaMaxNranks, single- or multi-node).
 bool ncclAllReduceDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
                                     ncclDataType_t datatype, ncclRedOp_t op);
@@ -66,6 +87,7 @@ ncclResult_t ncclAllReduceDdaFabricLL128(const void* sendbuff, void* recvbuff, s
 // Total CTAs (grid blocks) each DDA allreduce launcher would use for the given
 // operands. Mirrors the launch grid math so reporting reflects real occupancy.
 uint32_t ncclAllReduceDdaIpcBlocks(ncclComm* comm, size_t count, ncclDataType_t datatype);
+uint32_t ncclAllReduceDdaIpcLLBlocks(ncclComm* comm, size_t count, ncclDataType_t datatype);
 uint32_t ncclAllReduceDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_t datatype);
 uint32_t ncclAllReduceDdaFabricLLBlocks(ncclComm* comm, size_t count, ncclDataType_t datatype);
 uint32_t ncclAllReduceDdaFabricLL128Blocks(ncclComm* comm, size_t count, ncclDataType_t datatype);

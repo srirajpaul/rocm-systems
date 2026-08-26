@@ -8,8 +8,8 @@
  *
  * This is the all-reduce analogue of all_gather_dda_fabric_ll.h. The kernel is
  * codepath-agnostic (it only needs the peer scratch table), so the same kernel
- * backs the fabric launcher (dda_all_reduce_fabric_ll.cu) and can equally back
- * an IPC launcher.
+ * backs the fabric launcher (dda_all_reduce_fabric_ll.cu) and the IPC
+ * launcher (dda_all_reduce_ipc_ll.cu).
  *
  * See LICENSE.txt for license information.
  ************************************************************************/

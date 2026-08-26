@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 
 using nccl_dda_detail::DdaIpcBarrierState;
+using nccl_dda_detail::ddaLLEpochCount;
 using nccl_dda_detail::ddaMaxNBlocksForScratch;
 using nccl_dda_detail::kDdaNranks;
 
@@ -186,13 +187,33 @@ ncclResult_t ncclDdaIpcCommInit(ncclComm* comm) {
   barrierState->resources = std::move(barrierPair.first);
   barrierState->barrierHost = barrierPair.second;
 
+  // Device epoch cells for the LL collectives: zero-initialised so the first
+  // device-derived flag is 1. Optional — simple IPC still works if this fails.
+  uint32_t* epochDev = nullptr;
+  const size_t epochLen = ddaLLEpochCount(kDdaNranks, nBlocksMax);
+  ce = cudaMalloc(&epochDev, epochLen * sizeof(uint32_t));
+  if (ce != cudaSuccess) {
+    WARN("ncclDdaIpcCommInit: cudaMalloc(LL epoch) failed (%s); LL path disabled", cudaGetErrorString(ce));
+    epochDev = nullptr;
+  } else {
+    ce = cudaMemset(epochDev, 0, epochLen * sizeof(uint32_t));
+    if (ce != cudaSuccess) {
+      WARN("ncclDdaIpcCommInit: cudaMemset(LL epoch) failed (%s); LL path disabled", cudaGetErrorString(ce));
+      CUDACHECKIGNORE(cudaFree(epochDev));
+      epochDev = nullptr;
+    }
+  }
+
   comm->ddaIpcMemHandler = handler;
   comm->ddaScratch = scratch;
   comm->ddaScratchBytes = bytes;
   comm->ddaPeerPtrsDev = peerDev;
   comm->ddaIpcBarrierState = barrierState;
-  INFO(NCCL_INIT, "ncclDdaIpcCommInit: scratch %zu bytes, IpcGpuBarrier nBlocks=%d, peer IPC table on device", bytes,
-       nBlocksMax);
+  comm->ddaLLEpochDev = epochDev;
+  comm->ddaLLEpochLen = epochDev != nullptr ? (int)epochLen : 0;
+  INFO(NCCL_INIT,
+       "ncclDdaIpcCommInit: scratch %zu bytes, IpcGpuBarrier nBlocks=%d, peer IPC table on device, LL epoch cells=%zu",
+       bytes, nBlocksMax, epochDev != nullptr ? epochLen : 0);
   return ncclSuccess;
 }
 
@@ -206,6 +227,9 @@ ncclResult_t ncclDdaIpcCommFini(ncclComm* comm) {
   }
   CUDACHECKIGNORE(cudaFree(comm->ddaPeerPtrsDev));
   comm->ddaPeerPtrsDev = nullptr;
+  CUDACHECKIGNORE(cudaFree(comm->ddaLLEpochDev));
+  comm->ddaLLEpochDev = nullptr;
+  comm->ddaLLEpochLen = 0;
   free(comm->ddaPeerPtrsHost);
   comm->ddaPeerPtrsHost = nullptr;
   if (comm->ddaIpcMemHandler != nullptr) {
