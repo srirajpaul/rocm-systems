@@ -161,7 +161,7 @@ static ncclResult_t ncclAllReduceDdaFabricLL128OneShotTyped(const void* sendbuff
   const size_t bytes = count * sizeof(T);
   const int wireWordPerSlice = ddaLL128ArWireWordPerSlice(comm->WarpSize);
   const int dataBytesPerSlice = ddaLL128ArDataBytesPerSlice(comm->WarpSize, comm->ll128LineElems);
-  const size_t slices = ddaLL128ArSlices(bytes, comm->WarpSize, comm->ll128LineElems);
+  //const size_t slices = ddaLL128ArSlices(bytes, comm->WarpSize, comm->ll128LineElems);
   const size_t slotWords = dda::common::kDdaLL128ArSlotWords;
 
   const unsigned threads = 512;
@@ -176,19 +176,21 @@ static ncclResult_t ncclAllReduceDdaFabricLL128OneShotTyped(const void* sendbuff
   // total bytes with flags. we use 1 word from kLineWords as flag
   const size_t total_bytes = std::ceil((double)bytes * kLineWords / (kLineWords - 1));
 
-  const size_t nPk = std::ceil((double)total_bytes / kBytesPerThread);
+  const size_t nthreads = (total_bytes + kBytesPerThread - 1) / kBytesPerThread;
 
   int nBlocksMax = comm->ddaFabricMaxBlocks;
   if (nBlocksMax < 1) {
     nBlocksMax = 1;
   }
   unsigned blocks =
-    (unsigned)std::min<size_t>((nPk + threads - 1) / threads, (size_t)nBlocksMax);
+    (unsigned)std::min<size_t>((nthreads + threads - 1) / threads, (size_t)nBlocksMax);
   if (blocks == 0) {
     blocks = 1;
   }
   dim3 block(threads);
   dim3 grid(blocks);
+
+  const size_t slices = (nthreads + comm->WarpSize - 1) / comm->WarpSize;
 
   T** peers = reinterpret_cast<T**>(comm->ddaPeerPtrsDev);
   uint32_t* epochDev = comm->ddaLLEpochDev;
