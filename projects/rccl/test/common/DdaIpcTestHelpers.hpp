@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cstring>
 
 #include "comm.h"
@@ -28,7 +29,12 @@ struct DdaIpcMockComm
         comm.bootstrap           = &bootstrapPlaceholder;
         comm.nNodes              = 1;
         comm.nRanks              = nccl_dda_detail::kDdaNranks;
-        comm.ddaScratchBytes  = DDA_IPC_BUFFER_SIZE;
+        // Same sizing the real comm gets, so the LL all-reduce tiers see the
+        // capacity they actually run with rather than the pre-LL base size.
+        comm.ddaScratchBytes  = nccl_dda_detail::ddaIpcScratchSizing(
+            nccl_dda_detail::kDdaNranks, /*overrideBytes=*/-1, /*llEnabled=*/1);
+        comm.WarpSize            = 64;
+        comm.ll128LineElems      = 8;
         setIpcResourcesPresent(true);
     }
 
@@ -42,6 +48,8 @@ struct DdaIpcMockComm
             comm.ddaPeerPtrsDev   = reinterpret_cast<void*>(0x3);
             comm.ddaIpcBarrierState  =
                 reinterpret_cast<nccl_dda_detail::DdaIpcBarrierState*>(0x4);
+            comm.ddaLLEpochDev   = reinterpret_cast<uint32_t*>(0x5);
+            comm.ddaLLEpochLen   = 24;
         }
         else
         {
@@ -49,6 +57,8 @@ struct DdaIpcMockComm
             comm.ddaScratch      = nullptr;
             comm.ddaPeerPtrsDev  = nullptr;
             comm.ddaIpcBarrierState = nullptr;
+            comm.ddaLLEpochDev      = nullptr;
+            comm.ddaLLEpochLen      = 0;
         }
     }
 

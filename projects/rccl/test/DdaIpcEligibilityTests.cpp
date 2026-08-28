@@ -8,6 +8,7 @@
 #include "common/DdaIpcTestHelpers.hpp"
 
 #include "algorithms/dda/all_gather/dda_all_gather.h"
+#include "algorithms/dda/all_reduce/dda_all_reduce.h"
 #include "algorithms/dda/alltoall/dda_alltoall.h"
 #include "algorithms/dda/reduce_scatter/dda_reduce_scatter.h"
 #include "gtest/gtest.h"
@@ -206,6 +207,144 @@ TEST_F(DdaIpcEligibilityTest, ReduceScatter_InvalidDatatypeDispatch)
                                      mockComm_.get(),
                                      nullptr),
               ncclInvalidArgument);
+}
+
+// ---------------------------------------------------------------------------
+// AllReduce LL (IPC): same four-tier gate as fabric, with IPC resources.
+// Default thresholds: one-shot 1 MiB, two-shot 16 MiB, LL128 one-shot 32 MiB.
+// ---------------------------------------------------------------------------
+
+TEST_F(DdaIpcEligibilityTest, AllReduceLL_NullComm)
+{
+    EXPECT_FALSE(ncclAllReduceDdaIpcLLEligible(
+        nullptr, sendbuff_, recvbuff_, 4, ncclFloat32, ncclSum));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllReduceLL_MissingIpcResources)
+{
+    mockComm_.setIpcResourcesPresent(false);
+    EXPECT_FALSE(ncclAllReduceDdaIpcLLEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 4, ncclFloat32, ncclSum));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllReduceLL_MissingEpoch)
+{
+    mockComm_.comm.ddaLLEpochDev = nullptr;
+    EXPECT_FALSE(ncclAllReduceDdaIpcLLEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 4, ncclFloat32, ncclSum));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllReduceLL_MultiNode)
+{
+    mockComm_.comm.nNodes = 2;
+    EXPECT_FALSE(ncclAllReduceDdaIpcLLEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 4, ncclFloat32, ncclSum));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllReduceLL_ZeroCount)
+{
+    EXPECT_FALSE(ncclAllReduceDdaIpcLLEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 0, ncclFloat32, ncclSum));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllReduceLL_UnsupportedOp)
+{
+    EXPECT_FALSE(ncclAllReduceDdaIpcLLEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 4, ncclFloat32, ncclProd));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllReduceLL_UnalignedBytes)
+{
+    EXPECT_FALSE(ncclAllReduceDdaIpcLLEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 1, ncclFloat32, ncclSum));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllReduceLL_EligibleFloat32)
+{
+    EXPECT_TRUE(ncclAllReduceDdaIpcLLEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 4, ncclFloat32, ncclSum));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllReduceLL_OneShotEligible)
+{
+    mockComm_.comm.nRanks = 4;
+    EXPECT_TRUE(ddaLLArOneShotIpcEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 4, ncclFloat32, ncclSum));
+    EXPECT_FALSE(ddaLLArTwoShotIpcEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 4, ncclFloat32, ncclSum));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllReduceLL_TwoShotClaimsPastOneShotThreshold)
+{
+    EXPECT_TRUE(ncclAllReduceDdaIpcLLEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 262176, ncclFloat32, ncclSum));
+    EXPECT_FALSE(ddaLLArOneShotIpcEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 262176, ncclFloat32, ncclSum));
+    EXPECT_TRUE(ddaLLArTwoShotIpcEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 262176, ncclFloat32, ncclSum));
+}
+
+TEST_F(DdaIpcEligibilityTest, AllReduceLL128_OneShotPastTwoShotThreshold)
+{
+    // 16 MiB + 128 B is past the LL two-shot cap and inside the LL128 one-shot cap.
+    EXPECT_TRUE(ddaLL128ArOneShotIpcEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 4194336, ncclFloat32, ncclSum));
+    EXPECT_FALSE(ddaLLArOneShotIpcEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 4194336, ncclFloat32, ncclSum));
+    EXPECT_FALSE(ddaLLArTwoShotIpcEligible(
+        mockComm_.get(), sendbuff_, recvbuff_, 4194336, ncclFloat32, ncclSum));
+}
+
+// ---------------------------------------------------------------------------
+// IPC scratch sizing
+// ---------------------------------------------------------------------------
+
+TEST(DdaIpcScratchSizingTest, ExplicitOverrideTakesPrecedence)
+{
+    const size_t forced = nccl_dda_detail::ddaIpcScratchSizing(8, 4096, 1);
+    EXPECT_EQ(forced, 4096u);
+
+    const size_t disabled = nccl_dda_detail::ddaIpcScratchSizing(8, 0, 1);
+    EXPECT_EQ(disabled, 0u);
+}
+
+TEST(DdaIpcScratchSizingTest, DisabledLLUsesBaseBufferSize)
+{
+    const size_t sizing = nccl_dda_detail::ddaIpcScratchSizing(8, -1, 0);
+    EXPECT_EQ(sizing, (size_t)DDA_IPC_BUFFER_SIZE);
+}
+
+// The four LL all-reduce tiers share one bank layout of
+// 2 * nRanks * kDdaLLMaxBytes, which is far larger than DDA_IPC_BUFFER_SIZE.
+// Without this floor every tier fails its scratch-capacity check and the LL
+// path can never be selected on the IPC codepath.
+TEST(DdaIpcScratchSizingTest, LLFloorDominatesBaseBufferSize)
+{
+    constexpr size_t llFloor = 2 * 8 * nccl_dda_detail::kDdaLLMaxBytes;
+    static_assert(llFloor > (size_t)DDA_IPC_BUFFER_SIZE, "LL floor should exceed the base IPC buffer");
+
+    const size_t sizing = nccl_dda_detail::ddaIpcScratchSizing(8, -1, 1);
+    EXPECT_EQ(sizing, llFloor);
+}
+
+TEST(DdaIpcScratchSizingTest, LLFloorScalesWithRankCount)
+{
+    EXPECT_EQ(nccl_dda_detail::ddaIpcScratchSizing(4, -1, 1),
+              (size_t)2 * 4 * nccl_dda_detail::kDdaLLMaxBytes);
+    EXPECT_EQ(nccl_dda_detail::ddaIpcScratchSizing(8, -1, 1),
+              (size_t)2 * 8 * nccl_dda_detail::kDdaLLMaxBytes);
+}
+
+TEST_F(DdaIpcEligibilityTest, AllReduceLL_InvalidDatatypeDispatch)
+{
+    EXPECT_EQ(ncclAllReduceDdaIpcLL(sendbuff_,
+                                   recvbuff_,
+                                   4,
+                                   ncclInt32,
+                                   ncclSum,
+                                   mockComm_.get(),
+                                   nullptr),
+              ncclInternalError);
 }
 
 } // namespace RcclUnitTesting
