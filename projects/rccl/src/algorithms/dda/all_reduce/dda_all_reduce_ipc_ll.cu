@@ -30,6 +30,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -91,6 +92,30 @@ static inline int ddaIpcLlMaxBlocks() {
   return n < 1 ? 1 : n;
 }
 
+// LL one-shot all-reduce splits the peer fan-out across gridDim.y so a single
+// thread publishes to at most this many peers instead of all nRanks - 1.
+constexpr int kDdaLLArPeersPerBlockRow = 4;
+
+// Rows of blocks on the y axis: one row per group of kDdaLLArPeersPerBlockRow
+// ranks (8 ranks -> 2, 12 -> 3, 16 -> 4).
+static inline unsigned ddaLLArPeerRows(int nRanks) {
+  const int rows = (nRanks + kDdaLLArPeersPerBlockRow - 1) / kDdaLLArPeersPerBlockRow;
+  assert(rows > 0);
+  return (unsigned)rows;
+}
+
+// Largest x extent that keeps the whole grid inside the epoch array: the kernel
+// reads epochDev[flatBlockId] for every block, and flatBlockId spans
+// gridDim.x * gridDim.y. epochLen is always well above the row count
+// (ddaLLEpochCount() floors it at nRanks * kDdaLLAgMaxBlocksPerPeer), so this
+// only ever bites when RCCL_DDA_IPC_MAXBLOCKS is raised past epochLen / rows.
+static inline unsigned ddaLLArMaxBlocksForEpoch(int epochLen, unsigned rows) {
+  assert(rows > 0);
+  assert(epochLen >= (int)rows);
+  const int blocks = epochLen / (int)rows;
+  return (unsigned)(blocks < 1 ? 1 : blocks);
+}
+
 // IPC path: single node, IPC handler, shared scratch/peer table, and the LL
 // epoch array allocated at IPC comm init.
 static inline bool ddaIpcLlResourcesOk(ncclComm* comm) {
@@ -122,15 +147,20 @@ static ncclResult_t ncclAllReduceDdaIpcLLTyped(const void* sendbuff, void* recvb
   if (blocks == 0) {
     blocks = 1;
   }
+  const unsigned rows = ddaLLArPeerRows(nRanks);
+  // ddaLLEpochCount() sizes the epoch array for a 1D grid of nBlocksMax, so the
+  // y axis can push flatBlockId (< gridDim.x * gridDim.y) past the last cell.
+  // Give up x blocks rather than read off the end.
+  blocks = std::min(blocks, ddaLLArMaxBlocksForEpoch(comm->ddaLLEpochLen, rows));
   dim3 block(threads);
-  dim3 grid(blocks);
+  dim3 grid(blocks, rows);
 
   T** peers = reinterpret_cast<T**>(comm->ddaPeerPtrsDev);
   uint32_t* epochDev = comm->ddaLLEpochDev;
   const int epochLen = comm->ddaLLEpochLen;
 
-  INFO(NCCL_COLL, "DDA IPC AllReduce LL: nRanks=%d bytes=%zu nPk=%zu grid=%u block=%u", nRanks, bytes, nPk, grid.x,
-       block.x);
+  INFO(NCCL_COLL, "DDA IPC AllReduce LL: nRanks=%d bytes=%zu nPk=%zu grid=%ux%u block=%u epochLen=%d", nRanks, bytes,
+       nPk, grid.x, grid.y, block.x, epochLen);
 
   switch (nRanks) {
   case 4:

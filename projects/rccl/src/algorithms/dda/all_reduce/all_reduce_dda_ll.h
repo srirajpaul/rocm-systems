@@ -62,7 +62,17 @@ __launch_bounds__(512)
   const size_t nPk = bytes >> 3;           // 8 payload bytes per packet
   const size_t slot = kDdaLLArSlotStridePkts;
 
-  const uint32_t flag = ddaGetLLEpochInc(epochDev, blockIdx.x, 1);
+  // Flat block id + total launched blocks. tid 0 reads our own epoch cell (all
+  // cells hold the same value) and derives this launch's flag on the device, so
+  // nothing is baked into a HIP graph capture. bank = flag & 1.
+  const int flatBlockId = blockIdx.x * gridDim.y + blockIdx.y;
+  const int total = gridDim.x * gridDim.y;
+  const uint32_t flag = ddaGetLLEpochInc(epochDev, flatBlockId, 1);
+
+  // Peer fan-out across gridDim.y is not wired up yet: row 0 still does the
+  // whole collective and the other rows only carry the epoch bump. Row 0 (not
+  // row 1) so this stays correct where gridDim.y == 1, which is every launch
+  // from the fabric launcher.
   const size_t bankOffsetPkts = (size_t)(flag & 1u) * (size_t)nRanks * slot;
 
   const size_t gtid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -71,25 +81,34 @@ __launch_bounds__(512)
   const uint32_t* in = reinterpret_cast<const uint32_t*>(sendbuff);
   uint32_t* out = reinterpret_cast<uint32_t*>(recvbuff);
 
+  // Peers this row owns. Derived from the launch geometry rather than a fixed
+  // per-row constant, so the rows always tile [0, nRanks) whatever gridDim.y the
+  // launcher picked -- including the 1D fabric launch, where row 0 takes all of
+  // them. Phase 2 waits on every slot, so a gap here would hang the collective.
+  const int peersPerRow = (nRanks + (int)gridDim.y - 1) / (int)gridDim.y;
+  const int rStart = (int)blockIdx.y * peersPerRow;
+  const int rEnd = std::min(nRanks, rStart + peersPerRow);
+
   // Phase 1: publish my payload into every peer's slot[selfRank].
   for (size_t pk = gtid; pk < nPk; pk += stride) {
     const uint32_t d0 = in[2 * pk];
     const uint32_t d1 = in[2 * pk + 1];
 
 #pragma unroll
-    for (int r = 1; r < nRanks; ++r) {
+    for (int r = rStart; r < rEnd; ++r) {
       const int peer = (selfRank + r) % nRanks;
       LLPacket16* dst = reinterpret_cast<LLPacket16*>(peerScratch[peer]) + bankOffsetPkts + (size_t)selfRank * slot;
       ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(&dst[pk]), d0, flag, d1, flag);
     }
   }
 
+  if (blockIdx.y == 0) {
   // Phase 2: poll my slots for the other ranks, reduce with my own data.
   LLPacket16* myBase = reinterpret_cast<LLPacket16*>(peerScratch[selfRank]) + bankOffsetPkts;
   for (size_t pk = gtid; pk < nPk; pk += stride) {
-    uint32_t acc0 = in[2 * pk];
-    uint32_t acc1 = in[2 * pk + 1];
-    for (int r = 1; r < nRanks; ++r) {
+    uint32_t acc0 = 0; //in[2 * pk];
+    uint32_t acc1 = 0; //in[2 * pk + 1];
+    for (int r = 0; r < nRanks; ++r) {
       const int peer = (selfRank + r) % nRanks;
       volatile LLPacket16* src = myBase + (size_t)peer * slot;
       uint32_t d0, f0, d1, f1;
@@ -102,8 +121,9 @@ __launch_bounds__(512)
     out[2 * pk] = acc0;
     out[2 * pk + 1] = acc1;
   }
+  }
 
-  ddaSetLLEpoch(epochDev, epochLen, blockIdx.x, gridDim.x, flag);
+  ddaSetLLEpoch(epochDev, epochLen, flatBlockId, total, flag);
 }
 
 } // namespace dda::common
