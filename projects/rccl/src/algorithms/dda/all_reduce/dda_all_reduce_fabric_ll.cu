@@ -39,6 +39,7 @@ namespace {
 using dda::common::kDdaLLArSlotStridePkts;
 using dda::common::kDdaLLArTwoShotSlotStridePkts;
 using dda::common::kDdaLLMaxBytes;
+using dda::common::kDdaLLArPeersPerBlockRow;
 using dda::common::LLPacket16;
 
 // LL scratch footprint: 2 banks * nRanks slots * slotStride packets * 16B.
@@ -74,10 +75,6 @@ static inline std::pair<dim3, dim3> ddaAllReduceFabricLLGeom(ncclComm* comm, siz
   return std::make_pair(dim3(blocks), dim3(threads));
 }
 
-// LL one-shot all-reduce splits the peer fan-out across gridDim.y so a single
-// thread publishes to at most this many peers instead of all nRanks - 1.
-constexpr int kDdaLLArPeersPerBlockRow = 4;
-
 // Rows of blocks on the y axis: one row per group of kDdaLLArPeersPerBlockRow
 // ranks (8 ranks -> 2, 12 -> 3, 16 -> 4).
 static inline unsigned ddaLLArPeerRows(int nRanks) {
@@ -106,7 +103,7 @@ static ncclResult_t ncclAllReduceDdaFabricLLTyped(const void* sendbuff, void* re
   const size_t bytes = count * sizeof(T);
   const size_t nPk = bytes >> 3; // 8 payload bytes per packet (for logging)
 
-  const unsigned threads = 512;
+  const unsigned threads = 256;
   int nBlocksMax = comm->ddaFabricMaxBlocks;
   if (nBlocksMax < 1) {
     nBlocksMax = 1;

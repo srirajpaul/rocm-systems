@@ -29,6 +29,10 @@
 
 namespace dda::common {
 
+// LL one-shot all-reduce splits the peer fan-out across gridDim.y so a single
+// thread publishes to at most this many peers instead of all nRanks - 1.
+constexpr int kDdaLLArPeersPerBlockRow = 4;
+
 // LL is for small-message, so the full payload is well under the staging cap.
 // each packet takes 16 bytes.
 constexpr size_t kDdaLLArSlotStridePkts = kDdaLLMaxBytes / sizeof(LLPacket16);
@@ -82,8 +86,9 @@ __launch_bounds__(512)
   // launcher picked -- including the 1D fabric launch, where row 0 takes all of
   // them. Phase 2 waits on every slot, so a gap here would hang the collective.
   const int peersPerRow = (nRanks + (int)gridDim.y - 1) / (int)gridDim.y;
-  const int rStart = blockIdx.y * 4;
-  const int rEnd = rStart + 4;
+  const int rStart = blockIdx.y * kDdaLLArPeersPerBlockRow + 1;
+  const int rEnd = (blockIdx.y + 1) * kDdaLLArPeersPerBlockRow;
+      //rStart + kDdaLLArPeersPerBlockRow;
 
   //if (blockIdx.y == 0) {
   // Phase 1: publish my payload into every peer's slot[selfRank].
@@ -100,27 +105,27 @@ __launch_bounds__(512)
   }
   //}
 
-  if (blockIdx.y == 0) {
+  //if (blockIdx.y == 0) {
   // Phase 2: poll my slots for the other ranks, reduce with my own data.
   LLPacket16* myBase = reinterpret_cast<LLPacket16*>(peerScratch[selfRank]) + bankOffsetPkts;
   for (size_t pk = gtid; pk < nPk; pk += stride) {
     uint32_t acc0 = in[2 * pk];
     uint32_t acc1 = in[2 * pk + 1];
-    for (int r = 1; r < nRanks; ++r) {
+    for (int r = rStart; r < rEnd; ++r) {
       const int peer = (selfRank + r) % nRanks;
       volatile LLPacket16* src = myBase + (size_t)peer * slot;
       uint32_t d0, f0, d1, f1;
       do {
         ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(const_cast<LLPacket16*>(&src[pk])), d0, f0, d1, f1);
       } while (f0 != flag || f1 != flag);
-      //acc0 = vecElementAdd<T>(acc0, d0);
-      //acc1 = vecElementAdd<T>(acc1, d1);
+      acc0 = vecElementAdd<T>(acc0, d0);
+      acc1 = vecElementAdd<T>(acc1, d1);
     }
     out[2 * pk] = acc0;
     out[2 * pk + 1] = acc1;
   }
-  }
- 
+  //}
+
   //ddaSetLLEpoch(epochDev, epochLen, blockIdx.x, gridDim.x, flag);
   ddaSetLLEpoch(epochDev, epochLen, flatBlockId, total, flag);
 }
