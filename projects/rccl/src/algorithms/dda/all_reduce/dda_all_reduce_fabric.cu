@@ -90,6 +90,12 @@ static ncclResult_t ncclAllReduceDdaFabricTyped(const void* sendbuff, void* recv
         <<<grid, block, 0, stream>>>(d_ipcbuffs, static_cast<T*>(recvbuff), count, static_cast<const T*>(sendbuff),
                                      comm->rank, nRanks, barrierHost, nullptr);
       break;
+    case 16:
+      INFO(NCCL_COLL, "DDA fabric AllReduce: tree path, NRANKS_CT=8 (unrolled)");
+      dda::common::ddaAllReduceTreeFabric<T, 16, false>
+        <<<grid, block, 0, stream>>>(d_ipcbuffs, static_cast<T*>(recvbuff), count, static_cast<const T*>(sendbuff),
+                                     comm->rank, nRanks, barrierHost, nullptr);
+      break;
     default:
       INFO(NCCL_COLL, "DDA fabric AllReduce: tree path, NRANKS_CT=0 (runtime, nRanks=%d)", nRanks);
       dda::common::ddaAllReduceTreeFabric<T, 0, false>
@@ -108,6 +114,12 @@ static ncclResult_t ncclAllReduceDdaFabricTyped(const void* sendbuff, void* recv
     case 8:
       INFO(NCCL_COLL, "DDA fabric AllReduce: flat path, NRANKS_CT=8 (unrolled)");
       dda::common::ddaAllReduceFlatFabric<T, 8, false>
+        <<<grid, block, 0, stream>>>(d_ipcbuffs, static_cast<T*>(recvbuff), count, static_cast<const T*>(sendbuff),
+                                     comm->rank, nRanks, barrierHost, nullptr);
+      break;
+    case 16:
+      INFO(NCCL_COLL, "DDA fabric AllReduce: flat path, NRANKS_CT=8 (unrolled)");
+      dda::common::ddaAllReduceFlatFabric<T, 16, false>
         <<<grid, block, 0, stream>>>(d_ipcbuffs, static_cast<T*>(recvbuff), count, static_cast<const T*>(sendbuff),
                                      comm->rank, nRanks, barrierHost, nullptr);
       break;

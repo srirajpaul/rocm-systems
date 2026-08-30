@@ -74,6 +74,31 @@ static inline std::pair<dim3, dim3> ddaAllReduceFabricLLGeom(ncclComm* comm, siz
   return std::make_pair(dim3(blocks), dim3(threads));
 }
 
+// LL one-shot all-reduce splits the peer fan-out across gridDim.y so a single
+// thread publishes to at most this many peers instead of all nRanks - 1.
+constexpr int kDdaLLArPeersPerBlockRow = 4;
+
+// Rows of blocks on the y axis: one row per group of kDdaLLArPeersPerBlockRow
+// ranks (8 ranks -> 2, 12 -> 3, 16 -> 4).
+static inline unsigned ddaLLArPeerRows(int nRanks) {
+  const int rows = (nRanks + kDdaLLArPeersPerBlockRow - 1) / kDdaLLArPeersPerBlockRow;
+  assert(rows > 0);
+  return (unsigned)rows;
+}
+
+// Largest x extent that keeps the whole grid inside the epoch array: the kernel
+// reads epochDev[flatBlockId] for every block, and flatBlockId spans
+// gridDim.x * gridDim.y. epochLen is always well above the row count
+// (ddaLLEpochCount() floors it at nRanks * kDdaLLAgMaxBlocksPerPeer), so this
+// only ever bites when RCCL_DDA_IPC_MAXBLOCKS is raised past epochLen / rows.
+static inline unsigned ddaLLArMaxBlocksForEpoch(int epochLen, unsigned rows) {
+  assert(rows > 0);
+  assert(epochLen >= (int)rows);
+  const int blocks = epochLen / (int)rows;
+  return (unsigned)(blocks < 1 ? 1 : blocks);
+}
+
+
 template <typename T>
 static ncclResult_t ncclAllReduceDdaFabricLLTyped(const void* sendbuff, void* recvbuff, size_t count, ncclComm* comm,
                                                   cudaStream_t stream) {
@@ -90,8 +115,13 @@ static ncclResult_t ncclAllReduceDdaFabricLLTyped(const void* sendbuff, void* re
   if (blocks == 0) {
     blocks = 1;
   }
+  const unsigned rows = ddaLLArPeerRows(nRanks);
+  // ddaLLEpochCount() sizes the epoch array for a 1D grid of nBlocksMax, so the
+  // y axis can push flatBlockId (< gridDim.x * gridDim.y) past the last cell.
+  // Give up x blocks rather than read off the end.
+  blocks = std::min(blocks, ddaLLArMaxBlocksForEpoch(comm->ddaLLEpochLen, rows));
   dim3 block(threads);
-  dim3 grid(blocks);
+  dim3 grid(blocks, rows);
 
   T** peers = reinterpret_cast<T**>(comm->ddaPeerPtrsDev);
   // Shared epoch counter (same as AG/RS) so bank = flag & 1 is consistent
@@ -111,6 +141,10 @@ static ncclResult_t ncclAllReduceDdaFabricLLTyped(const void* sendbuff, void* re
     break;
   case 8:
     dda::common::ddaAllReduceFlatLL<T, 8><<<grid, block, 0, stream>>>(
+      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), count, comm->rank, nRanks, epochDev, epochLen);
+    break;
+  case 16:
+    dda::common::ddaAllReduceFlatLL<T, 16><<<grid, block, 0, stream>>>(
       peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), count, comm->rank, nRanks, epochDev, epochLen);
     break;
   default:
