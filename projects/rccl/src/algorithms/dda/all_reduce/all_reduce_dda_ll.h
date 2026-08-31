@@ -111,16 +111,31 @@ __launch_bounds__(512)
   for (size_t pk = gtid; pk < nPk; pk += stride) {
     uint32_t acc0 = in[2 * pk];
     uint32_t acc1 = in[2 * pk + 1];
+    uint32_t d00[kDdaLLArPeersPerBlockRow], d11[kDdaLLArPeersPerBlockRow];
+    bool needReload;
+    do {
+        needReload = false;
+
     for (int r = rStart; r < rEnd; ++r) {
       const int peer = (selfRank + r) % nRanks;
       volatile LLPacket16* src = myBase + (size_t)peer * slot;
       uint32_t d0, f0, d1, f1;
-      do {
-        ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(const_cast<LLPacket16*>(&src[pk])), d0, f0, d1, f1);
-      } while (f0 != flag || f1 != flag);
-      acc0 = vecElementAdd<T>(acc0, d0);
-      acc1 = vecElementAdd<T>(acc1, d1);
+      //do {
+        ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(const_cast<LLPacket16*>(&src[pk])), d00[r], f0, d11[r], f1);
+      //} while (f0 != flag || f1 != flag);
+      //acc0 = vecElementAdd<T>(acc0, d0);
+      //acc1 = vecElementAdd<T>(acc1, d1);
+
+      needReload |= (f0 != flag || f1 != flag);
     }
+
+    } while (needReload);
+
+    for (int r = rStart; r < rEnd; ++r) {
+        acc0 = vecElementAdd<T>(acc0, d00[r]);
+        acc1 = vecElementAdd<T>(acc1, d11[r]);
+    }
+
     out[2 * pk] = acc0;
     out[2 * pk + 1] = acc1;
   }
