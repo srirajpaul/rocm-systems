@@ -257,7 +257,7 @@ __device__ __forceinline__ void ddaLLStoreLineB128(uint32_t* dst, uint32_t a0, u
 __device__ __forceinline__ void ddaLLLoadLineB128(const uint32_t* src, uint32_t& o0, uint32_t& o1, uint32_t& o2,
                                                   uint32_t& o3) {
   asm volatile("" ::: "memory");
-#if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
+#if 1 //RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
   union {
     v4u v;
     uint32_t w[4];

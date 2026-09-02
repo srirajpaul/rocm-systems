@@ -86,7 +86,7 @@ __launch_bounds__(512)
   // launcher picked -- including the 1D fabric launch, where row 0 takes all of
   // them. Phase 2 waits on every slot, so a gap here would hang the collective.
   const int peersPerRow = (nRanks + (int)gridDim.y - 1) / (int)gridDim.y;
-  const int rStart = blockIdx.y * kDdaLLArPeersPerBlockRow + 1;
+  const int rStart = blockIdx.y * kDdaLLArPeersPerBlockRow;
   const int rEnd = (blockIdx.y + 1) * kDdaLLArPeersPerBlockRow;
       //rStart + kDdaLLArPeersPerBlockRow;
 
@@ -105,18 +105,20 @@ __launch_bounds__(512)
   }
   //}
 
-  //if (blockIdx.y == 0) {
+  if (blockIdx.y == 0) {
   // Phase 2: poll my slots for the other ranks, reduce with my own data.
   LLPacket16* myBase = reinterpret_cast<LLPacket16*>(peerScratch[selfRank]) + bankOffsetPkts;
   for (size_t pk = gtid; pk < nPk; pk += stride) {
     uint32_t acc0 = in[2 * pk];
     uint32_t acc1 = in[2 * pk + 1];
-    uint32_t d00[kDdaLLArPeersPerBlockRow], d11[kDdaLLArPeersPerBlockRow];
+    //uint32_t d00[kDdaLLArPeersPerBlockRow], d11[kDdaLLArPeersPerBlockRow];
+    uint32_t d00[nRanks], d11[nRanks];
     bool needReload;
     do {
         needReload = false;
 
-    for (int r = rStart; r < rEnd; ++r) {
+    //for (int r = rStart; r < rEnd; ++r) {
+    for (int r = 1; r < nRanks; ++r) {
       const int peer = (selfRank + r) % nRanks;
       volatile LLPacket16* src = myBase + (size_t)peer * slot;
       uint32_t d0, f0, d1, f1;
@@ -131,7 +133,8 @@ __launch_bounds__(512)
 
     } while (needReload);
 
-    for (int r = rStart; r < rEnd; ++r) {
+    //for (int r = rStart; r < rEnd; ++r) {
+    for (int r = 1; r < nRanks; ++r) {
         acc0 = vecElementAdd<T>(acc0, d00[r]);
         acc1 = vecElementAdd<T>(acc1, d11[r]);
     }
@@ -139,7 +142,7 @@ __launch_bounds__(512)
     out[2 * pk] = acc0;
     out[2 * pk + 1] = acc1;
   }
-  //}
+  }
 
   //ddaSetLLEpoch(epochDev, epochLen, blockIdx.x, gridDim.x, flag);
   ddaSetLLEpoch(epochDev, epochLen, flatBlockId, total, flag);
