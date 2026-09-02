@@ -27,10 +27,6 @@
 
 namespace dda::common {
 
-// LL one-shot all-reduce splits the peer fan-out across gridDim.y so a single
-// thread publishes to at most this many peers instead of all nRanks - 1.
-constexpr int kDdaLLArPeersPerBlockRow = 1;
-
 // Host-side mirrors of the wire layout, the LL128 counterparts of the LL path's
 // kDdaLLArSlotStridePkts. Pass comm->WarpSize / comm->ll128LineElems: the device
 // macros must not be used for host logic, they default to the gfx9 values there.
@@ -108,10 +104,7 @@ __global__ void ddaAllReduceFlatLL128(
   const int nwarps = nthreads / warpSize;
   const bool flagLane = ll128::isFlagLane(lane);
 
-  const int flatBlockId = blockIdx.x * gridDim.y + blockIdx.y;
-  const int total = gridDim.x * gridDim.y;
-  const uint32_t flag32 = ddaGetLLEpochInc(epochDev, flatBlockId, 1);
-  //const uint32_t flag32 = ddaGetLLEpochInc(epochDev, blockIdx.x, 1);
+  const uint32_t flag32 = ddaGetLLEpochInc(epochDev, blockIdx.x, 1);
   const uint64_t flag = ((uint64_t)flag32 << 32) | (uint64_t)flag32;
   const uint32_t bank = flag32 & 1u;
 
@@ -129,10 +122,6 @@ __global__ void ddaAllReduceFlatLL128(
   const uint64_t* gatherBase =
       reinterpret_cast<const uint64_t*>(peerScratch[selfRank]) + bankWords;
 
-  const int peersPerRow = (nRanks + (int)gridDim.y - 1) / (int)gridDim.y;
-  const int rStart = blockIdx.y * kDdaLLArPeersPerBlockRow;
-  const int rEnd = rStart + kDdaLLArPeersPerBlockRow;
-
   // Phase 1: pack each slice once, then push it to every peer's slot[selfRank].
   for (size_t s = gwarp; s < slicesTotal; s += wstride) {
     const size_t dataByte = s * (size_t)dataBytesPerSlice;
@@ -143,7 +132,7 @@ __global__ void ddaAllReduceFlatLL128(
     ll128::loadRegs<int8_t>(regs, srcBytes + dataByte, eltInSlice, lane, flagLane);
 
 #pragma unroll
-    for (int r = rStart; r < rEnd; ++r) {
+    for (int r = 1; r < nRanks; ++r) {
       const int peer = (selfRank + r) % nRanks;
       uint64_t* scatterSlot = reinterpret_cast<uint64_t*>(peerScratch[peer]) +
           bankWords + (uint64_t)selfRank * slotWords;
@@ -152,7 +141,6 @@ __global__ void ddaAllReduceFlatLL128(
     }
   }
 
-  //if (blockIdx.y == 0) {
   // Phase 2: poll every peer's slot for the same slices and fold them in.
   for (size_t s = gwarp; s < slicesTotal; s += wstride) {
     const size_t dataByte = s * (size_t)dataBytesPerSlice;
@@ -162,10 +150,9 @@ __global__ void ddaAllReduceFlatLL128(
 
     // Seed with our own payload; peers are folded on top.
     uint64_t acc[kWordsPerThread] = {};
-    //uint64_t val[kWordsPerThread][kDdaLLArPeersPerBlockRow];
     ll128::loadRegs<int8_t>(acc, srcBytes + dataByte, eltInSlice, lane, flagLane);
 
-    for (int r = rStart; r < rEnd; ++r) {
+    for (int r = 1; r < nRanks; ++r) {
       const int peer = (selfRank + r) % nRanks;
       const uint64_t* gatherSlot = gatherBase + (uint64_t)peer * slotWords;
       uint64_t vr[kWordsPerThread];
@@ -183,10 +170,8 @@ __global__ void ddaAllReduceFlatLL128(
 
     ll128::storeRegs<int8_t>(dstBytes + dataByte, acc, eltInSlice, lane, flagLane);
   }
-  //}
 
-  ddaSetLLEpoch(epochDev, epochLen, flatBlockId, total, flag);
-  //ddaSetLLEpoch(epochDev, epochLen, blockIdx.x, gridDim.x, flag32);
+  ddaSetLLEpoch(epochDev, epochLen, blockIdx.x, gridDim.x, flag32);
 }
 
 } // namespace dda::common

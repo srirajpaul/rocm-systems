@@ -49,7 +49,7 @@ constexpr int kLineSkip = 2 * kWarp / kLineElems;            // 4 or 16
 // (bad above it). 4 words halves the slice and the register arrays, and measured
 // 15-25% faster across 16KB-32MB. 2 is not valid: the flag-lane shuffle in
 // loadRegs/storeRegs needs at least two register pairs.
-constexpr int kWordsPerThread = 8;
+constexpr int kWordsPerThread = 4;
 constexpr int kPairs = kWordsPerThread / 2;                  // register pairs / thread
 
 // The last lane of each line's lane group owns that line's flag word: lanes

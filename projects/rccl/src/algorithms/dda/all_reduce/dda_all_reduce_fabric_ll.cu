@@ -45,7 +45,6 @@ using dda::common::kDdaLLArTwoShotSlotStridePkts;
 using dda::common::kDdaLL128ArSlotWords;
 using dda::common::kDdaLL128ArTwoShotSlotWords;
 using dda::common::kDdaLLMaxBytes;
-using dda::common::kDdaLLArPeersPerBlockRow;
 using dda::common::LLPacket16;
 
 using dda::common::ddaLL128ArDataBytesPerSlice;
@@ -88,26 +87,6 @@ static_assert(kDdaLL128ArTwoShotSlotWords == kDdaLL128ArSlotWords / 2,
 static_assert(kDdaLLArTwoShotSlotStridePkts == kDdaLLArSlotStridePkts / 2,
               "LL all-reduce tiers share one scratch and epoch; \
               keep LL-ts slot half of LL because the scratch is used in two phases");
-
-// Rows of blocks on the y axis: one row per group of kDdaLLArPeersPerBlockRow
-// ranks (8 ranks -> 2, 12 -> 3, 16 -> 4).
-static inline unsigned ddaLLArPeerRows(int nRanks) {
-  const int rows = (nRanks + kDdaLLArPeersPerBlockRow - 1) / kDdaLLArPeersPerBlockRow;
-  assert(rows > 0);
-  return (unsigned)rows;
-}
-
-// Largest x extent that keeps the whole grid inside the epoch array: the kernel
-// reads epochDev[flatBlockId] for every block, and flatBlockId spans
-// gridDim.x * gridDim.y. epochLen is always well above the row count
-// (ddaLLEpochCount() floors it at nRanks * kDdaLLAgMaxBlocksPerPeer), so this
-// only ever bites when RCCL_DDA_IPC_MAXBLOCKS is raised past epochLen / rows.
-static inline unsigned ddaLLArMaxBlocksForEpoch(int epochLen, unsigned rows) {
-  assert(rows > 0);
-  assert(epochLen >= (int)rows);
-  const int blocks = epochLen / (int)rows;
-  return (unsigned)(blocks < 1 ? 1 : blocks);
-}
 
 // Single source of the launch geometry: 1-D grid over 8-byte LL packets, capped
 // low (LL serves tiny messages where latency, not occupancy, dominates).
@@ -189,7 +168,7 @@ static ncclResult_t ncclAllReduceDdaFabricLL128OneShotTyped(const void* sendbuff
 
   // word is uint64_t (8 bytes)
   using word_type = uint64_t;
-  constexpr size_t kWordsPerThread = 8;
+  constexpr size_t kWordsPerThread = 4;
   constexpr size_t kBytesPerThread = kWordsPerThread * sizeof(word_type);
 
   // kLineWords is 16 for LL128, i.e. 16 uint64_t together form 128B
@@ -208,13 +187,8 @@ static ncclResult_t ncclAllReduceDdaFabricLL128OneShotTyped(const void* sendbuff
   if (blocks == 0) {
     blocks = 1;
   }
-  const unsigned rows = ddaLLArPeerRows(nRanks);
-  // ddaLLEpochCount() sizes the epoch array for a 1D grid of nBlocksMax, so the
-  // y axis can push flatBlockId (< gridDim.x * gridDim.y) past the last cell.
-  // Give up x blocks rather than read off the end.
-  blocks = std::min(blocks, ddaLLArMaxBlocksForEpoch(comm->ddaLLEpochLen, rows));
   dim3 block(threads);
-  dim3 grid(blocks, rows);
+  dim3 grid(blocks);
 
   const size_t slices = (nthreads + comm->WarpSize - 1) / comm->WarpSize;
 
@@ -236,11 +210,6 @@ static ncclResult_t ncclAllReduceDdaFabricLL128OneShotTyped(const void* sendbuff
     break;
   case 8:
     dda::common::ddaAllReduceFlatLL128<T, 8, kWordsPerThread><<<grid, block, 0, stream>>>(
-      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), bytes, comm->rank, nRanks, epochDev, epochLen,
-      slices, slotWords, wireWordPerSlice, dataBytesPerSlice);
-    break;
-  case 16:
-    dda::common::ddaAllReduceFlatLL128<T, 16, kWordsPerThread><<<grid, block, 0, stream>>>(
       peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), bytes, comm->rank, nRanks, epochDev, epochLen,
       slices, slotWords, wireWordPerSlice, dataBytesPerSlice);
     break;
@@ -327,7 +296,7 @@ static ncclResult_t ncclAllReduceDdaFabricLL128TwoShotTyped(const void* sendbuff
 
   // word is uint64_t (8 bytes)
   using word_type = uint64_t;
-  constexpr size_t kWordsPerThread = 8;
+  constexpr size_t kWordsPerThread = 4;
   constexpr size_t kBytesPerThread = kWordsPerThread * sizeof(word_type);
 
   // kLineWords is 16 for LL128, i.e. 16 uint64_t together form 128B
