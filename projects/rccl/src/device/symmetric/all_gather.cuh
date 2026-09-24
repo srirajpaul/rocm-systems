@@ -323,65 +323,50 @@ using ncclSymkGlobalPtr = T*;
 
 constexpr int ncclSymkGatherUnrollPeers = 8;
 
-// Copies pack i of each of the first nPeers src[] to dst[]. Dispatches down to NPeers == nPeers so the
-// copy loop has a compile-time peer count: runtime per-peer guards split it into one block per access,
-// which serializes the stores.
+// Copies nPacks packs starting `offset` bytes past each of the first nPeers src[] bases to the matching
+// dst[]. Dispatches down to NPeers == nPeers so the copy loop has a compile-time peer count: runtime
+// per-peer guards split it into one block per access, which serializes the stores.
 template <int NPeers, typename Pack>
 static __device__ __forceinline__ void gatherPeers(int nPeers,
-                                                   ncclSymkGlobalPtr<Pack> const (&src)[ncclSymkGatherUnrollPeers],
-                                                   ncclSymkGlobalPtr<Pack> const (&dst)[ncclSymkGatherUnrollPeers],
-                                                   int tn, int t, size_t nPacks) {
+                                                   ncclSymkGlobalPtr<char> const (&src)[ncclSymkGatherUnrollPeers],
+                                                   ncclSymkGlobalPtr<char> const (&dst)[ncclSymkGatherUnrollPeers],
+                                                   size_t offset, int tn, int t, size_t nPacks) {
   if NCCL_IF_CONSTEXPR (NPeers > 1) {
     if (nPeers < NPeers) {
-      gatherPeers<NPeers - 1, Pack>(nPeers, src, dst, tn, t, nPacks);
+      gatherPeers<NPeers - 1, Pack>(nPeers, src, dst, offset, tn, t, nPacks);
       return;
     }
+  }
+  ncclSymkGlobalPtr<Pack> srcPacks[NPeers];
+  ncclSymkGlobalPtr<Pack> dstPacks[NPeers];
+  NVCC_PRAGMA_UNROLL(NPeers)
+  for (int u = 0; u < NPeers; u++) {
+    srcPacks[u] = (ncclSymkGlobalPtr<Pack>)(src[u] + offset);
+    dstPacks[u] = (ncclSymkGlobalPtr<Pack>)(dst[u] + offset);
   }
   NVCC_PRAGMA_UNROLL_DISABLED
   for (size_t i = t; i < nPacks; i += tn) {
     Pack tmp[NPeers];
     NVCC_PRAGMA_UNROLL(NPeers)
-    for (int u = 0; u < NPeers; u++) tmp[u] = src[u][i];
+    for (int u = 0; u < NPeers; u++) tmp[u] = srcPacks[u][i];
     NVCC_PRAGMA_UNROLL(NPeers)
-    for (int u = 0; u < NPeers; u++) dst[u][i] = tmp[u];
+    for (int u = 0; u < NPeers; u++) dstPacks[u][i] = tmp[u];
   }
 }
 
 // Pull counterpart of bcast: load every peer's contribution out of its window and
 // store it into our own output, so all remote traffic is reads.
-// `output` addresses peer 0's slot; peer r's slot is `nAllPacks` further along.
-template <typename Pack>
-static __device__ void gatherPacks(int rank, int nRanks, bool inPlace, int tn, int t, ncclSymPtr<Pack> input,
-                                   ncclSymPtr<Pack> output, size_t nAllPacks, size_t nPacks) {
-  constexpr int UnrollPeers = ncclSymkGatherUnrollPeers;
-  Pack* outPacks = output.localPtr();
-  NVCC_PRAGMA_UNROLL_DISABLED
-  for (int dr = inPlace ? 1 : 0; dr < nRanks; dr += UnrollPeers) {
-    int nPeers = min(UnrollPeers, nRanks - dr);
-    ncclSymkGlobalPtr<Pack> src[UnrollPeers];
-    ncclSymkGlobalPtr<Pack> dst[UnrollPeers];
-    NVCC_PRAGMA_UNROLL(UnrollPeers)
-    for (int u = 0; u < UnrollPeers; u++) {
-      int r = rank + dr + (u < nPeers ? u : 0);
-      if (r >= nRanks) r -= nRanks;
-      // In-place send buffers sit at a different offset on every rank (their own slot),
-      // so an in-place peer's contribution has to be read out of its output window.
-      src[u] = (ncclSymkGlobalPtr<Pack>)(inPlace ? output + r * nAllPacks : input).lsaPtr(r);
-      dst[u] = (ncclSymkGlobalPtr<Pack>)(outPacks + r * nAllPacks);
-    }
-    gatherPeers<UnrollPeers, Pack>(nPeers, src, dst, tn, t, nPacks);
-  }
-}
-
+// `output` addresses peer 0's slot; peer r's slot is `nAllBytes` further along.
 static __device__ void gather(ncclSymkArgsHandler const& handler, int tn, int t, ncclSymPtr<char> input,
                               ncclSymPtr<char> output, size_t nBytes, size_t nAllBytes) {
 #if defined(__HIP_PLATFORM_AMD__)
   // A plain vector type: BytePack's copy/assignment only bind generic-address-space references,
-  // so it cannot be loaded or stored through the global pointers in gatherPacks.
+  // so it cannot be loaded or stored through the global pointers in gatherPeers.
   using Pack = v4u;
 #else
   using Pack = BytePack<ncclSymkBytePerPack>;
 #endif
+  constexpr int UnrollPeers = ncclSymkGatherUnrollPeers;
   int const& rank = handler.comm.rank;
   int const& nRanks = handler.comm.nRanks;
   bool inPlace = (input == output + rank * nAllBytes);
@@ -396,10 +381,27 @@ static __device__ void gather(ncclSymkArgsHandler const& handler, int tn, int t,
   }
   size_t cursor = nPreBytes + nPacks * sizeof(Pack);
 
-  gatherPacks<char>(rank, nRanks, inPlace, tn, t, input, output, nAllBytes, nPreBytes);
-  gatherPacks<Pack>(rank, nRanks, inPlace, tn, t, (ncclSymPtr<Pack>)(input + nPreBytes),
-                    (ncclSymPtr<Pack>)(output + nPreBytes), nAllBytes / sizeof(Pack), nPacks);
-  gatherPacks<char>(rank, nRanks, inPlace, tn, t, input + cursor, output + cursor, nAllBytes, nBytes - cursor);
+  char* out = output.localPtr();
+  NVCC_PRAGMA_UNROLL_DISABLED
+  for (int dr = inPlace ? 1 : 0; dr < nRanks; dr += UnrollPeers) {
+    int nPeers = min(UnrollPeers, nRanks - dr);
+    // Resolve every peer's base once, before the first store: window lookups placed after stores
+    // compile to a serialized vector load round trip per peer.
+    ncclSymkGlobalPtr<char> src[UnrollPeers];
+    ncclSymkGlobalPtr<char> dst[UnrollPeers];
+    NVCC_PRAGMA_UNROLL(UnrollPeers)
+    for (int u = 0; u < UnrollPeers; u++) {
+      int r = rank + dr + (u < nPeers ? u : 0);
+      if (r >= nRanks) r -= nRanks;
+      // In-place send buffers sit at a different offset on every rank (their own slot),
+      // so an in-place peer's contribution has to be read out of its output window.
+      src[u] = (ncclSymkGlobalPtr<char>)(inPlace ? output + r * nAllBytes : input).lsaPtr(r);
+      dst[u] = (ncclSymkGlobalPtr<char>)(out + r * nAllBytes);
+    }
+    gatherPeers<UnrollPeers, char>(nPeers, src, dst, 0, tn, t, nPreBytes);
+    gatherPeers<UnrollPeers, Pack>(nPeers, src, dst, nPreBytes, tn, t, nPacks);
+    gatherPeers<UnrollPeers, char>(nPeers, src, dst, cursor, tn, t, nBytes - cursor);
+  }
 }
 
 template <bool EnableProfiler>
@@ -412,8 +414,8 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_LD(ncclSymkDevWorkArgs con
 
   handler.forEachWork<char>([&] __device__(int block, int nBlocks, size_t nElts, size_t nAllElts,
                                            ncclSymPtr<char> input, ncclSymPtr<char> output) {
-    int t =
-      flattenIx(threadIdx.x % WARP_SIZE, WARP_SIZE, block, nBlocks, threadIdx.x / WARP_SIZE, blockDim.x / WARP_SIZE);
+    // Block-contiguous numbering: each block streams one contiguous blockDim.x-pack stretch per iteration.
+    int t = block * blockDim.x + threadIdx.x;
     int tn = nBlocks * blockDim.x;
     gather(handler, tn, t, input, output, nElts, nAllElts);
   });
