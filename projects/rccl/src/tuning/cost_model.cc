@@ -267,6 +267,7 @@ Enable order: Broadcast, Reduce, AllGather, ReduceScatter, AllReduce
   {nullptr, ncclTuningSymkModelSim, nullptr, {0, 0, 1, 0, 0}}, // AllGather_LLMC
   {nullptr, ncclTuningSymkModelSim, nullptr, {0, 0, 1, 0, 0}}, // AllGather_TmaST
   {nullptr, ncclTuningSymkModelSim, nullptr, {0, 0, 1, 0, 0}}, // AllGather_ST
+  {nullptr, ncclTuningSymkModelSim, nullptr, {0, 0, 1, 0, 0}}, // AllGather_LD
   {nullptr, ncclTuningSymkModelSim, nullptr, {0, 0, 1, 0, 0}}, // AllGather_TmaSTMC
   {nullptr, ncclTuningSymkModelSim, nullptr, {0, 0, 1, 0, 0}}, // AllGather_STMC
   {nullptr, ncclTuningSymkModelSim, nullptr, {0, 0, 1, 0, 0}}, // AllGather_RailRing_LsaSTMC

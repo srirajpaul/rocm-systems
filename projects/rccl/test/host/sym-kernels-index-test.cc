@@ -121,6 +121,8 @@ const std::vector<ExpectedKernelCase>& ValidCases() {
        (void*)ncclSymkDevKernel_AllGather_LL_profile},
       {"AllGather_ST", ncclSymkKernelId_AllGather_ST, ncclDevSum, ncclFloat32, (void*)ncclSymkDevKernel_AllGather_ST,
        (void*)ncclSymkDevKernel_AllGather_ST_profile},
+      {"AllGather_LD", ncclSymkKernelId_AllGather_LD, ncclDevSum, ncclFloat32, (void*)ncclSymkDevKernel_AllGather_LD,
+       (void*)ncclSymkDevKernel_AllGather_LD_profile},
 
       {"AllReduce_AGxLL_R_sum_f32", ncclSymkKernelId_AllReduce_AGxLL_R, ncclDevSum, ncclFloat32,
        (void*)ncclSymkDevKernel_AllReduce_AGxLL_R_sum_f32, (void*)ncclSymkDevKernel_AllReduce_AGxLL_R_sum_f32_profile},
@@ -269,6 +271,12 @@ TEST(SymKernelIndexNonReductionTest, AllGatherST_IgnoresRedAndType_ReturnsAllGat
   int index = ncclSymkGetKernelIndex(ncclSymkKernelId_AllGather_ST, 12345, (ncclDataType_t)9999);
   ASSERT_GE(index, 0);
   EXPECT_EQ(ncclSymkKernelList[index], (void*)ncclSymkDevKernel_AllGather_ST);
+}
+
+TEST(SymKernelIndexNonReductionTest, AllGatherLD_IgnoresRedAndType_ReturnsAllGatherLDKernel) {
+  int index = ncclSymkGetKernelIndex(ncclSymkKernelId_AllGather_LD, 12345, (ncclDataType_t)9999);
+  ASSERT_GE(index, 0);
+  EXPECT_EQ(ncclSymkKernelList[index], (void*)ncclSymkDevKernel_AllGather_LD);
 }
 
 struct InvalidKernelCase {

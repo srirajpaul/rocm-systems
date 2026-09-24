@@ -78,6 +78,8 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_LLMC(struct ncclSymkDevWor
 template <bool EnableProfiler>
 __device__ __forceinline__ void ncclSymkRun_AllGather_ST(struct ncclSymkDevWorkArgs const* args);
 template <bool EnableProfiler>
+__device__ __forceinline__ void ncclSymkRun_AllGather_LD(struct ncclSymkDevWorkArgs const* args);
+template <bool EnableProfiler>
 __device__ __forceinline__ void ncclSymkRun_AllGather_STMC(struct ncclSymkDevWorkArgs const* args);
 template <bool EnableProfiler>
 __device__ __forceinline__ void ncclSymkRun_AllGather_TmaST(struct ncclSymkDevWorkArgs const* args);

@@ -312,6 +312,213 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_TmaSTMC(ncclSymkDevWorkArg
   ncclSymkRun_AllGather_STMC_impl<EnableProfiler, /*EnableTma=*/true>(args);
 }
 
+#if defined(__HIP_PLATFORM_AMD__)
+// Global-aperture pointer, so accesses compile to global_* rather than flat_* instructions.
+template <typename T>
+using ncclSymkGlobalPtr = __attribute__((address_space(1))) T*;
+#else
+template <typename T>
+using ncclSymkGlobalPtr = T*;
+#endif
+
+constexpr int ncclSymkGatherUnrollPeers = 8;
+
+// Copies pack i of each of the first nPeers src[] to dst[]. Dispatches down to NPeers == nPeers so the
+// copy loop has a compile-time peer count: runtime per-peer guards split it into one block per access,
+// which serializes the stores.
+template <int NPeers, typename Pack>
+static __device__ __forceinline__ void gatherPeers(int nPeers,
+                                                   ncclSymkGlobalPtr<Pack> const (&src)[ncclSymkGatherUnrollPeers],
+                                                   ncclSymkGlobalPtr<Pack> const (&dst)[ncclSymkGatherUnrollPeers],
+                                                   int tn, int t, size_t nPacks) {
+  if NCCL_IF_CONSTEXPR (NPeers > 1) {
+    if (nPeers < NPeers) {
+      gatherPeers<NPeers - 1, Pack>(nPeers, src, dst, tn, t, nPacks);
+      return;
+    }
+  }
+  NVCC_PRAGMA_UNROLL_DISABLED
+  for (size_t i = t; i < nPacks; i += tn) {
+    Pack tmp[NPeers];
+    NVCC_PRAGMA_UNROLL(NPeers)
+    for (int u = 0; u < NPeers; u++) tmp[u] = src[u][i];
+    NVCC_PRAGMA_UNROLL(NPeers)
+    for (int u = 0; u < NPeers; u++) dst[u][i] = tmp[u];
+  }
+}
+
+// Pull counterpart of bcast: load every peer's contribution out of its window and
+// store it into our own output, so all remote traffic is reads.
+// `output` addresses peer 0's slot; peer r's slot is `nAllPacks` further along.
+template <typename Pack>
+static __device__ void gatherPacks(int rank, int nRanks, bool inPlace, int tn, int t, ncclSymPtr<Pack> input,
+                                   ncclSymPtr<Pack> output, size_t nAllPacks, size_t nPacks) {
+  constexpr int UnrollPeers = ncclSymkGatherUnrollPeers;
+  Pack* outPacks = output.localPtr();
+  NVCC_PRAGMA_UNROLL_DISABLED
+  for (int dr = inPlace ? 1 : 0; dr < nRanks; dr += UnrollPeers) {
+    int nPeers = min(UnrollPeers, nRanks - dr);
+    ncclSymkGlobalPtr<Pack> src[UnrollPeers];
+    ncclSymkGlobalPtr<Pack> dst[UnrollPeers];
+    NVCC_PRAGMA_UNROLL(UnrollPeers)
+    for (int u = 0; u < UnrollPeers; u++) {
+      int r = rank + dr + (u < nPeers ? u : 0);
+      if (r >= nRanks) r -= nRanks;
+      // In-place send buffers sit at a different offset on every rank (their own slot),
+      // so an in-place peer's contribution has to be read out of its output window.
+      src[u] = (ncclSymkGlobalPtr<Pack>)(inPlace ? output + r * nAllPacks : input).lsaPtr(r);
+      dst[u] = (ncclSymkGlobalPtr<Pack>)(outPacks + r * nAllPacks);
+    }
+    gatherPeers<UnrollPeers, Pack>(nPeers, src, dst, tn, t, nPacks);
+  }
+}
+
+static __device__ void gather(ncclSymkArgsHandler const& handler, int tn, int t, ncclSymPtr<char> input,
+                              ncclSymPtr<char> output, size_t nBytes, size_t nAllBytes) {
+#if defined(__HIP_PLATFORM_AMD__)
+  // A plain vector type: BytePack's copy/assignment only bind generic-address-space references,
+  // so it cannot be loaded or stored through the global pointers in gatherPacks.
+  using Pack = v4u;
+#else
+  using Pack = BytePack<ncclSymkBytePerPack>;
+#endif
+  int const& rank = handler.comm.rank;
+  int const& nRanks = handler.comm.nRanks;
+  bool inPlace = (input == output + rank * nAllBytes);
+
+  // Loads land at the same offset on every peer while stores land r*nAllBytes apart,
+  // so the per-rank stride has to be packed too for one alignment test to cover all peers.
+  uint32_t alignment = uint32_t(input.offset - output.offset);
+  size_t nPreBytes = 0, nPacks = 0;
+  if (alignment % sizeof(Pack) == 0 && nAllBytes % sizeof(Pack) == 0) {
+    nPreBytes = min((size_t)((sizeof(Pack) - input.offset) % sizeof(Pack)), nBytes);
+    nPacks = (nBytes - nPreBytes) / sizeof(Pack);
+  }
+  size_t cursor = nPreBytes + nPacks * sizeof(Pack);
+
+  gatherPacks<char>(rank, nRanks, inPlace, tn, t, input, output, nAllBytes, nPreBytes);
+  gatherPacks<Pack>(rank, nRanks, inPlace, tn, t, (ncclSymPtr<Pack>)(input + nPreBytes),
+                    (ncclSymPtr<Pack>)(output + nPreBytes), nAllBytes / sizeof(Pack), nPacks);
+  gatherPacks<char>(rank, nRanks, inPlace, tn, t, input + cursor, output + cursor, nAllBytes, nBytes - cursor);
+}
+
+template <bool EnableProfiler>
+__device__ __forceinline__ void ncclSymkRun_AllGather_LD(ncclSymkDevWorkArgs const* args) {
+  ncclSymkArgsHandler handler{args};
+  ncclLsaBarrierSession<ncclCoopCta> bar{ncclCoopCta(), handler.comm, ncclTeamTagLsa(), blockIdx.x};
+
+  bar.sync(ncclCoopCta(), cuda::memory_order_acquire);
+  if NCCL_IF_CONSTEXPR (EnableProfiler) ncclSymkProfilerPhase(args, NCCL_KERNEL_PHASE_AFTER_OPEN);
+
+  handler.forEachWork<char>([&] __device__(int block, int nBlocks, size_t nElts, size_t nAllElts,
+                                           ncclSymPtr<char> input, ncclSymPtr<char> output) {
+    int t =
+      flattenIx(threadIdx.x % WARP_SIZE, WARP_SIZE, block, nBlocks, threadIdx.x / WARP_SIZE, blockDim.x / WARP_SIZE);
+    int tn = nBlocks * blockDim.x;
+    gather(handler, tn, t, input, output, nElts, nAllElts);
+  });
+
+  if NCCL_IF_CONSTEXPR (EnableProfiler) ncclSymkProfilerPhase(args, NCCL_KERNEL_PHASE_BEFORE_CLOSE);
+  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+}
+
+#if 0
+// symmetric-memory DDA all-gather kernel (IPC path)
+template <typename T, int NRANKS, int inplace>
+__device__ void gather_symm_dda(
+    T* __restrict__ (&recvPtr)[NRANKS],
+    size_t count,
+    T* __restrict__ (&sendPtr)[NRANKS],
+    int selfRank) {
+  // use uint4 to do 16-byte loads to maximize memory efficiency
+  // We assume that count % countPerThread == 0. This assumption is enforced
+  // before kernel launch.
+  static_assert(sizeof(T) == 1);
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
+
+  const auto idxStart = gtIdx * countPerThread;
+  const auto idxEnd = count;
+  const auto idxStride = gridDim.x * blockDim.x * countPerThread;
+
+  T* __restrict__ (&sendPtr_use)[NRANKS] = inplace ? recvPtr : sendPtr;
+
+  #if 1
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    v4u tmp[NRANKS];
+    #pragma unroll NRANKS
+    for (int r = inplace; r < NRANKS; ++r) {
+      int peer = (selfRank + r) % NRANKS;
+      size_t srcIdx = inplace * count * peer + idx;
+      tmp[r] = *(v4u_gptr)(&sendPtr_use[peer][srcIdx]);
+    }
+    #pragma unroll NRANKS
+    for (int r = inplace; r < NRANKS; ++r) {
+      int peer = (selfRank + r) % NRANKS;
+      size_t dstIdx = peer * count + idx;
+      *(v4u_gptr)(&recvPtr[selfRank][dstIdx]) = tmp[r];
+    }
+  }
+  #else
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    #pragma unroll NRANKS
+    for (int r = inplace; r < NRANKS; ++r) {
+        int peer = (selfRank + r) % NRANKS;
+        size_t dstIdx = peer * count + idx;
+        size_t srcIdx = inplace * count * peer + idx;
+        *(v4u_gptr)(&recvPtr[selfRank][dstIdx]) = *(v4u_gptr)(&sendPtr_use[peer][srcIdx]);
+    }
+  }
+  #endif
+}
+
+template <bool EnableProfiler>
+__device__ __forceinline__ void ncclSymkRun_AllGather_LD(ncclSymkDevWorkArgs const* args) {
+  ncclSymkArgsHandler handler{args};
+  ncclLsaBarrierSession<ncclCoopCta> bar{ncclCoopCta(), handler.comm, ncclTeamTagLsa(), blockIdx.x};
+
+  bar.sync(ncclCoopCta(), cuda::memory_order_acquire);
+  if NCCL_IF_CONSTEXPR (EnableProfiler) ncclSymkProfilerPhase(args, NCCL_KERNEL_PHASE_AFTER_OPEN);
+
+  bool waitNeeded = true;
+  handler.forEachWork<char>([&] __device__(int block, int nBlocks, size_t nElts, size_t nAllElts,
+                                           ncclSymPtr<char> input, ncclSymPtr<char> output) {
+        // Threads numbered over rank.
+    int bt =
+      flattenIx(threadIdx.x % WARP_SIZE, WARP_SIZE, block, nBlocks, threadIdx.x / WARP_SIZE, blockDim.x / WARP_SIZE);
+    int btn = nBlocks * blockDim.x;
+
+    int const& rank = handler.comm.rank;
+    int const& nRanks = handler.comm.nRanks;
+    const size_t count = nElts;
+    const int inplace = input == output + count * rank;
+
+    constexpr int NR = 8;
+    char* __restrict__ recvPtr[NR];
+    char* __restrict__ sendPtr[NR];
+
+    #pragma unroll
+    for (int i = 0; i < nRanks; i++) {
+        recvPtr[i] = output.lsaPtr(i);
+        sendPtr[i] = input.lsaPtr(i);
+    }
+
+    assert(nRanks == 8);
+    if (inplace) {
+      gather_symm_dda<char, NR, 1>(recvPtr, count, sendPtr, rank);
+    }
+    else {
+      gather_symm_dda<char, NR, 0>(recvPtr, count, sendPtr, rank);
+    }
+
+    //gather<char>(handler, btn, bt, nBlocks, waitNeeded, bar, input, output, nElts, nAllElts);
+  });
+
+  if NCCL_IF_CONSTEXPR (EnableProfiler) ncclSymkProfilerPhase(args, NCCL_KERNEL_PHASE_BEFORE_CLOSE);
+  bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
+}
+#endif
+
 template <bool EnableProfiler, typename EltType>
 static __device__ void allgather_LL_body(ncclSymkDevWorkArgs const* args, ncclSymkArgsHandler& handler,
                                          ncclLLA2ASession<ncclCoopCta>& lla2a, EltType* input, EltType* output,

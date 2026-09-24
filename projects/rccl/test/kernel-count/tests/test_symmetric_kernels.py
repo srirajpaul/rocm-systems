@@ -36,9 +36,9 @@ GENERATE_PY = RCCL_ROOT / "src" / "device" / "symmetric" / "generate.py"
 # If a change moves these numbers, update them here AND explain in the PR
 # description WHY. Do not blind-update.
 # ---------------------------------------------------------------------------
-EXPECTED_TOTAL = 42
+EXPECTED_TOTAL = 43
 EXPECTED_PER_COLL = {
-    "AllGather": 2,
+    "AllGather": 3,
     "AllReduce": 10,
     "ReduceScatter": 30,
 }
