@@ -323,6 +323,7 @@ using ncclSymkGlobalPtr = T*;
 
 constexpr int ncclSymkGatherUnrollPeers = 8;
 
+#if 0
 // Copies nPacks packs starting `offset` bytes past each of the first nPeers src[] bases to the matching
 // dst[]. Dispatches down to NPeers == nPeers so the copy loop has a compile-time peer count: runtime
 // per-peer guards split it into one block per access, which serializes the stores.
@@ -420,7 +421,7 @@ __device__ __forceinline__ void ncclSymkRun_AllGather_LD(ncclSymkDevWorkArgs con
   bar.sync(ncclCoopCta(), cuda::memory_order_relaxed);
 }
 
-#if 0
+#else
 // symmetric-memory DDA all-gather kernel (IPC path)
 template <typename T, int NRANKS, int inplace>
 __device__ void gather_symm_dda(
