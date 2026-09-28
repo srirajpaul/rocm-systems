@@ -1160,6 +1160,14 @@ if(GENERATE_SYM_KERNELS)
       set(_this_bc_flag "${_sym_rocshmem_bc_flag}")
       set(_this_bc_deps "${_sym_rocshmem_deps}")
     endif()
+    # The instantiation file only includes the kernel bodies (symmetric/*.h), so without a DEPFILE an edit
+    # to a kernel header does not rebuild this object (same issue as collectives.o above).
+    set(_sym_dep_flags "")
+    set(_sym_depfile_args "")
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.20")
+      set(_sym_dep_flags -MD -MF ${_sym_obj}.d)
+      set(_sym_depfile_args DEPFILE ${_sym_obj}.d)
+    endif()
     add_custom_command(
       OUTPUT  ${_sym_obj}
       COMMAND ${DL_CLANG}
@@ -1173,9 +1181,11 @@ if(GENERATE_SYM_KERNELS)
         -std=c++17
         -fPIC
         ${_this_bc_flag}
+        ${_sym_dep_flags}
         -c -o ${_sym_obj}
         ${_sym_src}
       DEPENDS ${_sym_src} ${_this_bc_deps}
+      ${_sym_depfile_args}
       COMMENT "DL compile: sym ${_sym_name} (multi-arch fat object)"
       VERBATIM
     )

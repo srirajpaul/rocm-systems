@@ -337,20 +337,16 @@ static __device__ __forceinline__ void gatherPeers(int nPeers,
       return;
     }
   }
-  ncclSymkGlobalPtr<Pack> srcPacks[NPeers];
-  ncclSymkGlobalPtr<Pack> dstPacks[NPeers];
-  NVCC_PRAGMA_UNROLL(NPeers)
-  for (int u = 0; u < NPeers; u++) {
-    srcPacks[u] = (ncclSymkGlobalPtr<Pack>)(src[u] + offset);
-    dstPacks[u] = (ncclSymkGlobalPtr<Pack>)(dst[u] + offset);
-  }
+  // One per-thread byte cursor added to fixed bases; indexing each peer's pointer instead lets the compiler
+  // step every peer base separately, roughly doubling the instructions per iteration.
+  size_t end = offset + nPacks * sizeof(Pack);
   NVCC_PRAGMA_UNROLL_DISABLED
-  for (size_t i = t; i < nPacks; i += tn) {
+  for (size_t cur = offset + size_t(t) * sizeof(Pack); cur < end; cur += size_t(tn) * sizeof(Pack)) {
     Pack tmp[NPeers];
     NVCC_PRAGMA_UNROLL(NPeers)
-    for (int u = 0; u < NPeers; u++) tmp[u] = srcPacks[u][i];
+    for (int u = 0; u < NPeers; u++) tmp[u] = *(ncclSymkGlobalPtr<Pack>)(src[u] + cur);
     NVCC_PRAGMA_UNROLL(NPeers)
-    for (int u = 0; u < NPeers; u++) dstPacks[u][i] = tmp[u];
+    for (int u = 0; u < NPeers; u++) *(ncclSymkGlobalPtr<Pack>)(dst[u] + cur) = tmp[u];
   }
 }
 
