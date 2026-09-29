@@ -441,6 +441,7 @@ INSTANTIATE_TEST_SUITE_P(SymHasLDMCPostDivCases, SymKernelHasLDMCPostDivTest,
 TEST_F(SymKernelMaskTest, AllGather_AGKernelSurvives) {
   uint32_t kmask = ncclSymkMask(comm_.get(), ncclFuncAllGather, ncclDevSum, kTy, /*nElts=*/1024);
   EXPECT_TRUE(KernelBitSet(kmask, ncclSymkKernelId_AllGather_ST));
+  EXPECT_TRUE(KernelBitSet(kmask, ncclSymkKernelId_AllGather_LD));
 }
 
 TEST_F(SymKernelMaskTest, UnsupportedCollective_EntireMaskZeroed) {
