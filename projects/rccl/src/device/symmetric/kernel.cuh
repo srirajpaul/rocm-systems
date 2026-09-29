@@ -100,4 +100,6 @@ __device__ __forceinline__ void ncclSymkRun_ReduceScatter_RailA2A_LsaLDMC(struct
 
 template <bool EnableProfiler>
 __device__ __forceinline__ void ncclSymkRun_AllGather_RailRing_LsaSTMC(struct ncclSymkDevWorkArgs const* args);
+template <bool EnableProfiler>
+__device__ __forceinline__ void ncclSymkRun_AllGather_LD(struct ncclSymkDevWorkArgs const* args);
 #endif
