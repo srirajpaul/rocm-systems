@@ -333,6 +333,10 @@ static void queryModel_lsa(struct ncclTuningInput_t* input, ncclSymkKernelId k, 
   case ncclSymkKernelId_AllGather_ST:
     busBytes = (nRanks - 1) * nBytes;
     break;
+  case ncclSymkKernelId_AllGather_LD:
+    busBytes = (nRanks - 1) * nBytes;
+    busMultiplier = 0.99; // Same traffic as ST (as loads); lose ties to ST until LD is tuned.
+    break;
   case ncclSymkKernelId_AllGather_TmaSTMC:
     busMultiplier = 0.99;
     // fall through
@@ -503,6 +507,9 @@ ncclResult_t ncclTuningSymkModelSim(struct ncclTuningInput_t* const inputs, stru
           (tuning_kmask & ncclSymkLLKernelMask()) == 0) ||
       (inputs->func == ncclFuncAllGather && inputs->winRegType != ncclSymSendRegRecvReg &&
        inputs->winRegType != ncclSymSendNonregRecvReg && (tuning_kmask & ncclSymkLLKernelMask()) == 0) ||
+      // Pull kernels load from the peers' send windows, so the send buffer must be registered.
+      (inputs->func == ncclFuncAllGather && inputs->winRegType == ncclSymSendNonregRecvReg &&
+       (tuning_kmask & ncclSymkAGPullKernelMask()) != 0) ||
       (inputs->func == ncclFuncReduceScatter && inputs->winRegType != ncclSymSendRegRecvReg &&
        inputs->winRegType != ncclSymSendRegRecvNonreg && (tuning_kmask & ncclSymkLLKernelMask()) == 0) ||
       (inputs->func == ncclFuncAllGather && inputs->winRegType != ncclSymSendRegRecvReg && inputs->comm->nNodes > 1 &&

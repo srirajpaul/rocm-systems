@@ -57,6 +57,7 @@ enum ncclSymkKernelId {
   ncclSymkKernelId_AllGather_TmaSTMC,
   ncclSymkKernelId_AllGather_STMC,
   ncclSymkKernelId_AllGather_RailRing_LsaSTMC,
+  ncclSymkKernelId_AllGather_LD,
 
   ncclSymkKernelId_ReduceScatter_LL,
   ncclSymkKernelId_ReduceScatter_TmaLD,
@@ -82,6 +83,7 @@ constexpr char const* ncclSymKernelStr[] = {
   "AllGather_TmaSTMC",
   "AllGather_STMC",
   "AllGather_RailRing_LsaSTMC",
+  "AllGather_LD",
   "ReduceScatter_LL",
   "ReduceScatter_TmaLD",
   "ReduceScatter_LD",
@@ -217,6 +219,7 @@ int ncclSymkTmaKernelMask();
 int ncclSymkGinKernelMask();
 int ncclSymkLsaKernelMask();
 int ncclSymkAGKernelMask();
+int ncclSymkAGPullKernelMask();
 int ncclSymkARKernelMask();
 int ncclSymkRSKernelMask();
 size_t ncclSymkRsGinChunkBytes();

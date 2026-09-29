@@ -35,7 +35,11 @@ constexpr uint32_t kernelMask_LL = 1 << ncclSymkKernelId_AllReduce_AGxLL_R | 1 <
 constexpr uint32_t kernelMask_AG = 1 << ncclSymkKernelId_AllGather_LL | 1 << ncclSymkKernelId_AllGather_LLMC |
                                    1 << ncclSymkKernelId_AllGather_ST | 1 << ncclSymkKernelId_AllGather_STMC |
                                    1 << ncclSymkKernelId_AllGather_TmaST | 1 << ncclSymkKernelId_AllGather_TmaSTMC |
-                                   1 << ncclSymkKernelId_AllGather_RailRing_LsaSTMC;
+                                   1 << ncclSymkKernelId_AllGather_RailRing_LsaSTMC |
+                                   1 << ncclSymkKernelId_AllGather_LD;
+
+// AllGather kernels that load from the peers' send windows instead of storing into their recv windows.
+constexpr uint32_t kernelMask_AG_Pull = 1 << ncclSymkKernelId_AllGather_LD;
 
 constexpr uint32_t kernelMask_AR = 1 << ncclSymkKernelId_AllReduce_AGxLLMC_R | 1 << ncclSymkKernelId_AllReduce_AGxLL_R |
                                    1 << ncclSymkKernelId_AllReduce_RSxLDMC_AGxSTMC |
@@ -53,6 +57,7 @@ constexpr uint32_t kernelMask_LSA =
   1 << ncclSymkKernelId_AllReduce_RSxTmaLD_AGxTmaST | 1 << ncclSymkKernelId_AllGather_LL |
   1 << ncclSymkKernelId_AllGather_LLMC | 1 << ncclSymkKernelId_AllGather_ST | 1 << ncclSymkKernelId_AllGather_STMC |
   1 << ncclSymkKernelId_AllGather_TmaST | 1 << ncclSymkKernelId_AllGather_TmaSTMC |
+  1 << ncclSymkKernelId_AllGather_LD |
   1 << ncclSymkKernelId_ReduceScatter_LL | 1 << ncclSymkKernelId_ReduceScatter_LD |
   1 << ncclSymkKernelId_ReduceScatter_LDMC | 1 << ncclSymkKernelId_ReduceScatter_TmaLD;
 
@@ -86,6 +91,10 @@ int ncclSymkLsaKernelMask() {
 
 int ncclSymkAGKernelMask() {
   return kernelMask_AG;
+}
+
+int ncclSymkAGPullKernelMask() {
+  return kernelMask_AG_Pull;
 }
 
 int ncclSymkARKernelMask() {
