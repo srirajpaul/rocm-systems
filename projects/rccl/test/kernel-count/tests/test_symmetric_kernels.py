@@ -62,9 +62,9 @@ EXPECTED_DIMS = {
 # arch from one that only asks whether any target was given.
 GPU_TARGETS_WITHOUT_TDM = "gfx942;gfx950"
 GPU_TARGETS_WITH_TDM = "gfx942;gfx1250"
-EXPECTED_TDM_TOTAL = 58
+EXPECTED_TDM_TOTAL = 59
 EXPECTED_TDM_PER_COLL = {
-    "AllGather": 3,
+    "AllGather": 4,
     "AllReduce": 15,
     "ReduceScatter": 40,
 }

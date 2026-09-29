@@ -323,7 +323,7 @@ using ncclSymkGlobalPtr = T*;
 
 constexpr int ncclSymkGatherUnrollPeers = 8;
 
-#if 0
+#if 1
 // Copies nPacks packs starting `offset` bytes past each of the first nPeers src[] bases to the matching
 // dst[]. Dispatches down to NPeers == nPeers so the copy loop has a compile-time peer count: runtime
 // per-peer guards split it into one block per access, which serializes the stores.
