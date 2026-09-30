@@ -57,4 +57,34 @@ __launch_bounds__(512)
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
 }
 
+template <typename T, int NRANKS_CT>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+  __global__ void ddaAllToAllFabricPush(T* const* __restrict__ ipcbuffs, size_t count, const T* __restrict__ sendbuff,
+                                        int selfRank, int nRanks, FabricGpuBarrier barrier) {
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+  const int nRanksEff = (NRANKS_CT > 0) ? NRANKS_CT : nRanks;
+  constexpr int kUnroll = (NRANKS_CT > 0) ? NRANKS_CT : 8;
+  const size_t countPerRank = count;
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
+
+  const auto idxStart = gtIdx * countPerThread;
+  const auto idxEnd = countPerRank;
+  const auto idxStride = gridDim.x * blockDim.x * countPerThread;
+
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+#pragma unroll kUnroll
+    for (int r = 0; r < nRanksEff; ++r) {
+      size_t srcIdx = idx + r * idxEnd;
+      size_t destIdx = idx + selfRank * idxEnd;
+      *reinterpret_cast<uint4*>(&ipcbuffs[r][destIdx]) = reinterpret_cast<const uint4*>(&sendbuff[srcIdx])[0];
+    }
+  }
+
+  // Release our remote writes and acquire every peer's writes into our scratch.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+}
+
 } // namespace dda::common

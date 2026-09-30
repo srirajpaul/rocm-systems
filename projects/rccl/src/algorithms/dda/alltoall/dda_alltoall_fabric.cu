@@ -29,6 +29,8 @@
 RCCL_PARAM(DdaA2ATdm, "DDA_A2A_TDM", 0);
 // TDM tile size in KiB: 8 (x2 peers per warp, default), 16 (x1) or 4 (x4). Other values use 8.
 RCCL_PARAM(DdaA2ATdmTileKB, "DDA_A2A_TDM_TILE_KB", 8);
+// Push model: each rank writes its chunks into peers' scratch instead of reading from them. Env: RCCL_DDA_A2A_PUSH.
+RCCL_PARAM(DdaA2APush, "DDA_A2A_PUSH", 0);
 
 namespace {
 
@@ -145,6 +147,34 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
   void* peerPtrsDev = comm->ddaPeerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
 
+  if (rcclParamDdaA2APush()) {
+    auto gridBlock = ddaAllToAllFabricGeom(comm, count);
+    const auto& grid = gridBlock.first;
+    const auto& block = gridBlock.second;
+
+    INFO(NCCL_COLL, "DDA fabric AllToAll: launching push kernel: nRanks=%d count=%zu grid=%u block=%u%s", nRanks,
+         count, grid.x, block.x, (nRanks == 4 || nRanks == 8) ? " (unrolled)" : " (runtime)");
+
+    switch (nRanks) {
+    case 4:
+      dda::common::ddaAllToAllFabricPush<T, 4><<<grid, block, 0, stream>>>(
+        d_ipcbuffs, count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+      break;
+    case 8:
+      dda::common::ddaAllToAllFabricPush<T, 8><<<grid, block, 0, stream>>>(
+        d_ipcbuffs, count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+      break;
+    default:
+      dda::common::ddaAllToAllFabricPush<T, 0><<<grid, block, 0, stream>>>(
+        d_ipcbuffs, count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+      break;
+    }
+    CUDACHECK(cudaGetLastError());
+
+    CUDACHECK(cudaMemcpyAsync(recvbuff, comm->ddaScratch, totalBytes, cudaMemcpyDeviceToDevice, stream));
+    return ncclSuccess;
+  }
+
   // Stage sendbuff into this rank's scratch before the peer exchange. A single
   // host-launched cudaMemcpyAsync avoids the per-block in-kernel copy race on
   // the fabric path.
@@ -241,7 +271,7 @@ bool ncclAllToAllDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* r
 
 uint32_t ncclAllToAllDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_t datatype) {
   const size_t bytes = count * ncclTypeSize(datatype);
-  const auto grid = ddaAllToAllFabricTdmEligible(comm, bytes) ?
+  const auto grid = !rcclParamDdaA2APush() && ddaAllToAllFabricTdmEligible(comm, bytes) ?
                       ddaAllToAllFabricTdmGeom(comm, bytes, ddaAllToAllFabricTdmTileBytes()).first :
                       ddaAllToAllFabricGeom(comm, bytes).first;
   return grid.x * grid.y;
