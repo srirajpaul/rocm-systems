@@ -60,9 +60,11 @@ __launch_bounds__(512)
   barrier.endEpoch(flag + 2);
 }
 
+constexpr int kDdaA2APushThreadsPerBlock = 1024;
+
 template <typename T, int NRANKS_CT>
 #if defined(USE_ROCM)
-__launch_bounds__(512)
+__launch_bounds__(kDdaA2APushThreadsPerBlock)
 #endif
   __global__ void ddaAllToAllFabricPush(T* const* __restrict__ ipcbuffs, size_t count, const T* __restrict__ sendbuff,
                                         int selfRank, int nRanks, FabricGpuBarrier barrier) {

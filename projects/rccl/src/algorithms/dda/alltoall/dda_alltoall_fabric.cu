@@ -45,6 +45,18 @@ static inline std::pair<dim3, dim3> ddaAllToAllFabricGeom(ncclComm* comm, size_t
   return dda::common::getGridAndBlockDims(bytes, 1, comm->ddaFabricMaxBlocks);
 }
 
+// Push kernel: one 16 B vector per thread per peer, up to kDdaA2APushThreadsPerBlock threads.
+// Depends only on count, so every rank launches the same grid.
+static inline std::pair<dim3, dim3> ddaAllToAllFabricPushGeom(ncclComm* comm, size_t bytes) {
+  const size_t vecs = dda::common::divRoundUp(bytes, sizeof(uint4));
+  const uint32_t blocks =
+    dda::common::calcBlockCount(vecs, dda::common::kDdaA2APushThreadsPerBlock, comm->ddaFabricMaxBlocks);
+  const size_t warps = dda::common::divRoundUp(dda::common::divRoundUp(vecs, blocks), comm->WarpSize);
+  const uint32_t threads =
+    std::min<uint32_t>(dda::common::kDdaA2APushThreadsPerBlock, static_cast<uint32_t>(warps * comm->WarpSize));
+  return std::make_pair(dim3(blocks, 1, 1), dim3(threads, 1, 1));
+}
+
 static inline int ddaAllToAllFabricTdmTileBytes() {
   switch (rcclParamDdaA2ATdmTileKB()) {
   case 4:
@@ -148,7 +160,7 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
 
   if (rcclParamDdaA2APush()) {
-    auto gridBlock = ddaAllToAllFabricGeom(comm, count);
+    auto gridBlock = ddaAllToAllFabricPushGeom(comm, count);
     const auto& grid = gridBlock.first;
     const auto& block = gridBlock.second;
 
@@ -271,9 +283,14 @@ bool ncclAllToAllDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* r
 
 uint32_t ncclAllToAllDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_t datatype) {
   const size_t bytes = count * ncclTypeSize(datatype);
-  const auto grid = !rcclParamDdaA2APush() && ddaAllToAllFabricTdmEligible(comm, bytes) ?
-                      ddaAllToAllFabricTdmGeom(comm, bytes, ddaAllToAllFabricTdmTileBytes()).first :
-                      ddaAllToAllFabricGeom(comm, bytes).first;
+  dim3 grid;
+  if (rcclParamDdaA2APush()) {
+    grid = ddaAllToAllFabricPushGeom(comm, bytes).first;
+  } else if (ddaAllToAllFabricTdmEligible(comm, bytes)) {
+    grid = ddaAllToAllFabricTdmGeom(comm, bytes, ddaAllToAllFabricTdmTileBytes()).first;
+  } else {
+    grid = ddaAllToAllFabricGeom(comm, bytes).first;
+  }
   return grid.x * grid.y;
 }
 
