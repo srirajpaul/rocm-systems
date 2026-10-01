@@ -26,8 +26,10 @@ __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabric(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                     int selfRank, int nRanks, FabricGpuBarrier barrier) {
+  const uint32_t flag = barrier.beginEpoch();
+
   // Release-acquire barrier ensures the stream-ordered scratch write is visible to peers.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
 
   // use uint4 to do 16-byte loads to maximize memory efficiency. We assume
   // that count % countPerThread == 0, enforced before kernel launch.
@@ -54,7 +56,8 @@ __launch_bounds__(512)
   }
 
   // barrier to ensure remote ranks won't free their buffers until I'm done
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>(flag + 2);
+  barrier.endEpoch(flag + 2);
 }
 
 template <typename T, int NRANKS_CT>
@@ -63,7 +66,8 @@ __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabricPush(T* const* __restrict__ ipcbuffs, size_t count, const T* __restrict__ sendbuff,
                                         int selfRank, int nRanks, FabricGpuBarrier barrier) {
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+  const uint32_t flag = barrier.beginEpoch();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
   const int nRanksEff = (NRANKS_CT > 0) ? NRANKS_CT : nRanks;
   constexpr int kUnroll = (NRANKS_CT > 0) ? NRANKS_CT : 8;
   const size_t countPerRank = count;
@@ -84,7 +88,8 @@ __launch_bounds__(512)
   }
 
   // Release our remote writes and acquire every peer's writes into our scratch.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 2);
+  barrier.endEpoch(flag + 2);
 }
 
 } // namespace dda::common

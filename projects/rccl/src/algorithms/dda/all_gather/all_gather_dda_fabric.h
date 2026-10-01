@@ -29,6 +29,7 @@ __launch_bounds__(512)
   __global__
   void ddaAllGatherFabric(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                           const T* __restrict__ sendbuff, int selfRank, int nRanks, FabricGpuBarrier barrier) {
+  const uint32_t flag = barrier.beginEpoch();
 
   const size_t countPerRank = count;
   constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
@@ -42,12 +43,13 @@ __launch_bounds__(512)
   // of sendbuff into this rank's scratch buffer.
   copyFromSrcToDest<T>(sendbuff, ipcbuffs[selfRank], idxStart, idxEnd, idxStride);
 
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
 
   allGather<T, NRANKS_CT>(ipcbuffs, recvbuff, selfRank, nRanks, idxStart, idxEnd, idxStride, false);
 
   // barrier to ensure remote ranks won't free their buffers until I'm done
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>(flag + 2);
+  barrier.endEpoch(flag + 2);
 }
 
 } // namespace dda::common

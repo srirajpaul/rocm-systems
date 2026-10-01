@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 
+#include "algorithms/dda/device/CollCommon.h"
 #include "algorithms/dda/device/device_buffer.h"
 #include "algorithms/dda/fabric/fabric_mem_handler.h"
 #include "algorithms/dda/ipc/ipc_gpu_barrier.h"
@@ -46,48 +47,55 @@ public:
   static __host__ std::pair<std::unique_ptr<FabricGpuBarrierResources>, FabricGpuBarrier> mallocAndInit(
     int nRanks, int nBlocks, int selfRank, void* bootstrap, struct ncclMemManager* manager);
 
+  // Attaches the comm's LL epoch cells (comm->ddaLLEpochDev), which the barrier
+  // shares with the LL/LL128 kernels so every fabric collective advances one epoch.
+  __host__ void setEpochs(uint32_t* epochDev, int epochLen) {
+    epochDev_ = epochDev;
+    epochLen_ = epochLen;
+  }
+
+  // Barrier k (1-based) of a kernel posts epoch beginEpoch() + k, and the kernel
+  // ends with endEpoch(beginEpoch() + nBarriers). Both must be called by every
+  // thread of the block.
+  __device__ __forceinline__ FlagType beginEpoch() const {
+    return ddaGetLLEpochInc(epochDev_, blockIdx.x, 1);
+  }
+  __device__ __forceinline__ void endEpoch(FlagType epoch) const {
+    ddaSetLLEpoch(epochDev_, epochLen_, blockIdx.x, gridDim.x, epoch);
+  }
+
+  // Flags carry the epoch and only grow, so a slot is never reset and a waiter only
+  // needs "flag >= epoch". A peer can be at most one barrier ahead (it cannot pass
+  // epoch e before we post e), so the wrap-safe signed-difference compare is exact.
   template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess>
-  __device__ __forceinline__ void syncOnSameBlockIdx() {
-    enum class MemFenceType {
-      RELEASE_ACQUIRE,
-      RELEASE_ONLY,
-      ACQUIRE_ONLY,
-    };
-
+  __device__ __forceinline__ void syncOnSameBlockIdx(FlagType epoch) {
     static_assert(hasPreviousMemAccess || hasSubsequentMemAccess);
-
-    constexpr MemFenceType fenceType =
-      hasPreviousMemAccess && hasSubsequentMemAccess ?
-        MemFenceType::RELEASE_ACQUIRE :
-        (!hasPreviousMemAccess ? MemFenceType::ACQUIRE_ONLY : MemFenceType::RELEASE_ONLY);
 
     if constexpr (hasPreviousMemAccess) {
       __syncthreads();
     }
-    // Each thread handles one or more peers in a strided loop so the barrier
-    // stays correct when blockDim.x < nRanks_. A small count can launch as few
-    // as 64 threads while a clique may have up to kDdaMaxNranks ranks; with a
-    // single thread per peer, peers with rank >= blockDim.x would never be
-    // signaled or waited on, hanging the barrier. Every rank walks peers in the
-    // same increasing order, so the interleaved signal/wait cannot deadlock.
-    FlagType* selfBuf = peerFlags_[selfRank_];
-    for (int peerRank = threadIdx.x; peerRank < nRanks_; peerRank += blockDim.x) {
-      FlagType* peerBuf = peerFlags_[peerRank];
 
-      // Signal the peer that this rank reached the barrier for this block.
-      if constexpr (fenceType == MemFenceType::ACQUIRE_ONLY) {
-        putFlag<std::memory_order_relaxed>(peerBuf + getFlagIdx(selfRank_, blockIdx.x));
-      } else {
-        putFlag<std::memory_order_release>(peerBuf + getFlagIdx(selfRank_, blockIdx.x));
+    // Strided so the barrier stays correct when blockDim.x < nRanks_.
+    if (static_cast<int>(threadIdx.x) < nRanks_) {
+      if constexpr (hasPreviousMemAccess) {
+        __atomic_thread_fence(__ATOMIC_RELEASE);
       }
-
-      // Wait for the peer's signal in this rank's own buffer.
-      if constexpr (fenceType == MemFenceType::RELEASE_ONLY) {
-        waitFlag<std::memory_order_relaxed>(selfBuf + getFlagIdx(peerRank, blockIdx.x));
-      } else {
-        waitFlag<std::memory_order_acquire>(selfBuf + getFlagIdx(peerRank, blockIdx.x));
+      for (int peerRank = threadIdx.x; peerRank < nRanks_; peerRank += blockDim.x) {
+        __scoped_atomic_store_n(peerFlags_[peerRank] + getFlagIdx(selfRank_, blockIdx.x), epoch, __ATOMIC_RELAXED,
+                                __MEMORY_SCOPE_SYSTEM);
+      }
+      FlagType* selfBuf = peerFlags_[selfRank_];
+      for (int peerRank = threadIdx.x; peerRank < nRanks_; peerRank += blockDim.x) {
+        FlagType* flag = selfBuf + getFlagIdx(peerRank, blockIdx.x);
+        while (static_cast<int32_t>(__scoped_atomic_load_n(flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - epoch) <
+               0) {
+        }
+      }
+      if constexpr (hasSubsequentMemAccess) {
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
       }
     }
+
     if constexpr (hasSubsequentMemAccess) {
       __syncthreads();
     }
@@ -98,6 +106,8 @@ private:
   int selfRank_{-1};
   int nRanks_{-1};
   FlagType** peerFlags_{nullptr};
+  uint32_t* epochDev_{nullptr};
+  int epochLen_{0};
 
   __host__ FabricGpuBarrier(int nBlocks, int selfRank, int nRanks, FlagType** peerFlags)
     : nBlocks_(nBlocks), selfRank_(selfRank), nRanks_(nRanks), peerFlags_(peerFlags) {}

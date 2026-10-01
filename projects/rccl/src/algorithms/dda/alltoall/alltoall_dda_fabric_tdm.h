@@ -42,8 +42,10 @@ __launch_bounds__(512)
   static_assert(TileBytes * UnrollPeers <= kDdaA2ATdmWindowBytes, "tiles overflow the per-warp LDS window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
+  const uint32_t flag = barrier.beginEpoch();
+
   // Release-acquire barrier ensures the stream-ordered scratch write is visible to peers.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
 
   extern __shared__ __attribute__((aligned(128))) uint8_t ddaA2ATdmSmem[];
   // TDM descriptors live in SGPRs, so every address below must be wave-uniform.
@@ -84,7 +86,8 @@ __launch_bounds__(512)
   }
 
   // barrier to ensure remote ranks won't free their buffers until I'm done
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>(flag + 2);
+  barrier.endEpoch(flag + 2);
 #else
   // Only dispatched on gfx1250; every other arch still has to compile this kernel.
   (void)peerScratch, (void)recvbuff, (void)bytesPerRank, (void)selfRank, (void)nRanks, (void)barrier;
