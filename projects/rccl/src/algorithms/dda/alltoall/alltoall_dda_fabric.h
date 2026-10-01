@@ -67,7 +67,8 @@ __launch_bounds__(512)
   __global__ void ddaAllToAllFabricPush(T* const* __restrict__ ipcbuffs, size_t count, const T* __restrict__ sendbuff,
                                         int selfRank, int nRanks, FabricGpuBarrier barrier) {
   const uint32_t flag = barrier.beginEpoch();
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
+                             true /* sysScopeWrites */>(flag + 1);
   const int nRanksEff = (NRANKS_CT > 0) ? NRANKS_CT : nRanks;
   constexpr int kUnroll = (NRANKS_CT > 0) ? NRANKS_CT : 8;
   const size_t countPerRank = count;
@@ -78,17 +79,28 @@ __launch_bounds__(512)
   const auto idxEnd = countPerRank;
   const auto idxStride = gridDim.x * blockDim.x * countPerThread;
 
+  // ddaLLStoreLineB128 is a compiler memory barrier, so issue every load of the group before its stores.
+  const size_t destIdx = selfRank * idxEnd;
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
-#pragma unroll kUnroll
-    for (int r = 0; r < nRanksEff; ++r) {
-      size_t srcIdx = idx + r * idxEnd;
-      size_t destIdx = idx + selfRank * idxEnd;
-      *reinterpret_cast<uint4*>(&ipcbuffs[r][destIdx]) = reinterpret_cast<const uint4*>(&sendbuff[srcIdx])[0];
+    for (int r0 = 0; r0 < nRanksEff; r0 += kUnroll) {
+      uint4 v[kUnroll];
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        if (r0 + u < nRanksEff) v[u] = reinterpret_cast<const uint4*>(&sendbuff[idx + (r0 + u) * idxEnd])[0];
+      }
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        if (r0 + u < nRanksEff) {
+          ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(&ipcbuffs[r0 + u][destIdx + idx]), v[u].x, v[u].y, v[u].z,
+                             v[u].w);
+        }
+      }
     }
   }
 
   // Release our remote writes and acquire every peer's writes into our scratch.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 2);
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
+                             true /* sysScopeWrites */>(flag + 2);
   barrier.endEpoch(flag + 2);
 }
 

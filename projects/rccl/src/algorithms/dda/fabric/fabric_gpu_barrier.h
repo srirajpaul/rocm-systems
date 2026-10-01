@@ -67,7 +67,12 @@ public:
   // Flags carry the epoch and only grow, so a slot is never reset and a waiter only
   // needs "flag >= epoch". A peer can be at most one barrier ahead (it cannot pass
   // epoch e before we post e), so the wrap-safe signed-difference compare is exact.
-  template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess>
+  //
+  // sysScopeWrites: every write this barrier publishes was a system-scope store.
+  // Those complete at their destination rather than in local L2, and the leading
+  // __syncthreads already waits for each wave's stores to complete, so the release
+  // fence (a system-scope L2 writeback, which serializes across blocks) is skipped.
+  template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess, bool sysScopeWrites = false>
   __device__ __forceinline__ void syncOnSameBlockIdx(FlagType epoch) {
     static_assert(hasPreviousMemAccess || hasSubsequentMemAccess);
 
@@ -77,7 +82,7 @@ public:
 
     // Strided so the barrier stays correct when blockDim.x < nRanks_.
     if (static_cast<int>(threadIdx.x) < nRanks_) {
-      if constexpr (hasPreviousMemAccess) {
+      if constexpr (hasPreviousMemAccess && !sysScopeWrites) {
         __atomic_thread_fence(__ATOMIC_RELEASE);
       }
       for (int peerRank = threadIdx.x; peerRank < nRanks_; peerRank += blockDim.x) {
