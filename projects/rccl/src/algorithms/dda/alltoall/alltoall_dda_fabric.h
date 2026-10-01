@@ -66,8 +66,9 @@ template <typename T, int NRANKS_CT>
 #if defined(USE_ROCM)
 __launch_bounds__(kDdaA2APushThreadsPerBlock)
 #endif
-  __global__ void ddaAllToAllFabricPush(T* const* __restrict__ ipcbuffs, size_t count, const T* __restrict__ sendbuff,
-                                        int selfRank, int nRanks, FabricGpuBarrier barrier) {
+  __global__ void ddaAllToAllFabricPush(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
+                                        const T* __restrict__ sendbuff, int selfRank, int nRanks,
+                                        FabricGpuBarrier barrier) {
   const uint32_t flag = barrier.beginEpoch();
   // Only local sendbuff is read before the next barrier, so no acquire is needed here.
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
@@ -101,9 +102,32 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
     }
   }
 
-  // Release our remote writes and acquire every peer's writes into our scratch.
+  // Publish our remote writes. The drain below reads only with system-scope loads, so no acquire is needed.
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
-                             true /* sysScopeWrites */>(flag + 2);
+                             true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 2);
+
+  // Drain our scratch into recvbuff. Peer r's thread gtIdx wrote exactly the positions this thread reads
+  // from slot r, since every rank launches the same grid. ddaLLLoadLineB128 is a compiler memory barrier,
+  // so issue every load of the group before its stores.
+  const T* selfScratch = ipcbuffs[selfRank];
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    for (int r0 = 0; r0 < nRanksEff; r0 += kUnroll) {
+      uint32_t w[kUnroll][4];
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        if (r0 + u < nRanksEff) {
+          ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(&selfScratch[(r0 + u) * idxEnd + idx]), w[u][0], w[u][1],
+                            w[u][2], w[u][3]);
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        if (r0 + u < nRanksEff) {
+          *reinterpret_cast<uint4*>(&recvbuff[(r0 + u) * idxEnd + idx]) = make_uint4(w[u][0], w[u][1], w[u][2], w[u][3]);
+        }
+      }
+    }
+  }
   barrier.endEpoch(flag + 2);
 }
 
