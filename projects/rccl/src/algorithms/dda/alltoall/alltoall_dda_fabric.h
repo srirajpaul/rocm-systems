@@ -67,8 +67,9 @@ __launch_bounds__(512)
   __global__ void ddaAllToAllFabricPush(T* const* __restrict__ ipcbuffs, size_t count, const T* __restrict__ sendbuff,
                                         int selfRank, int nRanks, FabricGpuBarrier barrier) {
   const uint32_t flag = barrier.beginEpoch();
+  // Only local sendbuff is read before the next barrier, so no acquire is needed here.
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
-                             true /* sysScopeWrites */>(flag + 1);
+                             true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 1);
   const int nRanksEff = (NRANKS_CT > 0) ? NRANKS_CT : nRanks;
   constexpr int kUnroll = (NRANKS_CT > 0) ? NRANKS_CT : 8;
   const size_t countPerRank = count;

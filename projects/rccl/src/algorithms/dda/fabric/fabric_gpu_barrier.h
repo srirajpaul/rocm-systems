@@ -72,7 +72,13 @@ public:
   // Those complete at their destination rather than in local L2, and the leading
   // __syncthreads already waits for each wave's stores to complete, so the release
   // fence (a system-scope L2 writeback, which serializes across blocks) is skipped.
-  template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess, bool sysScopeWrites = false>
+  //
+  // sysScopeReads: nothing after this barrier reads peer-written data through the
+  // cache (it reads none, or only with system-scope loads), so the acquire fence (a
+  // system-scope L2 invalidate) is skipped. The trailing __syncthreads still holds
+  // the block until the wait completes.
+  template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess, bool sysScopeWrites = false,
+            bool sysScopeReads = false>
   __device__ __forceinline__ void syncOnSameBlockIdx(FlagType epoch) {
     static_assert(hasPreviousMemAccess || hasSubsequentMemAccess);
 
@@ -96,7 +102,7 @@ public:
                0) {
         }
       }
-      if constexpr (hasSubsequentMemAccess) {
+      if constexpr (hasSubsequentMemAccess && !sysScopeReads) {
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
       }
     }
