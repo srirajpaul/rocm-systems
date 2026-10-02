@@ -421,7 +421,6 @@ static constexpr size_t ncclSymkArOccupancyBoundBytes = 1 << 30;
 // threads to the epoch barrier without removing an epoch.
 static constexpr size_t ncclSymkArLLWideBytes = 64 << 10;
 static constexpr size_t ncclSymkAgLLWideBusBytes = 512 << 10;
-static constexpr size_t ncclSymkAgWideBlockBusBytes = 64 << 20;
 // Where AllGather's store kernel overtakes LL, which the shared cost model places past 8 MB.
 static constexpr size_t ncclSymkAgStoreMinBusBytes = 4 << 20;
 // Block widths those thresholds select between. 1024 is the widest workgroup gfx950 will launch.
@@ -435,11 +434,12 @@ bool ncclSymkGfx950AllGatherPrefersStore(int nRanks, size_t nBytes) {
 
 int ncclSymkGfx950BlockThreads(ncclFunc_t coll, bool isLL, int nRanks, size_t nBytes) {
   if (coll == ncclFuncAllGather) {
-    // A wider LL block halves the epoch count, which pays from 512 KB. The store kernel stays narrow
-    // below 64 MB, where a wider block leaves each warp too few iterations.
+    // A wider LL block halves the epoch count, which pays from 512 KB. The store and load kernels keep
+    // eight peer accesses in flight per wave, so they saturate at the narrow width at every size and a
+    // wider block only oversubscribes them.
     size_t busBytes = size_t(nRanks) * nBytes;
     if (isLL) return busBytes >= ncclSymkAgLLWideBusBytes ? ncclSymkGfx950LLThreads : ncclSymkGfx950NarrowThreads;
-    return busBytes >= ncclSymkAgWideBlockBusBytes ? ncclSymkGfx950WideThreads : ncclSymkGfx950NarrowThreads;
+    return ncclSymkGfx950NarrowThreads;
   }
   if (coll != ncclFuncReduceScatter && coll != ncclFuncAllReduce) return ncclSymkMaxThreads;
 

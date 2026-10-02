@@ -152,8 +152,8 @@ TEST(SymkBlockWidthTest, ReduceScatterLDBands)
 }
 
 // ===========================================================================
-// AllGather: LL widens from 512 KB bus, and the store kernel stays narrow below
-// 64 MB bus and widens above. The store kernel takes over from LL at 4 MB bus.
+// AllGather: LL widens from 512 KB bus, and the store and load kernels stay
+// narrow at every size. The store kernel takes over from LL at 4 MB bus.
 // Thresholds are bus bytes, like ReduceScatter's.
 // ===========================================================================
 
@@ -167,11 +167,11 @@ TEST(SymkBlockWidthTest, AllGatherLLWidensFrom512K)
 
 TEST(SymkBlockWidthTest, AllGatherStoreBands)
 {
-    // The store kernel is AllGather's non-LL kernel, so ldWidth() reaches it.
+    // The store and load kernels are AllGather's non-LL kernels, so ldWidth() reaches them.
     EXPECT_EQ(ldWidth(ncclFuncAllGather, busToBytes(4 * MiB)), kNarrow);
     EXPECT_EQ(ldWidth(ncclFuncAllGather, busToBytes(64 * MiB) - 1), kNarrow);
-    EXPECT_EQ(ldWidth(ncclFuncAllGather, busToBytes(64 * MiB)), kWide);
-    EXPECT_EQ(ldWidth(ncclFuncAllGather, busToBytes(4 * GiB)), kWide);
+    EXPECT_EQ(ldWidth(ncclFuncAllGather, busToBytes(64 * MiB)), kNarrow);
+    EXPECT_EQ(ldWidth(ncclFuncAllGather, busToBytes(4 * GiB)), kNarrow);
 }
 
 TEST(SymkBlockWidthTest, AllGatherPrefersStoreFrom4M)
