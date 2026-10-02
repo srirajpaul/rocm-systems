@@ -556,8 +556,10 @@ ncclResult_t ncclTuningSymkModelSim(struct ncclTuningInput_t* const inputs, stru
   int nThreads = ncclSymkMaxThreads;
   if (fullWidth) {
     nThreads = ncclSymkWarpsPerBlock * comm->WarpSize;
-  } else if (ncclSymkIsGfx950(comm) && isLsa) {
-    // The width tuning is fitted to the gfx950 LSA kernels.
+  } else if (ncclSymkIsGfx950(comm) && isLsa && (tuning_kmask & ncclSymkAGPullKernelMask()) == 0) {
+    // The width tuning is fitted to the gfx950 LSA kernels. The AllGather pull kernel keeps eight peer
+    // loads in flight per wave, so it already saturates at the default width and the store kernel's
+    // wider band only oversubscribes it.
     nThreads = ncclSymkGfx950BlockThreads(inputs->func, isLL, comm->nRanks, inputs->nBytes);
   }
   tuning->nWarps = std::max(1, nThreads / comm->WarpSize);
