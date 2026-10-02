@@ -468,7 +468,14 @@ static __device__ void gather(ncclSymkArgsHandler const& handler, int tn, int t,
   bool inPlace = (input == output + rank * nAllElts);
   size_t nBytes = nElts * sizeof(T);
   size_t nAllBytes = nAllElts * sizeof(T);
+
+#if defined(__gfx950__)
+  // Same floor as bcast: keep the partial final wave in the deep tiers instead of trimming it to the tail.
+  uint32_t const chunkFloor = uint32_t(nBlocks);
+#else
   uint32_t nBlocks_rcp32 = nccl::utility::idivRcp32_upto64(nBlocks);
+  uint32_t const chunkFloor = 1;
+#endif
 
   // Loads land at our input's offset on every peer but stores land nAllBytes apart, one slot per peer,
   // so each tier also needs nAllBytes aligned for its test on slot 0 to cover every slot.
@@ -504,11 +511,19 @@ static __device__ void gather(ncclSymkArgsHandler const& handler, int tn, int t,
 #endif
 
   if (alignment % 16 == 0 && nAllBytes % 16 == 0) {
-    constexpr int BytePerPack = ncclSymkBytePerPack, UnrollPacks = ncclSymkUnrollPacks, UnrollPeers = 2;
-    constexpr int BytePerChunk = ncclSymkBytePerChunk;
+#if defined(__gfx950__)
+    // Same shape as bcast's gfx950 tier: one pack per peer, with up to 8 peers' loads issued per batch.
+    constexpr int UnrollPacks = 1, UnrollPeers = 8;
+#else
+    constexpr int UnrollPacks = ncclSymkUnrollPacks, UnrollPeers = 2;
+#endif
+    constexpr int BytePerPack = ncclSymkBytePerPack;
+    constexpr int BytePerChunk = ncclSymkGetBytesPerChunk(ncclSymkMinWarpsPerBlock, UnrollPacks);
     uint32_t chunks = (nBytes - cursor) / BytePerChunk;
+#if !defined(__gfx950__)
     chunks -= imodFast32(chunks, nBlocks, nBlocks_rcp32);
-    if (chunks != 0) {
+#endif
+    if (chunks >= chunkFloor) {
       uintptr_t cursorAfter = cursor + uintptr_t(chunks) * BytePerChunk;
       gatherDeep<BytePerPack, UnrollPacks, UnrollPeers, EnableTma>(handler, tn, t, waitNeeded, bar,
                                                                    (ncclSymPtr<char>)input + cursor,
@@ -520,11 +535,18 @@ static __device__ void gather(ncclSymkArgsHandler const& handler, int tn, int t,
   }
 
   if (sizeof(T) == 4 || (sizeof(T) < 4 && alignment % 4 == 0 && nAllBytes % 4 == 0)) {
-    constexpr int BytePerPack = 4, UnrollPacks = 4, UnrollPeers = 4;
+#if defined(__gfx950__)
+    constexpr int UnrollPeers = 8;
+#else
+    constexpr int UnrollPeers = 4;
+#endif
+    constexpr int BytePerPack = 4, UnrollPacks = 4;
     constexpr int BytePerChunk = ncclSymkMinWarpsPerBlock * UnrollPacks * WARP_SIZE * BytePerPack;
     uint32_t chunks = (nBytes - cursor) / BytePerChunk;
+#if !defined(__gfx950__)
     chunks -= imodFast32(chunks, nBlocks, nBlocks_rcp32);
-    if (chunks != 0) {
+#endif
+    if (chunks >= chunkFloor) {
       uintptr_t cursorAfter = cursor + uintptr_t(chunks) * BytePerChunk;
       gatherDeep<(sizeof(T) <= BytePerPack ? BytePerPack : 0), UnrollPacks, UnrollPeers, false>(
         handler, tn, t, waitNeeded, bar, (ncclSymPtr<char>)input + cursor, (ncclSymPtr<char>)output + cursor,
