@@ -16,10 +16,13 @@
 #endif
 #include <stdio.h>
 
+// Per-access lookup variant of allreduceDeep, kept for the staged path and for rank counts past
+// ncclSymkHoistMaxRanks.
 template <int BytePerPack, int UnrollPacks, int UnrollPeers, typename T, bool EnableTma, typename Red>
-static __device__ __forceinline__ void allreduceDeep(ncclSymkArgsHandler const& handler, int tn, int t, bool waitNeeded,
-                                                     ncclLsaBarrierSession<ncclCoopCta>& bar, Red red,
-                                                     ncclSymPtr<char> input, ncclSymPtr<char> output, int32_t nIters) {
+static __device__ __forceinline__ void allreduceDeepGeneric(ncclSymkArgsHandler const& handler, int tn, int t,
+                                                            bool waitNeeded, ncclLsaBarrierSession<ncclCoopCta>& bar,
+                                                            Red red, ncclSymPtr<char> input, ncclSymPtr<char> output,
+                                                            int32_t nIters) {
   using Pack = BytePack<BytePerPack>;
   using Acc = typename Red::EltType;
   using AccPack = BytePack<BytePerPack * sizeof(Acc) / sizeof(T)>;
@@ -236,9 +239,9 @@ static __device__ __forceinline__ void allreduceDeep(ncclSymkArgsHandler const& 
 }
 
 template <int UnrollPeers, typename Red, typename T>
-static __device__ __forceinline__ void allreduceEnds(ncclSymkArgsHandler const& handler, int tn, int t, Red red,
-                                                     ncclSymPtr<T> input, ncclSymPtr<T> output, size_t nElts,
-                                                     uint32_t nPreElts, size_t nSufElts) {
+static __device__ __forceinline__ void allreduceEndsGeneric(ncclSymkArgsHandler const& handler, int tn, int t, Red red,
+                                                            ncclSymPtr<T> input, ncclSymPtr<T> output, size_t nElts,
+                                                            uint32_t nPreElts, size_t nSufElts) {
   using Acc = typename Red::EltType;
 
   ncclTeam world = ncclTeamWorld(handler.comm);
@@ -300,6 +303,106 @@ static __device__ __forceinline__ void allreduceEnds(ncclSymkArgsHandler const& 
         }
       }
     }
+  }
+}
+
+// Reduces nIters warp tiles across the first nRanks src[] bases and writes the result to every dst[].
+// Dispatches down to NRanks == nRanks so the rank loops have a compile-time count.
+template <int BytePerPack, int UnrollPacks, int UnrollPeers, int NRanks, typename T, typename Red>
+static __device__ __forceinline__ void allreduceDeepRanks(int nRanks,
+                                                          ncclSymkGlobalPtr<char> const (&src)[ncclSymkHoistMaxRanks],
+                                                          ncclSymkGlobalPtr<char> const (&dst)[ncclSymkHoistMaxRanks],
+                                                          Red red, int tn, int t, int32_t nIters) {
+  if NCCL_IF_CONSTEXPR (NRanks > 1) {
+    if (nRanks < NRanks) {
+      allreduceDeepRanks<BytePerPack, UnrollPacks, UnrollPeers, NRanks - 1, T>(nRanks, src, dst, red, tn, t, nIters);
+      return;
+    }
+  }
+  using Acc = typename Red::EltType;
+  using AccPack = BytePack<BytePerPack * sizeof(Acc) / sizeof(T)>;
+  constexpr size_t TileBytes = size_t(UnrollPacks) * WARP_SIZE * BytePerPack;
+  int wn = tn / WARP_SIZE;
+  int w = t / WARP_SIZE;
+  int lane = t % WARP_SIZE;
+  size_t cur = size_t(w) * TileBytes + size_t(lane) * BytePerPack;
+  size_t const step = size_t(wn) * TileBytes;
+  NVCC_PRAGMA_UNROLL_DISABLED
+  for (int i = w; i < nIters; i += wn, cur += step) {
+    AccPack acc[UnrollPacks];
+    ncclSymkReduceTile<BytePerPack, UnrollPacks, UnrollPeers, NRanks, T>(red, src, cur, acc);
+    BytePack<BytePerPack> out[UnrollPacks];
+    NVCC_PRAGMA_UNROLL(UnrollPacks)
+    for (int p = 0; p < UnrollPacks; p++) out[p] = applyCast<Acc, T>(acc[p]);
+    NVCC_PRAGMA_UNROLL(NRanks)
+    for (int k = 0; k < NRanks; k++) {
+      NVCC_PRAGMA_UNROLL(UnrollPacks)
+      for (int p = 0; p < UnrollPacks; p++) {
+        ncclSymkStoreGlobal<BytePerPack>(dst[k] + cur + p * WARP_SIZE * BytePerPack, out[p]);
+      }
+    }
+  }
+}
+
+template <int BytePerPack, int UnrollPacks, int UnrollPeers, typename T, bool EnableTma, typename Red>
+static __device__ __forceinline__ void allreduceDeep(ncclSymkArgsHandler const& handler, int tn, int t, bool waitNeeded,
+                                                     ncclLsaBarrierSession<ncclCoopCta>& bar, Red red,
+                                                     ncclSymPtr<char> input, ncclSymPtr<char> output, int32_t nIters) {
+  int const& nRanks = handler.comm.nRanks;
+  if (!EnableTma && nRanks <= ncclSymkHoistMaxRanks) {
+    ncclSymkGlobalPtr<char> src[ncclSymkHoistMaxRanks];
+    ncclSymkGlobalPtr<char> dst[ncclSymkHoistMaxRanks];
+    ncclSymkRankBases(handler, input, src);
+    ncclSymkRankBases(handler, output, dst);
+    if (waitNeeded) bar.wait(ncclCoopCta(), cuda::memory_order_acquire);
+    allreduceDeepRanks<BytePerPack, UnrollPacks, UnrollPeers, ncclSymkHoistMaxRanks, T>(nRanks, src, dst, red, tn, t,
+                                                                                       nIters);
+  } else {
+    allreduceDeepGeneric<BytePerPack, UnrollPacks, UnrollPeers, T, EnableTma>(handler, tn, t, waitNeeded, bar, red,
+                                                                              input, output, nIters);
+  }
+}
+
+// Per-element counterpart of allreduceDeepRanks for the unaligned head and the tail.
+template <int UnrollPeers, int NRanks, typename T, typename Red>
+static __device__ __forceinline__ void allreduceEndsRanks(int nRanks,
+                                                          ncclSymkGlobalPtr<char> const (&src)[ncclSymkHoistMaxRanks],
+                                                          ncclSymkGlobalPtr<char> const (&dst)[ncclSymkHoistMaxRanks],
+                                                          Red red, int tn, int t, size_t nElts, uint32_t nPreElts,
+                                                          size_t nSufElts) {
+  if NCCL_IF_CONSTEXPR (NRanks > 1) {
+    if (nRanks < NRanks) {
+      allreduceEndsRanks<UnrollPeers, NRanks - 1, T>(nRanks, src, dst, red, tn, t, nElts, nPreElts, nSufElts);
+      return;
+    }
+  }
+  using Acc = typename Red::EltType;
+  NVCC_PRAGMA_UNROLL_DISABLED
+  for (size_t i = t; i < nPreElts + nSufElts; i += tn) {
+    size_t cur = (i < nPreElts ? i : nElts - nSufElts - nPreElts + i) * sizeof(T);
+    BytePack<sizeof(Acc)> acc[1];
+    ncclSymkReduceTile<sizeof(T), 1, UnrollPeers, NRanks, T>(red, src, cur, acc);
+    BytePack<sizeof(T)> out = applyCast<Acc, T>(acc[0]);
+    NVCC_PRAGMA_UNROLL(NRanks)
+    for (int k = 0; k < NRanks; k++) ncclSymkStoreGlobal<sizeof(T)>(dst[k] + cur, out);
+  }
+}
+
+template <int UnrollPeers, typename Red, typename T>
+static __device__ __forceinline__ void allreduceEnds(ncclSymkArgsHandler const& handler, int tn, int t, Red red,
+                                                     ncclSymPtr<T> input, ncclSymPtr<T> output, size_t nElts,
+                                                     uint32_t nPreElts, size_t nSufElts) {
+  int const& nRanks = handler.comm.nRanks;
+  if (nPreElts + nSufElts == 0) return;
+  if (nRanks <= ncclSymkHoistMaxRanks) {
+    ncclSymkGlobalPtr<char> src[ncclSymkHoistMaxRanks];
+    ncclSymkGlobalPtr<char> dst[ncclSymkHoistMaxRanks];
+    ncclSymkRankBases(handler, input, src);
+    ncclSymkRankBases(handler, output, dst);
+    allreduceEndsRanks<UnrollPeers, ncclSymkHoistMaxRanks, T>(nRanks, src, dst, red, tn, t, nElts, nPreElts,
+                                                              nSufElts);
+  } else {
+    allreduceEndsGeneric<UnrollPeers>(handler, tn, t, red, input, output, nElts, nPreElts, nSufElts);
   }
 }
 

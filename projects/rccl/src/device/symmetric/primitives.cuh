@@ -176,6 +176,72 @@ static __device__ __forceinline__ void ncclSymkTileFenceSmem() {
 }
 #endif // NCCL_SYMK_ASYNC_TILE
 
+////////////////////////////////////////////////////////////////////////////////
+// Hoisted peer bases
+//
+// The LSA copy loops take their peer bases as ncclSymkGlobalPtr, resolved once ahead of any store. The
+// window lookups behind lsaPtr()/peerPtr()/localPtr() are plain loads that the compiler cannot move past
+// our own stores, so left inside a copy loop they serialize every access behind a full wait.
+
+#if defined(__HIP_PLATFORM_AMD__)
+// Global-aperture pointer, so accesses compile to global_* rather than flat_* instructions. Flat accesses
+// also count against lgkmcnt, so any wait on one drains every access still in flight.
+template <typename T>
+using ncclSymkGlobalPtr = __attribute__((address_space(1))) T*;
+// Plain scalar and vector types: BytePack's copy/assignment only bind generic-address-space references,
+// so it cannot be loaded or stored through a ncclSymkGlobalPtr.
+template <int Bytes>
+struct ncclSymkCopyWord;
+template <>
+struct ncclSymkCopyWord<1> {
+  using Type = uint8_t;
+};
+template <>
+struct ncclSymkCopyWord<2> {
+  using Type = uint16_t;
+};
+template <>
+struct ncclSymkCopyWord<4> {
+  using Type = uint32_t;
+};
+template <>
+struct ncclSymkCopyWord<8> {
+  using Type = uint64_t;
+};
+template <>
+struct ncclSymkCopyWord<16> {
+  using Type = v4u;
+};
+#else
+template <typename T>
+using ncclSymkGlobalPtr = T*;
+template <int Bytes>
+struct ncclSymkCopyWord {
+  using Type = BytePack<Bytes>;
+};
+#endif
+
+// Rank-count bound up to which the reducing kernels hold every rank's base in registers. Above it they
+// keep their per-access lookups.
+constexpr int ncclSymkHoistMaxRanks = 8;
+
+template <int Bytes>
+static __device__ __forceinline__ BytePack<Bytes> ncclSymkLoadGlobal(ncclSymkGlobalPtr<char> p) {
+  using Word = typename ncclSymkCopyWord<Bytes>::Type;
+  Word w = *(ncclSymkGlobalPtr<Word>)p;
+  BytePack<Bytes> v;
+  __builtin_memcpy(&v, &w, Bytes);
+  return v;
+}
+
+template <int Bytes>
+static __device__ __forceinline__ void ncclSymkStoreGlobal(ncclSymkGlobalPtr<char> p, BytePack<Bytes> v) {
+  using Word = typename ncclSymkCopyWord<Bytes>::Type;
+  Word w;
+  __builtin_memcpy(&w, &v, Bytes);
+  *(ncclSymkGlobalPtr<Word>)p = w;
+}
+
 // HIP has no __isShared() (used only as a __builtin_assume hint); map it to the AMDGCN builtin.
 #if defined(__HIP_PLATFORM_AMD__) && !defined(NCCL_SYMK_HAVE_ISSHARED)
 #define NCCL_SYMK_HAVE_ISSHARED 1
@@ -669,4 +735,52 @@ struct ncclLsaPointerGetter {
     return (T*)nccl::utility::add4G(base, lsaPeer * stride4G);
   }
 };
+
+// Resolves p on every rank, in reduction order: base[k] is p on rank (rank + k) % nRanks, so base[0] is our
+// own. Slots past nRanks repeat our own and are never accessed. Needs nRanks <= ncclSymkHoistMaxRanks.
+template <typename T>
+static __device__ __forceinline__ void ncclSymkRankBases(ncclSymkArgsHandler const& handler, ncclSymPtr<T> p,
+                                                         ncclSymkGlobalPtr<char> (&base)[ncclSymkHoistMaxRanks]) {
+  ncclTeam world = ncclTeamWorld(handler.comm);
+  int const& rank = handler.comm.rank;
+  int const& nRanks = handler.comm.nRanks;
+  NVCC_PRAGMA_UNROLL(ncclSymkHoistMaxRanks)
+  for (int k = 0; k < ncclSymkHoistMaxRanks; k++) {
+    int r = rank + (k < nRanks ? k : 0);
+    if (r >= nRanks) r -= nRanks;
+    base[k] = (ncclSymkGlobalPtr<char>)p.peerPtr(world, r);
+  }
+}
+
+// Loads this thread's UnrollPacks packs at byte offset cur from each of the first NRanks bases and reduces
+// them in base order, UnrollPeers ranks' loads in flight at a time. NRanks is a compile-time count so the
+// per-rank guards fold away: runtime guards split the loads into one block each, which serializes them.
+template <int BytePerPack, int UnrollPacks, int UnrollPeers, int NRanks, typename T, typename Red>
+static __device__ __forceinline__ void ncclSymkReduceTile(
+  Red red, ncclSymkGlobalPtr<char> const (&base)[ncclSymkHoistMaxRanks], size_t cur,
+  BytePack<BytePerPack * sizeof(typename Red::EltType) / sizeof(T)> (&acc)[UnrollPacks]) {
+  using Acc = typename Red::EltType;
+  NVCC_PRAGMA_UNROLL(NRanks)
+  for (int g = 0; g < NRanks; g += UnrollPeers) {
+    BytePack<BytePerPack> tmp[UnrollPeers][UnrollPacks];
+    NVCC_PRAGMA_UNROLL(UnrollPeers)
+    for (int k = 0; k < UnrollPeers; k++) {
+      if (g + k < NRanks) {
+        NVCC_PRAGMA_UNROLL(UnrollPacks)
+        for (int p = 0; p < UnrollPacks; p++) {
+          tmp[k][p] = ncclSymkLoadGlobal<BytePerPack>(base[g + k] + cur + p * WARP_SIZE * BytePerPack);
+        }
+      }
+    }
+    NVCC_PRAGMA_UNROLL(UnrollPeers)
+    for (int k = 0; k < UnrollPeers; k++) {
+      if (g + k < NRanks) {
+        NVCC_PRAGMA_UNROLL(UnrollPacks)
+        for (int p = 0; p < UnrollPacks; p++) {
+          acc[p] = g + k == 0 ? applyCast<T, Acc>(tmp[k][p]) : applyReduce(red, acc[p], applyCast<T, Acc>(tmp[k][p]));
+        }
+      }
+    }
+  }
+}
 #endif // NCCL_DEVICE_SYMMETRIC_PRIMITIVES_H_

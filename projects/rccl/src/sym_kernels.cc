@@ -414,9 +414,6 @@ bool ncclSymkAvailable(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRedO
 // ReduceScatter's and AllGather's are bus bytes since their counts are per rank. AllReduce's are message bytes.
 static constexpr size_t ncclSymkRsWideBlockMinBusBytes = 1 << 20;
 static constexpr size_t ncclSymkRsNarrowBlockBusBytes = 16 << 20;
-static constexpr size_t ncclSymkArTailSaturatedBytes = 512 << 10;
-static constexpr size_t ncclSymkArDeepTierBytes = 2 << 20;
-static constexpr size_t ncclSymkArOccupancyBoundBytes = 1 << 30;
 // Below this message size AllReduce's LL packs fit few enough epochs that a wider block only adds
 // threads to the epoch barrier without removing an epoch.
 static constexpr size_t ncclSymkArLLWideBytes = 64 << 10;
@@ -459,11 +456,9 @@ int ncclSymkGfx950BlockThreads(ncclFunc_t coll, bool isLL, int nRanks, size_t nB
     return ncclSymkGfx950WideThreads;
   }
 
-  // AllReduce folds rank into its thread index, so across the deep tiers a wider block halves
-  // iterations per warp rather than covering more GPU. Outside them the wider block wins.
-  bool narrowBlock = nBytes < ncclSymkArTailSaturatedBytes ||
-                     (ncclSymkArDeepTierBytes <= nBytes && nBytes < ncclSymkArOccupancyBoundBytes);
-  return narrowBlock ? ncclSymkGfx950NarrowThreads : ncclSymkGfx950WideThreads;
+  // AllReduce folds rank into its thread index, so a wider block halves iterations per warp rather than
+  // covering more GPU, and with every rank's loads in flight per wave the narrow block saturates.
+  return ncclSymkGfx950NarrowThreads;
 }
 #endif
 

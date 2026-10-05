@@ -393,11 +393,13 @@ static void queryModel_lsa(struct ncclTuningInput_t* input, ncclSymkKernelId k, 
       peakBw *= bwGain;
     }
   }
-  // With eight peer accesses in flight per wave, the gfx950 AllGather store and load kernels saturate
-  // the links by 24 blocks; more only add contention and cost 2-10% from 4 MB up.
-  constexpr int ncclSymkGfx950AllGatherMaxBlocks = 24;
-  if ((k == ncclSymkKernelId_AllGather_ST || k == ncclSymkKernelId_AllGather_LD) && ncclSymkIsGfx950(comm)) {
-    nMaxBlocks = std::min(nMaxBlocks, ncclSymkGfx950AllGatherMaxBlocks);
+  // With every peer's accesses in flight per wave, the gfx950 LSA copy and reduce kernels saturate the
+  // links by 24 blocks; more only add contention, costing up to 12% at large sizes.
+  constexpr int ncclSymkGfx950LsaMaxBlocks = 24;
+  if ((k == ncclSymkKernelId_AllGather_ST || k == ncclSymkKernelId_AllGather_LD ||
+       k == ncclSymkKernelId_AllReduce_RSxLD_AGxST || k == ncclSymkKernelId_ReduceScatter_LD) &&
+      ncclSymkIsGfx950(comm)) {
+    nMaxBlocks = std::min(nMaxBlocks, ncclSymkGfx950LsaMaxBlocks);
   }
 #else
   if (comm->cudaArch < 1000) {

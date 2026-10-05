@@ -14,40 +14,6 @@
 #include "primitives.cuh"
 #endif
 
-#if defined(__HIP_PLATFORM_AMD__)
-// Global-aperture pointer, so accesses compile to global_* rather than flat_* instructions. Flat accesses
-// also count against lgkmcnt, so any wait on one drains every access still in flight.
-//
-// The copy loops below take their peer bases as these, resolved once per batch of peers ahead of any
-// store: the window lookups behind lsaPtr()/localPtr() are plain loads that the compiler cannot move past
-// our stores, so left inside a copy loop they serialize every access behind a full wait.
-template <typename T>
-using ncclSymkGlobalPtr = __attribute__((address_space(1))) T*;
-// Plain scalar and vector types: BytePack's copy/assignment only bind generic-address-space references,
-// so it cannot be loaded or stored through a ncclSymkGlobalPtr.
-template <int Bytes>
-struct ncclSymkCopyWord;
-template <>
-struct ncclSymkCopyWord<1> {
-  using Type = uint8_t;
-};
-template <>
-struct ncclSymkCopyWord<4> {
-  using Type = uint32_t;
-};
-template <>
-struct ncclSymkCopyWord<16> {
-  using Type = v4u;
-};
-#else
-template <typename T>
-using ncclSymkGlobalPtr = T*;
-template <int Bytes>
-struct ncclSymkCopyWord {
-  using Type = BytePack<Bytes>;
-};
-#endif
-
 // Resolves the bases of up to UnrollPeers peers starting dr past our rank: dst[u] is our slot in peer r's
 // output. `output` already addresses our slot.
 template <int UnrollPeers, typename T>

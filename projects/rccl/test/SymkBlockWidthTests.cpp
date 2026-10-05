@@ -99,35 +99,18 @@ TEST(SymkBlockWidthTest, ReduceScatterLLAlwaysWide)
 }
 
 // ===========================================================================
-// AllReduce LD: narrow below 512 KB, wide to 2 MB, narrow again to 1 GB, wide
-// above. Thresholds are message bytes.
+// AllReduce LD: narrow at every size.
 // ===========================================================================
 
-TEST(SymkBlockWidthTest, AllReduceLDNarrowBelowTailSaturation)
+TEST(SymkBlockWidthTest, AllReduceLDAlwaysNarrow)
 {
     EXPECT_EQ(ldWidth(ncclFuncAllReduce, 128 * KiB), kNarrow);
-    EXPECT_EQ(ldWidth(ncclFuncAllReduce, 256 * KiB), kNarrow);
-    EXPECT_EQ(ldWidth(ncclFuncAllReduce, 512 * KiB - sizeof(float)), kNarrow);
-}
-
-TEST(SymkBlockWidthTest, AllReduceLDWideAcrossTailSaturatedBand)
-{
-    EXPECT_EQ(ldWidth(ncclFuncAllReduce, 512 * KiB), kWide);
-    EXPECT_EQ(ldWidth(ncclFuncAllReduce, 1 * MiB), kWide);
-    EXPECT_EQ(ldWidth(ncclFuncAllReduce, 2 * MiB - sizeof(float)), kWide);
-}
-
-TEST(SymkBlockWidthTest, AllReduceLDNarrowAcrossDeepTiers)
-{
+    EXPECT_EQ(ldWidth(ncclFuncAllReduce, 512 * KiB), kNarrow);
+    EXPECT_EQ(ldWidth(ncclFuncAllReduce, 1 * MiB), kNarrow);
     EXPECT_EQ(ldWidth(ncclFuncAllReduce, 2 * MiB), kNarrow);
     EXPECT_EQ(ldWidth(ncclFuncAllReduce, 512 * MiB), kNarrow);
-    EXPECT_EQ(ldWidth(ncclFuncAllReduce, 1 * GiB - sizeof(float)), kNarrow);
-}
-
-TEST(SymkBlockWidthTest, AllReduceLDWideAboveOccupancyBound)
-{
-    EXPECT_EQ(ldWidth(ncclFuncAllReduce, 1 * GiB), kWide);
-    EXPECT_EQ(ldWidth(ncclFuncAllReduce, 4 * GiB), kWide);
+    EXPECT_EQ(ldWidth(ncclFuncAllReduce, 1 * GiB), kNarrow);
+    EXPECT_EQ(ldWidth(ncclFuncAllReduce, 4 * GiB), kNarrow);
 }
 
 // ===========================================================================
