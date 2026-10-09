@@ -83,14 +83,19 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
   const auto idxEnd = countPerRank;
   const auto idxStride = gridDim.x * blockDim.x * countPerThread;
 
-  // ddaLLStoreLineB128 is a compiler memory barrier, so issue every load of the group before its stores.
+  // Every access is system-scope so none of it goes through L2. The line helpers are compiler memory
+  // barriers, so issue every load of the group before its stores.
   const size_t destIdx = selfRank * idxEnd;
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
     for (int r0 = 0; r0 < nRanksEff; r0 += kUnroll) {
       uint4 v[kUnroll];
 #pragma unroll
       for (int u = 0; u < kUnroll; ++u) {
-        if (r0 + u < nRanksEff) v[u] = reinterpret_cast<const uint4*>(&sendbuff[idx + (r0 + u) * idxEnd])[0];
+        if (r0 + u < nRanksEff) {
+          uint32_t t0, t1, t2, t3;
+          ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(&sendbuff[idx + (r0 + u) * idxEnd]), t0, t1, t2, t3);
+          v[u] = make_uint4(t0, t1, t2, t3);
+        }
       }
 #pragma unroll
       for (int u = 0; u < kUnroll; ++u) {
@@ -107,8 +112,8 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
                              true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 2);
 
   // Drain our scratch into recvbuff. Peer r's thread gtIdx wrote exactly the positions this thread reads
-  // from slot r, since every rank launches the same grid. ddaLLLoadLineB128 is a compiler memory barrier,
-  // so issue every load of the group before its stores.
+  // from slot r, since every rank launches the same grid. As above, every access is system-scope and the
+  // loads of a group are issued before its stores.
   const T* selfScratch = ipcbuffs[selfRank];
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
     for (int r0 = 0; r0 < nRanksEff; r0 += kUnroll) {
@@ -123,7 +128,8 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
 #pragma unroll
       for (int u = 0; u < kUnroll; ++u) {
         if (r0 + u < nRanksEff) {
-          *reinterpret_cast<uint4*>(&recvbuff[(r0 + u) * idxEnd + idx]) = make_uint4(w[u][0], w[u][1], w[u][2], w[u][3]);
+          ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(&recvbuff[(r0 + u) * idxEnd + idx]), w[u][0], w[u][1], w[u][2],
+                             w[u][3]);
         }
       }
     }
