@@ -31,6 +31,8 @@ RCCL_PARAM(DdaA2ATdm, "DDA_A2A_TDM", 0);
 RCCL_PARAM(DdaA2ATdmTileKB, "DDA_A2A_TDM_TILE_KB", 8);
 // TDM warps per block before the block cap is reached (1..16). Fewer spreads the same warps over more CUs.
 RCCL_PARAM(DdaA2ATdmWarps, "DDA_A2A_TDM_WARPS", 16);
+// TDM per-warp LDS window in KiB: 16 (default), 32 or 64. A warp keeps window / tile tiles in flight.
+RCCL_PARAM(DdaA2ATdmWindowKB, "DDA_A2A_TDM_WINDOW_KB", 16);
 // Push model: each rank writes its chunks into peers' scratch instead of reading from them. Env: RCCL_DDA_A2A_PUSH.
 RCCL_PARAM(DdaA2APush, "DDA_A2A_PUSH", 0);
 
@@ -38,6 +40,7 @@ namespace {
 
 using nccl_dda_detail::DdaFabricBarrierState;
 using dda::common::kDdaA2ATdmAlign;
+using dda::common::kDdaA2ATdmMaxDynSmem;
 using dda::common::kDdaA2ATdmMaxWarpsPerBlock;
 using dda::common::kDdaA2ATdmWindowBytes;
 
@@ -70,6 +73,17 @@ static inline int ddaAllToAllFabricTdmTileBytes() {
   }
 }
 
+static inline int ddaAllToAllFabricTdmWindowBytes() {
+  switch (rcclParamDdaA2ATdmWindowKB()) {
+  case 32:
+    return 32 << 10;
+  case 64:
+    return 64 << 10;
+  default:
+    return kDdaA2ATdmWindowBytes;
+  }
+}
+
 // Everything but recvbuff alignment, which the block-count report cannot see.
 static bool ddaAllToAllFabricTdmEligible(ncclComm* comm, size_t bytesPerRank) {
   if (!rcclParamDdaA2ATdm()) return false;
@@ -85,17 +99,19 @@ static inline uint32_t ddaAllToAllFabricTdmWarpsTarget() {
   return (w >= 1 && w <= kDdaA2ATdmMaxWarpsPerBlock) ? static_cast<uint32_t>(w) : kDdaA2ATdmMaxWarpsPerBlock;
 }
 
-// Grid covers one warp per UnrollPeers (tile, peer) items. Blocks are sized for the
-// RCCL_DDA_A2A_TDM_WARPS target until the barrier's block cap is reached, then filled up to 16
-// warps. Depends only on count, so every rank launches the same grid.
-static inline std::pair<dim3, dim3> ddaAllToAllFabricTdmGeom(ncclComm* comm, size_t bytesPerRank, int tileBytes) {
-  const size_t unrollPeers = kDdaA2ATdmWindowBytes / tileBytes;
+// Grid covers one warp per UnrollPeers = windowBytes / tileBytes (tile, peer) items. A block holds
+// at most kDdaA2ATdmMaxDynSmem / windowBytes warps (16 at the default window). Blocks are sized for
+// the RCCL_DDA_A2A_TDM_WARPS target until the barrier's block cap is reached, then filled up to
+// that maximum. Depends only on count, so every rank launches the same grid.
+static inline std::pair<dim3, dim3> ddaAllToAllFabricTdmGeom(ncclComm* comm, size_t bytesPerRank, int tileBytes,
+                                                             int windowBytes) {
+  const size_t unrollPeers = windowBytes / tileBytes;
+  const uint32_t maxWarps = std::min<uint32_t>(kDdaA2ATdmMaxWarpsPerBlock, kDdaA2ATdmMaxDynSmem / windowBytes);
   const size_t tilesPerPeer = (bytesPerRank + tileBytes - 1) / tileBytes;
   const size_t warpsNeeded = dda::common::divRoundUp(tilesPerPeer * comm->nRanks, unrollPeers);
-  const uint32_t blocks =
-    dda::common::calcBlockCount(warpsNeeded, ddaAllToAllFabricTdmWarpsTarget(), comm->ddaFabricMaxBlocks);
-  const uint32_t warpsPerBlock =
-    std::min<uint32_t>(kDdaA2ATdmMaxWarpsPerBlock, dda::common::divRoundUp(warpsNeeded, blocks));
+  const uint32_t blocks = dda::common::calcBlockCount(
+    warpsNeeded, std::min(ddaAllToAllFabricTdmWarpsTarget(), maxWarps), comm->ddaFabricMaxBlocks);
+  const uint32_t warpsPerBlock = std::min<uint32_t>(maxWarps, dda::common::divRoundUp(warpsNeeded, blocks));
   return std::make_pair(dim3(blocks, 1, 1), dim3(warpsPerBlock * comm->WarpSize, 1, 1));
 }
 
@@ -107,7 +123,7 @@ static bool ddaAllToAllFabricTdmPrepare(int cudaDev) {
   const bool cached = cudaDev >= 0 && cudaDev < kMaxDevs;
   if (cached && state[cudaDev].load(std::memory_order_acquire) != 0) return state[cudaDev].load() > 0;
 
-  constexpr int kMaxDynSmem = kDdaA2ATdmMaxWarpsPerBlock * kDdaA2ATdmWindowBytes;
+  constexpr int kMaxDynSmem = kDdaA2ATdmMaxDynSmem;
   int optin = 0;
   bool ok = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, cudaDev) == cudaSuccess &&
             optin >= kMaxDynSmem &&
@@ -122,11 +138,11 @@ static bool ddaAllToAllFabricTdmPrepare(int cudaDev) {
   return ok;
 }
 
-template <int TileBytes, bool Push>
+template <int TileBytes, int kUnrollPeers, bool Push>
 static ncclResult_t ncclAllToAllDdaFabricTdmLaunch(const void* sendbuff, void* recvbuff, size_t bytesPerRank,
                                                    ncclComm* comm, dda::common::FabricGpuBarrier barrierHost,
                                                    cudaStream_t stream, bool* launched) {
-  constexpr int kUnrollPeers = kDdaA2ATdmWindowBytes / TileBytes;
+  constexpr int kWindowBytes = TileBytes * kUnrollPeers;
   *launched = false;
   bool ready;
   if constexpr (Push) {
@@ -136,10 +152,10 @@ static ncclResult_t ncclAllToAllDdaFabricTdmLaunch(const void* sendbuff, void* r
   }
   if (!ready) return ncclSuccess;
 
-  auto gridBlock = ddaAllToAllFabricTdmGeom(comm, bytesPerRank, TileBytes);
+  auto gridBlock = ddaAllToAllFabricTdmGeom(comm, bytesPerRank, TileBytes, kWindowBytes);
   const auto& grid = gridBlock.first;
   const auto& block = gridBlock.second;
-  const size_t dynSmem = (block.x / comm->WarpSize) * kDdaA2ATdmWindowBytes;
+  const size_t dynSmem = (block.x / comm->WarpSize) * kWindowBytes;
 
   INFO(NCCL_COLL,
        "DDA fabric AllToAll: launching TDM %s kernel: nRanks=%d count=%zu tile=%d x%d grid=%u block=%u lds=%zu",
@@ -159,21 +175,39 @@ static ncclResult_t ncclAllToAllDdaFabricTdmLaunch(const void* sendbuff, void* r
   return ncclSuccess;
 }
 
-// Picks the tile shape from RCCL_DDA_A2A_TDM_TILE_KB. *launched stays false if the device cannot grant the LDS.
+template <int TileBytes, bool Push>
+static ncclResult_t ncclAllToAllDdaFabricTdmDispatchWindow(const void* sendbuff, void* recvbuff, size_t bytesPerRank,
+                                                           ncclComm* comm, dda::common::FabricGpuBarrier barrierHost,
+                                                           cudaStream_t stream, bool* launched) {
+  switch (ddaAllToAllFabricTdmWindowBytes()) {
+  case 64 << 10:
+    return ncclAllToAllDdaFabricTdmLaunch<TileBytes, (64 << 10) / TileBytes, Push>(sendbuff, recvbuff, bytesPerRank,
+                                                                                   comm, barrierHost, stream, launched);
+  case 32 << 10:
+    return ncclAllToAllDdaFabricTdmLaunch<TileBytes, (32 << 10) / TileBytes, Push>(sendbuff, recvbuff, bytesPerRank,
+                                                                                   comm, barrierHost, stream, launched);
+  default:
+    return ncclAllToAllDdaFabricTdmLaunch<TileBytes, kDdaA2ATdmWindowBytes / TileBytes, Push>(
+      sendbuff, recvbuff, bytesPerRank, comm, barrierHost, stream, launched);
+  }
+}
+
+// Picks the tile shape from RCCL_DDA_A2A_TDM_TILE_KB and the per-warp window from RCCL_DDA_A2A_TDM_WINDOW_KB.
+// *launched stays false if the device cannot grant the LDS.
 template <bool Push>
 static ncclResult_t ncclAllToAllDdaFabricTdmDispatch(const void* sendbuff, void* recvbuff, size_t bytesPerRank,
                                                      ncclComm* comm, dda::common::FabricGpuBarrier barrierHost,
                                                      cudaStream_t stream, bool* launched) {
   switch (ddaAllToAllFabricTdmTileBytes()) {
   case 4 << 10:
-    return ncclAllToAllDdaFabricTdmLaunch<4 << 10, Push>(sendbuff, recvbuff, bytesPerRank, comm, barrierHost, stream,
-                                                         launched);
+    return ncclAllToAllDdaFabricTdmDispatchWindow<4 << 10, Push>(sendbuff, recvbuff, bytesPerRank, comm, barrierHost,
+                                                                 stream, launched);
   case 16 << 10:
-    return ncclAllToAllDdaFabricTdmLaunch<16 << 10, Push>(sendbuff, recvbuff, bytesPerRank, comm, barrierHost, stream,
-                                                          launched);
+    return ncclAllToAllDdaFabricTdmDispatchWindow<16 << 10, Push>(sendbuff, recvbuff, bytesPerRank, comm, barrierHost,
+                                                                  stream, launched);
   default:
-    return ncclAllToAllDdaFabricTdmLaunch<8 << 10, Push>(sendbuff, recvbuff, bytesPerRank, comm, barrierHost, stream,
-                                                         launched);
+    return ncclAllToAllDdaFabricTdmDispatchWindow<8 << 10, Push>(sendbuff, recvbuff, bytesPerRank, comm, barrierHost,
+                                                                 stream, launched);
   }
 }
 
@@ -327,7 +361,8 @@ uint32_t ncclAllToAllDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_
   const size_t bytes = count * ncclTypeSize(datatype);
   dim3 grid;
   if (ddaAllToAllFabricTdmEligible(comm, bytes)) {
-    grid = ddaAllToAllFabricTdmGeom(comm, bytes, ddaAllToAllFabricTdmTileBytes()).first;
+    grid = ddaAllToAllFabricTdmGeom(comm, bytes, ddaAllToAllFabricTdmTileBytes(), ddaAllToAllFabricTdmWindowBytes())
+             .first;
   } else if (rcclParamDdaA2APush()) {
     grid = ddaAllToAllFabricPushGeom(comm, bytes).first;
   } else {
