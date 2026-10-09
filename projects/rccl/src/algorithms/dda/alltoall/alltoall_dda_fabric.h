@@ -107,6 +107,21 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
     }
   }
 
+  // TODO : move these inside barrier
+  __syncthreads();
+
+#if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#if defined(__gfx1250__)
+  asm volatile("s_wait_loadcnt 0x0\n\ts_wait_storecnt 0x0");
+#else
+  asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)");
+#endif
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#else
+  __threadfence_system();
+#endif
+
   // Publish our remote writes. The drain below reads only with system-scope loads, so no acquire is needed.
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
                              true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 2);
