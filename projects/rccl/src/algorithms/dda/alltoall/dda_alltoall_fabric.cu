@@ -29,6 +29,8 @@
 RCCL_PARAM(DdaA2ATdm, "DDA_A2A_TDM", 0);
 // TDM tile size in KiB: 8 (x2 peers per warp, default), 16 (x1) or 4 (x4). Other values use 8.
 RCCL_PARAM(DdaA2ATdmTileKB, "DDA_A2A_TDM_TILE_KB", 8);
+// TDM warps per block before the block cap is reached (1..16). Fewer spreads the same warps over more CUs.
+RCCL_PARAM(DdaA2ATdmWarps, "DDA_A2A_TDM_WARPS", 16);
 // Push model: each rank writes its chunks into peers' scratch instead of reading from them. Env: RCCL_DDA_A2A_PUSH.
 RCCL_PARAM(DdaA2APush, "DDA_A2A_PUSH", 0);
 
@@ -78,14 +80,20 @@ static bool ddaAllToAllFabricTdmEligible(ncclComm* comm, size_t bytesPerRank) {
   return reinterpret_cast<uintptr_t>(comm->ddaScratch) % kDdaA2ATdmAlign == 0;
 }
 
-// Grid covers one warp per UnrollPeers (tile, peer) items, up to 16 warps per block and
-// the barrier's block cap. Depends only on count, so every rank launches the same grid.
+static inline uint32_t ddaAllToAllFabricTdmWarpsTarget() {
+  const int64_t w = rcclParamDdaA2ATdmWarps();
+  return (w >= 1 && w <= kDdaA2ATdmMaxWarpsPerBlock) ? static_cast<uint32_t>(w) : kDdaA2ATdmMaxWarpsPerBlock;
+}
+
+// Grid covers one warp per UnrollPeers (tile, peer) items. Blocks are sized for the
+// RCCL_DDA_A2A_TDM_WARPS target until the barrier's block cap is reached, then filled up to 16
+// warps. Depends only on count, so every rank launches the same grid.
 static inline std::pair<dim3, dim3> ddaAllToAllFabricTdmGeom(ncclComm* comm, size_t bytesPerRank, int tileBytes) {
   const size_t unrollPeers = kDdaA2ATdmWindowBytes / tileBytes;
   const size_t tilesPerPeer = (bytesPerRank + tileBytes - 1) / tileBytes;
   const size_t warpsNeeded = dda::common::divRoundUp(tilesPerPeer * comm->nRanks, unrollPeers);
   const uint32_t blocks =
-    dda::common::calcBlockCount(warpsNeeded, kDdaA2ATdmMaxWarpsPerBlock, comm->ddaFabricMaxBlocks);
+    dda::common::calcBlockCount(warpsNeeded, ddaAllToAllFabricTdmWarpsTarget(), comm->ddaFabricMaxBlocks);
   const uint32_t warpsPerBlock =
     std::min<uint32_t>(kDdaA2ATdmMaxWarpsPerBlock, dda::common::divRoundUp(warpsNeeded, blocks));
   return std::make_pair(dim3(blocks, 1, 1), dim3(warpsPerBlock * comm->WarpSize, 1, 1));
