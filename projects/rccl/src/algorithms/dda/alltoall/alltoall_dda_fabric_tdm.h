@@ -95,4 +95,122 @@ __launch_bounds__(512)
 #endif
 }
 
+// Push variant: this rank writes its chunk for every peer into that peer's scratch, then drains its own
+// scratch into recvbuff. Same (tile, peer) item split and per-warp LDS window as the pull kernel.
+//
+// Item k pushes to peer (self + k) and drains the slot of peer (self - k). Peer p's item k pushes to
+// (p + k), so the tile this rank drains under item k was written by the same item index on the peer;
+// the grid depends only on count, so that item sits in the same block and the per-block barrier pairs
+// the write with the read.
+template <int TileBytes, int UnrollPeers>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+  __global__ void ddaAllToAllFabricTdmPush(uint8_t* const* __restrict__ peerScratch, uint8_t* __restrict__ recvbuff,
+                                           const uint8_t* __restrict__ sendbuff, size_t bytesPerRank, int selfRank,
+                                           int nRanks, FabricGpuBarrier barrier) {
+  static_assert(TileBytes * UnrollPeers <= kDdaA2ATdmWindowBytes, "tiles overflow the per-warp LDS window");
+  static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
+#if TDM_SUPPORTED
+  const uint32_t flag = barrier.beginEpoch();
+
+  // Only local sendbuff is read before the next barrier, so no acquire is needed here.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
+                             true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 1);
+
+  extern __shared__ __attribute__((aligned(128))) uint8_t ddaA2ATdmSmem[];
+  // TDM descriptors live in SGPRs, so every address below must be wave-uniform.
+  const int lw = __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / warpSize));
+  uint8_t* win = ddaA2ATdmSmem + lw * kDdaA2ATdmWindowBytes;
+
+  const size_t tilesPerPeer = (bytesPerRank + TileBytes - 1) / TileBytes;
+  const size_t nItems = tilesPerPeer * nRanks;
+  const size_t warpsPerBlock = blockDim.x / warpSize;
+  const size_t nWarps = gridDim.x * warpsPerBlock;
+  const size_t firstItem = (blockIdx.x * warpsPerBlock + lw) * UnrollPeers;
+  const size_t itemStride = nWarps * UnrollPeers;
+  const size_t selfSlot = static_cast<size_t>(selfRank) * bytesPerRank;
+
+  for (size_t base = firstItem; base < nItems; base += itemStride) {
+#pragma unroll
+    for (int u = 0; u < UnrollPeers; ++u) {
+      const size_t item = base + u;
+      if (item < nItems) {
+        const int peer = (selfRank + static_cast<int>(item % nRanks)) % nRanks;
+        const size_t off = (item / nRanks) * TileBytes;
+        const size_t n = bytesPerRank - off < TileBytes ? bytesPerRank - off : TileBytes;
+        tdm::asyncLoadToLDS<SyncPolicy::Async, kDdaA2ATdmPolicy, /*Aligned=*/true>(
+          sendbuff + static_cast<size_t>(peer) * bytesPerRank + off, win + u * TileBytes, n);
+      }
+    }
+    tdm::tdmWait();
+#pragma unroll
+    for (int u = 0; u < UnrollPeers; ++u) {
+      const size_t item = base + u;
+      if (item < nItems) {
+        const int peer = (selfRank + static_cast<int>(item % nRanks)) % nRanks;
+        const size_t off = (item / nRanks) * TileBytes;
+        const size_t n = bytesPerRank - off < TileBytes ? bytesPerRank - off : TileBytes;
+        tdm::asyncStoreFromLDS<SyncPolicy::Async, kDdaA2ATdmPolicy, /*Aligned=*/true>(win + u * TileBytes,
+                                                                                      peerScratch[peer] + selfSlot + off, n);
+      }
+    }
+    tdm::tdmWait();
+  }
+
+  // TODO : move these inside barrier
+  __syncthreads();
+
+#if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#if defined(__gfx1250__)
+  asm volatile("s_wait_loadcnt 0x0\n\ts_wait_storecnt 0x0");
+#else
+  asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)");
+#endif
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#else
+  __threadfence_system();
+#endif
+
+  // Every TDM store above has drained (tdmWait), and they bypass L2, so no release fence is needed; the
+  // drain below reads only through TDM, which bypasses the cache too.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
+                             true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 2);
+
+  const uint8_t* selfScratch = peerScratch[selfRank];
+  for (size_t base = firstItem; base < nItems; base += itemStride) {
+#pragma unroll
+    for (int u = 0; u < UnrollPeers; ++u) {
+      const size_t item = base + u;
+      if (item < nItems) {
+        const int src = (selfRank - static_cast<int>(item % nRanks) + nRanks) % nRanks;
+        const size_t off = (item / nRanks) * TileBytes;
+        const size_t n = bytesPerRank - off < TileBytes ? bytesPerRank - off : TileBytes;
+        tdm::asyncLoadToLDS<SyncPolicy::Async, kDdaA2ATdmPolicy, /*Aligned=*/true>(
+          selfScratch + static_cast<size_t>(src) * bytesPerRank + off, win + u * TileBytes, n);
+      }
+    }
+    tdm::tdmWait();
+#pragma unroll
+    for (int u = 0; u < UnrollPeers; ++u) {
+      const size_t item = base + u;
+      if (item < nItems) {
+        const int src = (selfRank - static_cast<int>(item % nRanks) + nRanks) % nRanks;
+        const size_t off = (item / nRanks) * TileBytes;
+        const size_t n = bytesPerRank - off < TileBytes ? bytesPerRank - off : TileBytes;
+        tdm::asyncStoreFromLDS<SyncPolicy::Async, kDdaA2ATdmPolicy, /*Aligned=*/true>(
+          win + u * TileBytes, recvbuff + static_cast<size_t>(src) * bytesPerRank + off, n);
+      }
+    }
+    tdm::tdmWait();
+  }
+  barrier.endEpoch(flag + 2);
+#else
+  // Only dispatched on gfx1250; every other arch still has to compile this kernel.
+  (void)peerScratch, (void)recvbuff, (void)sendbuff, (void)bytesPerRank, (void)selfRank, (void)nRanks, (void)barrier;
+  __builtin_trap();
+#endif
+}
+
 } // namespace dda::common
