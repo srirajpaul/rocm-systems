@@ -16,6 +16,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -27,10 +28,24 @@ using nccl_dda_detail::DdaFabricBarrierState;
 // Flat all-reduce kernel below this size; tree kernel at or above it.
 constexpr size_t kDdaFlatTreeThresholdBytes = 1ULL << 18;
 
+static inline bool ddaAllReduceFabricUseTree(ncclComm* comm, size_t count, int typeSize) {
+  return count * typeSize > kDdaFlatTreeThresholdBytes && count % static_cast<size_t>(comm->nRanks) == 0;
+}
+
 // Single source of the launch geometry: grid/block for `count` elements of
-// `typeSize` bytes, capped at the init-time block count.
+// `typeSize` bytes, capped at the init-time block count. Each tree-kernel thread
+// covers one 16 B line of a shard (count / nRanks elements), so the tree grid is
+// sized on the shard; sizing it on count would launch blocks with no lines.
 static inline std::pair<dim3, dim3> ddaAllReduceFabricGeom(ncclComm* comm, size_t count, int typeSize) {
-  return dda::common::getGridAndBlockDims(count, typeSize, comm->ddaFabricMaxBlocks);
+  if (!ddaAllReduceFabricUseTree(comm, count, typeSize)) {
+    return dda::common::getGridAndBlockDims(count, typeSize, comm->ddaFabricMaxBlocks);
+  }
+  constexpr uint32_t kThreadsPerBlock = 512;
+  const size_t vecs = dda::common::divRoundUp(count / comm->nRanks * typeSize, sizeof(uint4));
+  const uint32_t blocks = dda::common::calcBlockCount(vecs, kThreadsPerBlock, comm->ddaFabricMaxBlocks);
+  const size_t warps = dda::common::divRoundUp(dda::common::divRoundUp(vecs, blocks), comm->WarpSize);
+  const uint32_t threads = std::min<uint32_t>(kThreadsPerBlock, static_cast<uint32_t>(warps * comm->WarpSize));
+  return std::make_pair(dim3(blocks, 1, 1), dim3(threads, 1, 1));
 }
 
 template <typename T>
