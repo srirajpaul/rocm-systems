@@ -41,15 +41,10 @@ using dda::common::kDdaA2ATdmAlign;
 using dda::common::kDdaA2ATdmMaxWarpsPerBlock;
 using dda::common::kDdaA2ATdmWindowBytes;
 
-// Single source of the launch geometry: grid/block for a byte payload. The
-// kernel is instantiated for int8_t, so `bytes` is the per-block element count.
-static inline std::pair<dim3, dim3> ddaAllToAllFabricGeom(ncclComm* comm, size_t bytes) {
-  return dda::common::getGridAndBlockDims(bytes, 1, comm->ddaFabricMaxBlocks);
-}
-
-// Push kernel: one 16 B vector per thread per peer, up to kDdaA2APushThreadsPerBlock threads.
-// Depends only on count, so every rank launches the same grid.
-static inline std::pair<dim3, dim3> ddaAllToAllFabricPushGeom(ncclComm* comm, size_t bytes) {
+// Vector push and pull kernels: one 16 B vector per thread per peer, up to kDdaA2APushThreadsPerBlock
+// threads. The kernels are instantiated for int8_t, so `bytes` is the per-rank chunk. Depends only on count,
+// so every rank launches the same grid.
+static inline std::pair<dim3, dim3> ddaAllToAllFabricVectorGeom(ncclComm* comm, size_t bytes) {
   const size_t vecs = dda::common::divRoundUp(bytes, sizeof(uint4));
   const uint32_t blocks =
     dda::common::calcBlockCount(vecs, dda::common::kDdaA2APushThreadsPerBlock, comm->ddaFabricMaxBlocks);
@@ -151,9 +146,9 @@ static ncclResult_t ncclAllToAllDdaFabricTdmLaunch(const void* sendbuff, void* r
       peerScratch, static_cast<uint8_t*>(recvbuff), static_cast<const uint8_t*>(sendbuff), bytesPerRank, comm->rank,
       comm->nRanks, barrierHost);
   } else {
-    (void)sendbuff;
     dda::common::ddaAllToAllFabricTdm<TileBytes, kUnrollPeers><<<grid, block, dynSmem, stream>>>(
-      peerScratch, static_cast<uint8_t*>(recvbuff), bytesPerRank, comm->rank, comm->nRanks, barrierHost);
+      peerScratch, static_cast<uint8_t*>(recvbuff), static_cast<const uint8_t*>(sendbuff), bytesPerRank, comm->rank,
+      comm->nRanks, barrierHost);
   }
   *launched = true;
   return ncclSuccess;
@@ -214,7 +209,7 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
       }
     }
 
-    auto gridBlock = ddaAllToAllFabricPushGeom(comm, count);
+    auto gridBlock = ddaAllToAllFabricVectorGeom(comm, count);
     const auto& grid = gridBlock.first;
     const auto& block = gridBlock.second;
 
@@ -239,13 +234,9 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
     return ncclSuccess;
   }
 
-  // Stage sendbuff into this rank's scratch before the peer exchange. A single
-  // host-launched cudaMemcpyAsync avoids the per-block in-kernel copy race on
-  // the fabric path.
-  CUDACHECK(cudaMemcpyAsync(comm->ddaScratch, sendbuff, totalBytes, cudaMemcpyDeviceToDevice, stream));
-
-  // count is already the byte count (kernel instantiated for int8_t).
-  if (ddaAllToAllFabricTdmEligible(comm, count) && ddaA2ATdmAligned(recvbuff)) {
+  // count is already the byte count (kernel instantiated for int8_t). The pull kernels stage sendbuff into
+  // this rank's scratch themselves.
+  if (ddaAllToAllFabricTdmEligible(comm, count) && ddaA2ATdmAligned(sendbuff) && ddaA2ATdmAligned(recvbuff)) {
     bool launched = false;
     NCCLCHECK(ncclAllToAllDdaFabricTdmDispatch<false>(sendbuff, recvbuff, count, comm, barrierHost, stream, &launched));
     if (launched) {
@@ -255,7 +246,7 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
   }
 
   // Use the block cap chosen at init (barrier flag buffer is sized for it).
-  auto gridBlock = ddaAllToAllFabricGeom(comm, count);
+  auto gridBlock = ddaAllToAllFabricVectorGeom(comm, count);
   const auto& grid = gridBlock.first;
   const auto& block = gridBlock.second;
 
@@ -264,16 +255,16 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
 
   switch (nRanks) {
   case 4:
-    dda::common::ddaAllToAllFabric<T, 4>
-      <<<grid, block, 0, stream>>>(d_ipcbuffs, static_cast<T*>(recvbuff), count, comm->rank, nRanks, barrierHost);
+    dda::common::ddaAllToAllFabric<T, 4><<<grid, block, 0, stream>>>(
+      d_ipcbuffs, static_cast<T*>(recvbuff), count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
     break;
   case 8:
-    dda::common::ddaAllToAllFabric<T, 8>
-      <<<grid, block, 0, stream>>>(d_ipcbuffs, static_cast<T*>(recvbuff), count, comm->rank, nRanks, barrierHost);
+    dda::common::ddaAllToAllFabric<T, 8><<<grid, block, 0, stream>>>(
+      d_ipcbuffs, static_cast<T*>(recvbuff), count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
     break;
   default:
-    dda::common::ddaAllToAllFabric<T, 0>
-      <<<grid, block, 0, stream>>>(d_ipcbuffs, static_cast<T*>(recvbuff), count, comm->rank, nRanks, barrierHost);
+    dda::common::ddaAllToAllFabric<T, 0><<<grid, block, 0, stream>>>(
+      d_ipcbuffs, static_cast<T*>(recvbuff), count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
     break;
   }
 
@@ -328,10 +319,8 @@ uint32_t ncclAllToAllDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_
   dim3 grid;
   if (ddaAllToAllFabricTdmEligible(comm, bytes)) {
     grid = ddaAllToAllFabricTdmGeom(comm, bytes, ddaAllToAllFabricTdmTileBytes()).first;
-  } else if (rcclParamDdaA2APush()) {
-    grid = ddaAllToAllFabricPushGeom(comm, bytes).first;
   } else {
-    grid = ddaAllToAllFabricGeom(comm, bytes).first;
+    grid = ddaAllToAllFabricVectorGeom(comm, bytes).first;
   }
   return grid.x * grid.y;
 }

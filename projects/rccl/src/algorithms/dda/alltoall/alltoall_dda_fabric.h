@@ -20,16 +20,44 @@
 
 namespace dda::common {
 
+constexpr int kDdaA2APushThreadsPerBlock = 1024;
+
+// Copies 16 B line idx of every rank slot from src to dst with system-scope b128 accesses, src slot r at
+// srcBase(r) and dst slot r at dstBase(r). The line helpers are compiler memory barriers, so every load of
+// a group is issued before its stores.
+template <int kUnroll, typename SrcBase, typename DstBase>
+__device__ __forceinline__ void ddaA2ASysCopyLines(int nRanks, size_t idxStart, size_t idxEnd, size_t idxStride,
+                                                   SrcBase srcBase, DstBase dstBase) {
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    for (int r0 = 0; r0 < nRanks; r0 += kUnroll) {
+      uint32_t w[kUnroll][4];
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        if (r0 + u < nRanks) {
+          ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(srcBase(r0 + u) + idx), w[u][0], w[u][1], w[u][2],
+                            w[u][3]);
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        if (r0 + u < nRanks) {
+          ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(dstBase(r0 + u) + idx), w[u][0], w[u][1], w[u][2], w[u][3]);
+        }
+      }
+    }
+  }
+}
+
+// Pull alltoall: each rank stages its sendbuff into its own scratch, then reads its slot out of every
+// peer's scratch into recvbuff. Every access is system-scope, so neither barrier needs a cache fence.
 template <typename T, int NRANKS_CT>
 #if defined(USE_ROCM)
-__launch_bounds__(512)
+__launch_bounds__(kDdaA2APushThreadsPerBlock)
 #endif
   __global__ void ddaAllToAllFabric(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
-                                    int selfRank, int nRanks, FabricGpuBarrier barrier) {
+                                    const T* __restrict__ sendbuff, int selfRank, int nRanks,
+                                    FabricGpuBarrier barrier) {
   const uint32_t flag = barrier.beginEpoch();
-
-  // Release-acquire barrier ensures the stream-ordered scratch write is visible to peers.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
 
   // use uint4 to do 16-byte loads to maximize memory efficiency. We assume
   // that count % countPerThread == 0, enforced before kernel launch.
@@ -45,22 +73,30 @@ __launch_bounds__(512)
   const auto idxEnd = countPerRank;
   const auto idxStride = gridDim.x * blockDim.x * countPerThread;
 
-  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
-#pragma unroll kUnroll
-    for (int r = 0; r < nRanksEff; ++r) {
-      int srcRank = r;
-      size_t srcIdx = idx + selfRank * idxEnd;
-      size_t destIdx = idx + r * idxEnd;
-      *reinterpret_cast<uint4*>(&recvbuff[destIdx]) = reinterpret_cast<const uint4*>(&ipcbuffs[srcRank][srcIdx])[0];
-    }
-  }
+  // Stage every slot of sendbuff into our scratch. Thread gtIdx on each peer later reads exactly the lines this
+  // thread writes (same grid on every rank), so the per-block barrier covers them. The previous op's closing
+  // barrier guarantees no peer is still reading our scratch.
+  T* selfScratch = ipcbuffs[selfRank];
+  ddaA2ASysCopyLines<kUnroll>(
+    nRanksEff, idxStart, idxEnd, idxStride, [&](int r) { return sendbuff + r * idxEnd; },
+    [&](int r) { return selfScratch + r * idxEnd; });
 
-  // barrier to ensure remote ranks won't free their buffers until I'm done
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>(flag + 2);
+  ddaFabricWaitMemOps();
+  // Publish the staged scratch; the reads below are system-scope, so no acquire is needed.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
+                             true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 1);
+
+  const size_t selfSlot = selfRank * idxEnd;
+  ddaA2ASysCopyLines<kUnroll>(
+    nRanksEff, idxStart, idxEnd, idxStride, [&](int r) { return ipcbuffs[r] + selfSlot; },
+    [&](int r) { return recvbuff + r * idxEnd; });
+
+  // Peers must not overwrite their scratch until every rank has read its slot; nothing is published here.
+  ddaFabricWaitMemOps();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */,
+                             true /* sysScopeWrites */>(flag + 2);
   barrier.endEpoch(flag + 2);
 }
-
-constexpr int kDdaA2APushThreadsPerBlock = 1024;
 
 template <typename T, int NRANKS_CT>
 #if defined(USE_ROCM)

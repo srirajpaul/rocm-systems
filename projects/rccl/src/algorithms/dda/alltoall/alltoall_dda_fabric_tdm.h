@@ -38,14 +38,12 @@ template <int TileBytes, int UnrollPeers>
 __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabricTdm(uint8_t* const* __restrict__ peerScratch, uint8_t* __restrict__ recvbuff,
-                                       size_t bytesPerRank, int selfRank, int nRanks, FabricGpuBarrier barrier) {
+                                       const uint8_t* __restrict__ sendbuff, size_t bytesPerRank, int selfRank,
+                                       int nRanks, FabricGpuBarrier barrier) {
   static_assert(TileBytes * UnrollPeers <= kDdaA2ATdmWindowBytes, "tiles overflow the per-warp LDS window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
   const uint32_t flag = barrier.beginEpoch();
-
-  // Release-acquire barrier ensures the stream-ordered scratch write is visible to peers.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
 
   extern __shared__ __attribute__((aligned(128))) uint8_t ddaA2ATdmSmem[];
   // TDM descriptors live in SGPRs, so every address below must be wave-uniform.
@@ -56,9 +54,47 @@ __launch_bounds__(512)
   const size_t nItems = tilesPerPeer * nRanks;
   const size_t warpsPerBlock = blockDim.x / warpSize;
   const size_t nWarps = gridDim.x * warpsPerBlock;
+  const size_t firstItem = (blockIdx.x * warpsPerBlock + lw) * UnrollPeers;
+  const size_t itemStride = nWarps * UnrollPeers;
   const size_t srcBase = static_cast<size_t>(selfRank) * bytesPerRank;
 
-  for (size_t base = (blockIdx.x * warpsPerBlock + lw) * UnrollPeers; base < nItems; base += nWarps * UnrollPeers) {
+  // Stage sendbuff into our scratch. Item k writes slot (self - k), the tile peer (self - k) reads from us
+  // under the same item index, so the per-block barrier pairs the write with the read. The previous op's
+  // closing barrier guarantees no peer is still reading our scratch.
+  uint8_t* selfScratch = peerScratch[selfRank];
+  for (size_t base = firstItem; base < nItems; base += itemStride) {
+#pragma unroll
+    for (int u = 0; u < UnrollPeers; ++u) {
+      const size_t item = base + u;
+      if (item < nItems) {
+        const size_t slot = static_cast<size_t>((selfRank - static_cast<int>(item % nRanks) + nRanks) % nRanks);
+        const size_t off = (item / nRanks) * TileBytes;
+        const size_t n = bytesPerRank - off < TileBytes ? bytesPerRank - off : TileBytes;
+        tdm::asyncLoadToLDS<SyncPolicy::Async, kDdaA2ATdmPolicy, /*Aligned=*/true>(sendbuff + slot * bytesPerRank + off,
+                                                                                   win + u * TileBytes, n);
+      }
+    }
+    tdm::tdmWait();
+#pragma unroll
+    for (int u = 0; u < UnrollPeers; ++u) {
+      const size_t item = base + u;
+      if (item < nItems) {
+        const size_t slot = static_cast<size_t>((selfRank - static_cast<int>(item % nRanks) + nRanks) % nRanks);
+        const size_t off = (item / nRanks) * TileBytes;
+        const size_t n = bytesPerRank - off < TileBytes ? bytesPerRank - off : TileBytes;
+        tdm::asyncStoreFromLDS<SyncPolicy::Async, kDdaA2ATdmPolicy, /*Aligned=*/true>(
+          win + u * TileBytes, selfScratch + slot * bytesPerRank + off, n);
+      }
+    }
+    tdm::tdmWait();
+  }
+
+  ddaFabricWaitMemOps();
+  // Publish the staged scratch; the reads below go through TDM, which bypasses the cache, so no acquire.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
+                             true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 1);
+
+  for (size_t base = firstItem; base < nItems; base += itemStride) {
 #pragma unroll
     for (int u = 0; u < UnrollPeers; ++u) {
       const size_t item = base + u;
@@ -85,12 +121,14 @@ __launch_bounds__(512)
     tdm::tdmWait();
   }
 
-  // barrier to ensure remote ranks won't free their buffers until I'm done
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>(flag + 2);
+  // Peers must not overwrite their scratch until every rank has read its slot; nothing is published here.
+  ddaFabricWaitMemOps();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */,
+                             true /* sysScopeWrites */>(flag + 2);
   barrier.endEpoch(flag + 2);
 #else
   // Only dispatched on gfx1250; every other arch still has to compile this kernel.
-  (void)peerScratch, (void)recvbuff, (void)bytesPerRank, (void)selfRank, (void)nRanks, (void)barrier;
+  (void)peerScratch, (void)recvbuff, (void)sendbuff, (void)bytesPerRank, (void)selfRank, (void)nRanks, (void)barrier;
   __builtin_trap();
 #endif
 }

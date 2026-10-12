@@ -26,6 +26,24 @@ namespace dda::common {
 // Note: LL scratch scales as 2 * nRanks * 16 MiB; at 144 ranks this is ~4.5 GiB per GPU.
 constexpr int kDdaMaxNranks = 144;
 
+// Waits for every load and store the block has issued to complete. Kernels that pass sysScopeWrites to
+// syncOnSameBlockIdx (no release fence) call it right before the barrier so their system-scope data
+// accesses are done before the flag is posted.
+__device__ __forceinline__ void ddaFabricWaitMemOps() {
+  __syncthreads();
+#if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#if defined(__gfx1250__)
+  asm volatile("s_wait_loadcnt 0x0\n\ts_wait_storecnt 0x0");
+#else
+  asm volatile("s_waitcnt lgkmcnt(0) vmcnt(0)");
+#endif
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#else
+  __threadfence_system();
+#endif
+}
+
 class FabricGpuBarrier;
 
 struct FabricGpuBarrierResources {
