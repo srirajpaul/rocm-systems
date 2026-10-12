@@ -297,6 +297,32 @@ __device__ __forceinline__ void ddaLLLoadLineB128(const uint32_t* src, uint32_t&
 #endif
 }
 
+// Copies 16 B line idx of every rank slot from src to dst with system-scope b128 accesses, src slot r at
+// srcBase(r) and dst slot r at dstBase(r). The line helpers are compiler memory barriers, so every load of
+// a group is issued before its stores.
+template <int kUnroll, typename SrcBase, typename DstBase>
+__device__ __forceinline__ void ddaSysCopyLines(int nRanks, size_t idxStart, size_t idxEnd, size_t idxStride,
+                                                SrcBase srcBase, DstBase dstBase) {
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+    for (int r0 = 0; r0 < nRanks; r0 += kUnroll) {
+      uint32_t w[kUnroll][4];
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        if (r0 + u < nRanks) {
+          ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(srcBase(r0 + u) + idx), w[u][0], w[u][1], w[u][2],
+                            w[u][3]);
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        if (r0 + u < nRanks) {
+          ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(dstBase(r0 + u) + idx), w[u][0], w[u][1], w[u][2], w[u][3]);
+        }
+      }
+    }
+  }
+}
+
 __device__ __forceinline__ uint32_t ddaGetLLEpochInc(const uint32_t* __restrict__ epochDev, int flatBlockId, uint32_t inc) {
   uint32_t flag = epochDev[flatBlockId] + inc;
   if (flag == 0u) flag = 2u; // skip 0 sentinel; keep bank parity

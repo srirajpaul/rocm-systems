@@ -75,8 +75,7 @@ static ncclResult_t ncclAllReduceDdaFabricTyped(const void* sendbuff, void* recv
        (nRanks == 4 || nRanks == 8) ? " (unrolled)" : " (runtime)");
 
   if (treeOk) {
-    CUDACHECK(cudaMemcpyAsync(comm->ddaScratch, sendbuff, count * sizeof(T), cudaMemcpyDeviceToDevice, stream));
-    // NRANKS_CT 4/8: unrolled CollCommon reduce; 0: runtime fallback.
+    // NRANKS_CT 4/8: unrolled reduce; 0: runtime fallback. The kernel stages sendbuff into scratch itself.
     switch (nRanks) {
     case 4:
       INFO(NCCL_COLL, "DDA fabric AllReduce: tree path, NRANKS_CT=4 (unrolled)");

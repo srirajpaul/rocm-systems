@@ -22,32 +22,6 @@ namespace dda::common {
 
 constexpr int kDdaA2APushThreadsPerBlock = 1024;
 
-// Copies 16 B line idx of every rank slot from src to dst with system-scope b128 accesses, src slot r at
-// srcBase(r) and dst slot r at dstBase(r). The line helpers are compiler memory barriers, so every load of
-// a group is issued before its stores.
-template <int kUnroll, typename SrcBase, typename DstBase>
-__device__ __forceinline__ void ddaA2ASysCopyLines(int nRanks, size_t idxStart, size_t idxEnd, size_t idxStride,
-                                                   SrcBase srcBase, DstBase dstBase) {
-  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
-    for (int r0 = 0; r0 < nRanks; r0 += kUnroll) {
-      uint32_t w[kUnroll][4];
-#pragma unroll
-      for (int u = 0; u < kUnroll; ++u) {
-        if (r0 + u < nRanks) {
-          ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(srcBase(r0 + u) + idx), w[u][0], w[u][1], w[u][2],
-                            w[u][3]);
-        }
-      }
-#pragma unroll
-      for (int u = 0; u < kUnroll; ++u) {
-        if (r0 + u < nRanks) {
-          ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(dstBase(r0 + u) + idx), w[u][0], w[u][1], w[u][2], w[u][3]);
-        }
-      }
-    }
-  }
-}
-
 // Pull alltoall: each rank stages its sendbuff into its own scratch, then reads its slot out of every
 // peer's scratch into recvbuff. Every access is system-scope, so neither barrier needs a cache fence.
 template <typename T, int NRANKS_CT>
@@ -77,7 +51,7 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
   // thread writes (same grid on every rank), so the per-block barrier covers them. The previous op's closing
   // barrier guarantees no peer is still reading our scratch.
   T* selfScratch = ipcbuffs[selfRank];
-  ddaA2ASysCopyLines<kUnroll>(
+  ddaSysCopyLines<kUnroll>(
     nRanksEff, idxStart, idxEnd, idxStride, [&](int r) { return sendbuff + r * idxEnd; },
     [&](int r) { return selfScratch + r * idxEnd; });
 
@@ -87,7 +61,7 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
                              true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 1);
 
   const size_t selfSlot = selfRank * idxEnd;
-  ddaA2ASysCopyLines<kUnroll>(
+  ddaSysCopyLines<kUnroll>(
     nRanksEff, idxStart, idxEnd, idxStride, [&](int r) { return ipcbuffs[r] + selfSlot; },
     [&](int r) { return recvbuff + r * idxEnd; });
 
