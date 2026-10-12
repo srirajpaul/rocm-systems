@@ -24,11 +24,8 @@
 namespace dda::common {
 
 constexpr int kDdaA2ATdmMaxWarpsPerBlock = 16;
-// Default per-warp LDS window (TileBytes * UnrollPeers); larger windows keep more tiles in flight per warp.
+// Every tile shape fills the same window, so the LDS grant depends only on the warp count.
 constexpr int kDdaA2ATdmWindowBytes = 16 << 10;
-constexpr int kDdaA2ATdmMaxWindowBytes = 64 << 10;
-// Dynamic LDS granted per block. A block's warps share it, so larger windows mean fewer warps per block.
-constexpr int kDdaA2ATdmMaxDynSmem = kDdaA2ATdmMaxWarpsPerBlock * kDdaA2ATdmWindowBytes;
 // Chunk offsets and recvbuff must be this aligned so every transfer is whole 256 B rows.
 constexpr size_t kDdaA2ATdmAlign = 256;
 
@@ -42,8 +39,7 @@ __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabricTdm(uint8_t* const* __restrict__ peerScratch, uint8_t* __restrict__ recvbuff,
                                        size_t bytesPerRank, int selfRank, int nRanks, FabricGpuBarrier barrier) {
-  constexpr int kWindowBytes = TileBytes * UnrollPeers;
-  static_assert(kWindowBytes <= kDdaA2ATdmMaxWindowBytes, "tiles overflow the per-warp LDS window");
+  static_assert(TileBytes * UnrollPeers <= kDdaA2ATdmWindowBytes, "tiles overflow the per-warp LDS window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
   const uint32_t flag = barrier.beginEpoch();
@@ -54,7 +50,7 @@ __launch_bounds__(512)
   extern __shared__ __attribute__((aligned(128))) uint8_t ddaA2ATdmSmem[];
   // TDM descriptors live in SGPRs, so every address below must be wave-uniform.
   const int lw = __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / warpSize));
-  uint8_t* win = ddaA2ATdmSmem + lw * kWindowBytes;
+  uint8_t* win = ddaA2ATdmSmem + lw * kDdaA2ATdmWindowBytes;
 
   const size_t tilesPerPeer = (bytesPerRank + TileBytes - 1) / TileBytes;
   const size_t nItems = tilesPerPeer * nRanks;
@@ -113,8 +109,7 @@ __launch_bounds__(512)
   __global__ void ddaAllToAllFabricTdmPush(uint8_t* const* __restrict__ peerScratch, uint8_t* __restrict__ recvbuff,
                                            const uint8_t* __restrict__ sendbuff, size_t bytesPerRank, int selfRank,
                                            int nRanks, FabricGpuBarrier barrier) {
-  constexpr int kWindowBytes = TileBytes * UnrollPeers;
-  static_assert(kWindowBytes <= kDdaA2ATdmMaxWindowBytes, "tiles overflow the per-warp LDS window");
+  static_assert(TileBytes * UnrollPeers <= kDdaA2ATdmWindowBytes, "tiles overflow the per-warp LDS window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
   const uint32_t flag = barrier.beginEpoch();
@@ -126,7 +121,7 @@ __launch_bounds__(512)
   extern __shared__ __attribute__((aligned(128))) uint8_t ddaA2ATdmSmem[];
   // TDM descriptors live in SGPRs, so every address below must be wave-uniform.
   const int lw = __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / warpSize));
-  uint8_t* win = ddaA2ATdmSmem + lw * kWindowBytes;
+  uint8_t* win = ddaA2ATdmSmem + lw * kDdaA2ATdmWindowBytes;
 
   const size_t tilesPerPeer = (bytesPerRank + TileBytes - 1) / TileBytes;
   const size_t nItems = tilesPerPeer * nRanks;
