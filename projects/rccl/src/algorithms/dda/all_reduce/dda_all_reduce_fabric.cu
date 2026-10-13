@@ -8,35 +8,22 @@
 
 #include "algorithms/dda/device/CollCommon.h"
 #include "algorithms/dda/all_reduce/all_reduce_dda_fabric.h"
-#include "algorithms/dda/all_reduce/all_reduce_dda_fabric_tdm.h"
-#include "archinfo.h"
 #include "checks.h"
 #include "comm.h"
 #include "debug.h"
 #include "algorithms/dda/dda_init_detail.h"
 #include "algorithms/dda/fabric/fabric_gpu_barrier.h"
-#include "param.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
 
-// Move the fabric all-reduce through LDS with the gfx1250 Tensor Data Mover. Opt-in. Env: RCCL_DDA_AR_TDM.
-RCCL_PARAM(DdaArTdm, "DDA_AR_TDM", 0);
-// TDM warps per block before the block cap is reached (1..16); fewer spreads the same warps over more CUs.
-RCCL_PARAM(DdaArTdmWarps, "DDA_AR_TDM_WARPS", 16);
-
 namespace {
 
 using nccl_dda_detail::DdaFabricBarrierState;
-using dda::common::kDdaArTdmAlign;
-using dda::common::kDdaArTdmMaxDynSmem;
-using dda::common::kDdaArTdmMaxWarpsPerBlock;
-using dda::common::kDdaArTdmWindowBytes;
 
 // Flat all-reduce kernel below this size; tree kernel at or above it.
 constexpr size_t kDdaFlatTreeThresholdBytes = 1ULL << 18;
@@ -59,124 +46,6 @@ static inline std::pair<dim3, dim3> ddaAllReduceFabricGeom(ncclComm* comm, size_
   const size_t warps = dda::common::divRoundUp(dda::common::divRoundUp(vecs, blocks), comm->WarpSize);
   const uint32_t threads = std::min<uint32_t>(kThreadsPerBlock, static_cast<uint32_t>(warps * comm->WarpSize));
   return std::make_pair(dim3(blocks, 1, 1), dim3(threads, 1, 1));
-}
-
-// A warp keeps one tile per rank in its window, so the tile is the largest power of two with
-// tile * nRanks <= window, at least 1 KiB. 0 means the clique is too large for the TDM kernels.
-static inline int ddaAllReduceFabricTdmTileBytes(int nRanks) {
-  if (nRanks <= 4) return 4 << 10;
-  if (nRanks <= 8) return 2 << 10;
-  if (nRanks <= 16) return 1 << 10;
-  return 0;
-}
-
-static inline bool ddaArTdmAligned(const void* p) {
-  return reinterpret_cast<uintptr_t>(p) % kDdaArTdmAlign == 0;
-}
-
-// Everything but sendbuff/recvbuff alignment, which the block-count report cannot see.
-static bool ddaAllReduceFabricTdmEligible(ncclComm* comm, size_t count, int typeSize) {
-  if (!rcclParamDdaArTdm()) return false;
-  if (!TDM_TOOLCHAIN_AVAILABLE || comm->archName == nullptr || !IsArchMatch(comm->archName, "gfx1250")) return false;
-  // The kernels are bounded to 512 threads, i.e. 16 wave32 warps.
-  if (comm->WarpSize * kDdaArTdmMaxWarpsPerBlock > 512) return false;
-  if (ddaAllReduceFabricTdmTileBytes(comm->nRanks) == 0) return false;
-  const size_t regionBytes =
-    ddaAllReduceFabricUseTree(comm, count, typeSize) ? count / comm->nRanks * typeSize : count * typeSize;
-  if (regionBytes % kDdaArTdmAlign != 0) return false;
-  return ddaArTdmAligned(comm->ddaScratch);
-}
-
-// One warp per tile (of a shard on the tree path, of the whole buffer on the flat path). Blocks are sized for
-// the RCCL_DDA_AR_TDM_WARPS target until the block cap is reached, then filled up to 16 warps. Depends only on
-// count, so every rank launches the same grid.
-static inline std::pair<dim3, dim3> ddaAllReduceFabricTdmGeom(ncclComm* comm, size_t count, int typeSize) {
-  const int tileBytes = ddaAllReduceFabricTdmTileBytes(comm->nRanks);
-  const size_t regionBytes =
-    ddaAllReduceFabricUseTree(comm, count, typeSize) ? count / comm->nRanks * typeSize : count * typeSize;
-  const size_t nTiles = dda::common::divRoundUp(regionBytes, tileBytes);
-  const int64_t w = rcclParamDdaArTdmWarps();
-  const uint32_t target =
-    (w >= 1 && w <= kDdaArTdmMaxWarpsPerBlock) ? static_cast<uint32_t>(w) : kDdaArTdmMaxWarpsPerBlock;
-  const uint32_t blocks = dda::common::calcBlockCount(nTiles, target, comm->ddaFabricMaxBlocks);
-  const uint32_t warpsPerBlock =
-    std::min<uint32_t>(kDdaArTdmMaxWarpsPerBlock, dda::common::divRoundUp(nTiles, blocks));
-  return std::make_pair(dim3(blocks, 1, 1), dim3(warpsPerBlock * comm->WarpSize, 1, 1));
-}
-
-// Raise the kernel's dynamic LDS cap once per device. Returns false if the device cannot grant it.
-template <auto Kernel>
-static bool ddaAllReduceFabricTdmPrepare(int cudaDev) {
-  constexpr int kMaxDevs = 64;
-  static std::atomic<int8_t> state[kMaxDevs]; // 0 unknown, 1 ready, -1 unavailable
-  const bool cached = cudaDev >= 0 && cudaDev < kMaxDevs;
-  if (cached && state[cudaDev].load(std::memory_order_acquire) != 0) return state[cudaDev].load() > 0;
-
-  int optin = 0;
-  bool ok = cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, cudaDev) == cudaSuccess &&
-            optin >= kDdaArTdmMaxDynSmem &&
-            cudaFuncSetAttribute(reinterpret_cast<const void*>(Kernel), cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 kDdaArTdmMaxDynSmem) == cudaSuccess;
-  if (!ok) {
-    (void)cudaGetLastError();
-    WARN("DDA fabric AllReduce: TDM path needs %d B of dynamic LDS (device opt-in %d B); using the vector kernel",
-         kDdaArTdmMaxDynSmem, optin);
-  }
-  if (cached) state[cudaDev].store(ok ? 1 : -1, std::memory_order_release);
-  return ok;
-}
-
-template <typename T, int TileBytes, bool Tree>
-static ncclResult_t ncclAllReduceDdaFabricTdmLaunch(const void* sendbuff, void* recvbuff, size_t count,
-                                                    ncclComm* comm, dda::common::FabricGpuBarrier barrierHost,
-                                                    cudaStream_t stream, bool* launched) {
-  *launched = false;
-  bool ready;
-  if constexpr (Tree) {
-    ready = ddaAllReduceFabricTdmPrepare<&dda::common::ddaAllReduceTreeFabricTdm<T, TileBytes>>(comm->cudaDev);
-  } else {
-    ready = ddaAllReduceFabricTdmPrepare<&dda::common::ddaAllReduceFlatFabricTdm<T, TileBytes>>(comm->cudaDev);
-  }
-  if (!ready) return ncclSuccess;
-
-  auto gridBlock = ddaAllReduceFabricTdmGeom(comm, count, sizeof(T));
-  const auto& grid = gridBlock.first;
-  const auto& block = gridBlock.second;
-  const size_t dynSmem = (block.x / comm->WarpSize) * kDdaArTdmWindowBytes;
-  const size_t bytes = count * sizeof(T);
-
-  INFO(NCCL_COLL, "DDA fabric AllReduce: launching TDM %s kernel: nRanks=%d bytes=%zu tile=%d grid=%u block=%u lds=%zu",
-       Tree ? "tree (two-shot)" : "flat (one-shot)", comm->nRanks, bytes, TileBytes, grid.x, block.x, dynSmem);
-
-  auto* peers = reinterpret_cast<uint8_t* const*>(comm->ddaPeerPtrsDev);
-  if constexpr (Tree) {
-    dda::common::ddaAllReduceTreeFabricTdm<T, TileBytes><<<grid, block, dynSmem, stream>>>(
-      peers, static_cast<uint8_t*>(recvbuff), bytes, static_cast<const uint8_t*>(sendbuff), comm->rank, comm->nRanks,
-      barrierHost);
-  } else {
-    dda::common::ddaAllReduceFlatFabricTdm<T, TileBytes><<<grid, block, dynSmem, stream>>>(
-      peers, static_cast<uint8_t*>(recvbuff), bytes, static_cast<const uint8_t*>(sendbuff), comm->rank, comm->nRanks,
-      barrierHost);
-  }
-  *launched = true;
-  return ncclSuccess;
-}
-
-template <typename T, bool Tree>
-static ncclResult_t ncclAllReduceDdaFabricTdmDispatch(const void* sendbuff, void* recvbuff, size_t count,
-                                                      ncclComm* comm, dda::common::FabricGpuBarrier barrierHost,
-                                                      cudaStream_t stream, bool* launched) {
-  switch (ddaAllReduceFabricTdmTileBytes(comm->nRanks)) {
-  case 4 << 10:
-    return ncclAllReduceDdaFabricTdmLaunch<T, 4 << 10, Tree>(sendbuff, recvbuff, count, comm, barrierHost, stream,
-                                                             launched);
-  case 2 << 10:
-    return ncclAllReduceDdaFabricTdmLaunch<T, 2 << 10, Tree>(sendbuff, recvbuff, count, comm, barrierHost, stream,
-                                                             launched);
-  default:
-    return ncclAllReduceDdaFabricTdmLaunch<T, 1 << 10, Tree>(sendbuff, recvbuff, count, comm, barrierHost, stream,
-                                                             launched);
-  }
 }
 
 template <typename T>
@@ -209,20 +78,6 @@ static ncclResult_t ncclAllReduceDdaFabricTyped(const void* sendbuff, void* recv
 
   auto* barrierState = static_cast<DdaFabricBarrierState*>(comm->ddaFabricBarrierState);
   dda::common::FabricGpuBarrier barrierHost = barrierState->barrierHost;
-
-  if (ddaAllReduceFabricTdmEligible(comm, count, sizeof(T)) && ddaArTdmAligned(sendbuff) && ddaArTdmAligned(recvbuff)) {
-    bool launched = false;
-    const ncclResult_t res =
-      treeOk ? ncclAllReduceDdaFabricTdmDispatch<T, true>(sendbuff, recvbuff, count, comm, barrierHost, stream,
-                                                          &launched) :
-               ncclAllReduceDdaFabricTdmDispatch<T, false>(sendbuff, recvbuff, count, comm, barrierHost, stream,
-                                                           &launched);
-    NCCLCHECK(res);
-    if (launched) {
-      CUDACHECK(cudaGetLastError());
-      return ncclSuccess;
-    }
-  }
 
   void* peerPtrsDev = comm->ddaPeerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
@@ -336,10 +191,7 @@ bool ncclAllReduceDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* 
 }
 
 uint32_t ncclAllReduceDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_t datatype) {
-  const int typeSize = ncclTypeSize(datatype);
-  const auto grid = ddaAllReduceFabricTdmEligible(comm, count, typeSize) ?
-                      ddaAllReduceFabricTdmGeom(comm, count, typeSize).first :
-                      ddaAllReduceFabricGeom(comm, count, typeSize).first;
+  const auto grid = ddaAllReduceFabricGeom(comm, count, ncclTypeSize(datatype)).first;
   return grid.x * grid.y;
 }
 
