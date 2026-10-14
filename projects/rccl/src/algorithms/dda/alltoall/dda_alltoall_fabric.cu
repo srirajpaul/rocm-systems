@@ -33,6 +33,9 @@ RCCL_PARAM(DdaA2ATdmTileKB, "DDA_A2A_TDM_TILE_KB", 8);
 RCCL_PARAM(DdaA2ATdmWarps, "DDA_A2A_TDM_WARPS", 16);
 // Push model: each rank writes its chunks into peers' scratch instead of reading from them. Env: RCCL_DDA_A2A_PUSH.
 RCCL_PARAM(DdaA2APush, "DDA_A2A_PUSH", 0);
+// Vector push/pull threads per block before the block cap is reached (one warp .. 1024). Fewer spreads the same
+// threads over more CUs.
+RCCL_PARAM(DdaA2AThreads, "DDA_A2A_THREADS", 256);
 
 namespace {
 
@@ -41,13 +44,17 @@ using dda::common::kDdaA2ATdmAlign;
 using dda::common::kDdaA2ATdmMaxWarpsPerBlock;
 using dda::common::kDdaA2ATdmWindowBytes;
 
-// Vector push and pull kernels: one 16 B vector per thread per peer, up to kDdaA2APushThreadsPerBlock
-// threads. The kernels are instantiated for int8_t, so `bytes` is the per-rank chunk. Depends only on count,
-// so every rank launches the same grid.
+// Vector push and pull kernels: one 16 B vector per thread per peer. Blocks are sized for the
+// RCCL_DDA_A2A_THREADS target until the block cap is reached, then filled up to kDdaA2APushThreadsPerBlock.
+// The kernels are instantiated for int8_t, so `bytes` is the per-rank chunk. Depends only on count, so every
+// rank launches the same grid.
 static inline std::pair<dim3, dim3> ddaAllToAllFabricVectorGeom(ncclComm* comm, size_t bytes) {
   const size_t vecs = dda::common::divRoundUp(bytes, sizeof(uint4));
-  const uint32_t blocks =
-    dda::common::calcBlockCount(vecs, dda::common::kDdaA2APushThreadsPerBlock, comm->ddaFabricMaxBlocks);
+  const int64_t t = rcclParamDdaA2AThreads();
+  const uint32_t target = (t >= comm->WarpSize && t <= dda::common::kDdaA2APushThreadsPerBlock) ?
+                            static_cast<uint32_t>(t) :
+                            static_cast<uint32_t>(dda::common::kDdaA2APushThreadsPerBlock);
+  const uint32_t blocks = dda::common::calcBlockCount(vecs, target, comm->ddaFabricMaxBlocks);
   const size_t warps = dda::common::divRoundUp(dda::common::divRoundUp(vecs, blocks), comm->WarpSize);
   const uint32_t threads =
     std::min<uint32_t>(dda::common::kDdaA2APushThreadsPerBlock, static_cast<uint32_t>(warps * comm->WarpSize));
