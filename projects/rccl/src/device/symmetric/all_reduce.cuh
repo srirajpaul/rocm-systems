@@ -16,6 +16,83 @@
 #endif
 #include <stdio.h>
 
+// Rank count and per-thread footprint up to which allreduceDeep holds every rank's tile in registers so it
+// can load the next tile before storing the current one.
+constexpr int ncclSymkArPrefetchMaxRanks = 8;
+constexpr int ncclSymkArPrefetchMaxBytes = 128;
+
+// The allreduceDeep loop with the next tile's loads issued before the current tile's stores. The wait counter
+// is in order across loads and stores, so loads issued after the stores could not be consumed until every
+// store had completed. Dispatches down to NRanks == nRanks so the rank loops have a compile-time count.
+template <int BytePerPack, int UnrollPacks, int NRanks, typename T, typename Red>
+static __device__ __forceinline__ void allreduceDeepPrefetch(int nRanks, int rank, int lsaShift,
+                                                             ncclLsaPointerGetter<BytePack<BytePerPack>> inLsa,
+                                                             ncclLsaPointerGetter<BytePack<BytePerPack>> outLsa,
+                                                             Red red, int tn, int t, int32_t nIters) {
+  if NCCL_IF_CONSTEXPR (NRanks > 1) {
+    if (nRanks < NRanks) {
+      allreduceDeepPrefetch<BytePerPack, UnrollPacks, NRanks - 1, T>(nRanks, rank, lsaShift, inLsa, outLsa, red, tn,
+                                                                     t, nIters);
+      return;
+    }
+  }
+  using Pack = BytePack<BytePerPack>;
+  using Acc = typename Red::EltType;
+  using AccPack = BytePack<BytePerPack * sizeof(Acc) / sizeof(T)>;
+  int const wn = tn / WARP_SIZE;
+  int const w = t / WARP_SIZE;
+  intptr_t const step = intptr_t(wn) * UnrollPacks * WARP_SIZE;
+
+  // LSA slot of the k-th rank in reduction order, starting from our own.
+  int slot[NRanks];
+  NVCC_PRAGMA_UNROLL(NRanks)
+  for (int k = 0; k < NRanks; k++) {
+    int r = rank + k;
+    if (r >= NRanks) r -= NRanks;
+    slot[k] = lsaShift + r;
+  }
+
+  Pack in[NRanks][UnrollPacks];
+  int i = w;
+  if (i < nIters) {
+    NVCC_PRAGMA_UNROLL(NRanks)
+    for (int k = 0; k < NRanks; k++) {
+      NVCC_PRAGMA_UNROLL(UnrollPacks)
+      for (int u = 0; u < UnrollPacks; u++) in[k][u] = inLsa(slot[k])[u * WARP_SIZE];
+    }
+  }
+  NVCC_PRAGMA_UNROLL_DISABLED
+  while (i < nIters) {
+    Pack out[UnrollPacks];
+    NVCC_PRAGMA_UNROLL(UnrollPacks)
+    for (int u = 0; u < UnrollPacks; u++) {
+      AccPack acc = applyCast<T, Acc>(in[0][u]);
+      NVCC_PRAGMA_UNROLL(NRanks)
+      for (int k = 1; k < NRanks; k++) acc = applyReduce(red, acc, applyCast<T, Acc>(in[k][u]));
+      out[u] = applyCast<Acc, T>(acc);
+    }
+
+    // The inputs are consumed, so the next tile's loads can reuse their registers.
+    bool const more = i + wn < nIters;
+    inLsa.base = (Pack*)inLsa.base + step;
+    if (more) {
+      NVCC_PRAGMA_UNROLL(NRanks)
+      for (int k = 0; k < NRanks; k++) {
+        NVCC_PRAGMA_UNROLL(UnrollPacks)
+        for (int u = 0; u < UnrollPacks; u++) in[k][u] = inLsa(slot[k])[u * WARP_SIZE];
+      }
+    }
+
+    NVCC_PRAGMA_UNROLL(NRanks)
+    for (int k = 0; k < NRanks; k++) {
+      NVCC_PRAGMA_UNROLL(UnrollPacks)
+      for (int u = 0; u < UnrollPacks; u++) outLsa(slot[k])[u * WARP_SIZE] = out[u];
+    }
+    outLsa.base = (Pack*)outLsa.base + step;
+    i += wn;
+  }
+}
+
 template <int BytePerPack, int UnrollPacks, int UnrollPeers, typename T, bool EnableTma, typename Red>
 static __device__ __forceinline__ void allreduceDeep(ncclSymkArgsHandler const& handler, int tn, int t, bool waitNeeded,
                                                      ncclLsaBarrierSession<ncclCoopCta>& bar, Red red,
@@ -48,6 +125,17 @@ static __device__ __forceinline__ void allreduceDeep(ncclSymkArgsHandler const& 
   ncclLsaPointerGetter<Pack> inLsa(inpPacks);
   ncclLsaPointerGetter<Pack> outLsa(outPacks);
   int const lsaShift = handler.comm.lsaRank - rank;
+
+  constexpr bool CanPrefetch = !EnableTma && BytePerPack > 0 &&
+                               ncclSymkArPrefetchMaxRanks * UnrollPacks * BytePerPack <= ncclSymkArPrefetchMaxBytes;
+  if NCCL_IF_CONSTEXPR (CanPrefetch) {
+    if (nRanks <= ncclSymkArPrefetchMaxRanks) {
+      if (waitNeeded) bar.wait(ncclCoopCta(), cuda::memory_order_acquire);
+      allreduceDeepPrefetch<BytePerPack, UnrollPacks, ncclSymkArPrefetchMaxRanks, T>(nRanks, rank, lsaShift, inLsa,
+                                                                                     outLsa, red, tn, t, nIters);
+      return;
+    }
+  }
 
   Pack acc0[UnrollPacks];
 
