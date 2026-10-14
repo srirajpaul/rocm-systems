@@ -42,4 +42,35 @@ __launch_bounds__(512)
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
 }
 
+// Symmetric-memory variant of ddaAllGatherIpc. Same data-movement structure
+// (publish own chunk -> barrier -> gather all chunks -> barrier), kept as a
+// separate kernel so the symmetric path can diverge from the plain IPC path
+// without disturbing it.
+template <typename T, int NRANKS, bool hasAcc>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+  __global__ void ddaAllGatherIpcSymm(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
+                                      const T* __restrict__ sendbuff, int selfRank, IpcGpuBarrier barrier) {
+
+  const size_t countPerRank = count;
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
+
+  const auto idxStart = gtIdx * countPerThread;
+  const auto idxEnd = countPerRank;
+  const auto idxStride = gridDim.x * blockDim.x * countPerThread;
+
+  // It is expensive to launch hipMemcpyAsync on ROCm
+  // Move data copy here. Each block copies part of sendbuff data
+  copyFromSrcToDest<T>(sendbuff, ipcbuffs[selfRank], idxStart, idxEnd, idxStride);
+
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+
+  allGather<T, NRANKS>(ipcbuffs, recvbuff, selfRank, NRANKS, idxStart, idxEnd, idxStride, false);
+
+  // barrier to ensure remote ranks won't free their buffers until I'm done
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
+}
+
 } // namespace dda::common
