@@ -344,4 +344,95 @@ __launch_bounds__(512)
 #endif
 }
 
+// Pipelined peer-major TDM push: the block roles and parts of ddaAllToAllFabricTdmPushPeer, with each part cut into
+// `pieces` pieces of whole tiles and a ready flag per piece in place of the barrier between push and drain, as
+// ddaAllToAllFabricPushPeerPipe does with vector copies. Step i pushes piece i, then waits for the source's piece
+// i - 1 and drains it, then posts piece i's flag; a final step drains the last piece. The source is the peer this
+// block pushes to, (self + k): the block drains the slot that peer's block with offset nRanks - k (same part) wrote,
+// and each warp drains exactly the tiles it pushed, so the kernel runs in place. Piece i's flag is epoch
+// flag + 2 + i in the slot this block owns at the peer; every wave polls the flag itself. The entry barrier stays a
+// full barrier. gridDim.x must be a multiple of nRanks.
+template <int TileBytes, int UnrollTiles>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+  __global__ void ddaAllToAllFabricTdmPushPeerPipe(uint8_t* const* __restrict__ peerScratch, uint8_t* recvbuff,
+                                                   const uint8_t* sendbuff, size_t bytesPerRank, int selfRank,
+                                                   int nRanks, FabricGpuBarrier barrier, size_t partTiles,
+                                                   int pieces) {
+  static_assert(TileBytes * UnrollTiles <= kDdaA2ATdmWindowBytes, "tiles overflow the per-warp LDS window");
+  static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
+#if TDM_SUPPORTED
+  const uint32_t flag = barrier.beginEpoch();
+  // Only local sendbuff is read before the next barrier, so no acquire is needed here.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
+                             true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 1);
+
+  extern __shared__ __attribute__((aligned(128))) uint8_t ddaA2ATdmSmem[];
+  // TDM descriptors live in SGPRs, so every address below must be wave-uniform.
+  const int lw = __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / warpSize));
+  uint8_t* win = ddaA2ATdmSmem + lw * kDdaA2ATdmWindowBytes;
+
+  const size_t nParts = gridDim.x / nRanks;
+  const int k = static_cast<int>(blockIdx.x / nParts);
+  const size_t part = blockIdx.x % nParts;
+  const size_t tilesPerPeer = (bytesPerRank + TileBytes - 1) / TileBytes;
+  const size_t tileBegin = part * partTiles;
+  const size_t tileEnd = tileBegin + partTiles < tilesPerPeer ? tileBegin + partTiles : tilesPerPeer;
+  const size_t warpOff = static_cast<size_t>(lw) * UnrollTiles;
+  const size_t stride = (blockDim.x / warpSize) * UnrollTiles;
+
+  const int peer = (selfRank + k) % nRanks;
+  uint8_t* dst = (k == 0 ? recvbuff : peerScratch[peer]) + static_cast<size_t>(selfRank) * bytesPerRank;
+  const uint8_t* src = sendbuff + static_cast<size_t>(peer) * bytesPerRank;
+
+  if (k == 0 || tileBegin >= tileEnd) {
+    // Own chunk (no remote write, no drain; in place it is already in recvbuff) or an empty part: nothing to signal
+    // or wait for.
+    if (tileBegin < tileEnd && dst != src) {
+      ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(dst, src, bytesPerRank, tileBegin + warpOff, tileEnd, stride, win);
+    }
+    barrier.endEpoch(flag + 1 + pieces);
+    return;
+  }
+
+  const size_t pieceTiles = (tileEnd - tileBegin + pieces - 1) / pieces;
+  auto pieceBegin = [&](int i) {
+    const size_t b = tileBegin + static_cast<size_t>(i) * pieceTiles;
+    return b < tileEnd ? b : tileEnd;
+  };
+  const size_t srcOff = static_cast<size_t>(peer) * bytesPerRank;
+  const uint8_t* drainSrc = peerScratch[selfRank] + srcOff;
+  uint8_t* drainDst = recvbuff + srcOff;
+  const FabricGpuBarrier::FlagType* ready = barrier.peerFlag(peer, static_cast<int>((nRanks - k) * nParts + part));
+
+  for (int i = 0; i <= pieces; ++i) {
+    if (i < pieces) {
+      ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(dst, src, bytesPerRank, pieceBegin(i) + warpOff, pieceBegin(i + 1),
+                                                 stride, win);
+    }
+    if (i > 0) {
+      const FabricGpuBarrier::FlagType want = flag + 1 + i;
+      while (static_cast<int32_t>(__scoped_atomic_load_n(ready, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - want) < 0) {
+      }
+      __atomic_signal_fence(__ATOMIC_SEQ_CST);
+      ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(drainDst, drainSrc, bytesPerRank, pieceBegin(i - 1) + warpOff,
+                                                 pieceBegin(i), stride, win);
+    }
+    if (i < pieces) {
+      // Every warp's TDM stores of piece i have drained (tdmWait); finish its other memory ops, then publish.
+      ddaFabricWaitMemOps();
+      __syncthreads();
+      if (threadIdx.x == 0) barrier.postPeer(peer, flag + 2 + i);
+    }
+  }
+  barrier.endEpoch(flag + 1 + pieces);
+#else
+  // Only dispatched on gfx1250; every other arch still has to compile this kernel.
+  (void)peerScratch, (void)recvbuff, (void)sendbuff, (void)bytesPerRank, (void)selfRank, (void)nRanks, (void)barrier,
+    (void)partTiles, (void)pieces;
+  __builtin_trap();
+#endif
+}
+
 } // namespace dda::common

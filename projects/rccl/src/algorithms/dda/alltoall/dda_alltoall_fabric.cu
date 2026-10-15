@@ -219,10 +219,31 @@ static ncclResult_t ncclAllToAllDdaFabricTdmPushPeerLaunch(const void* sendbuff,
   dim3 grid, block;
   size_t partTiles;
   if (!ddaAllToAllFabricTdmPushPeerGeom(comm, bytesPerRank, TileBytes, &grid, &block, &partTiles)) return ncclSuccess;
+  const size_t dynSmem = (block.x / comm->WarpSize) * kDdaA2ATdmWindowBytes;
+
+  if (rcclParamDdaA2APushPeerPipe()) {
+    if (!ddaAllToAllFabricTdmPrepare<&dda::common::ddaAllToAllFabricTdmPushPeerPipe<TileBytes, kUnrollTiles>>(
+          comm->cudaDev)) {
+      return ncclSuccess;
+    }
+    const int64_t pc = rcclParamDdaA2APushPeerPieces();
+    const bool autoPieces = pc < 1 || pc > 64;
+    const int pieces = autoPieces ? ddaAllToAllFabricPushPeerAutoPieces(partTiles * TileBytes) : static_cast<int>(pc);
+    INFO(NCCL_COLL,
+         "DDA fabric AllToAll: launching pipelined TDM peer-major push kernel: nRanks=%d count=%zu tile=%d x%d "
+         "grid=%u (%u per peer) block=%u part=%zu B pieces=%d%s lds=%zu",
+         comm->nRanks, bytesPerRank, TileBytes, kUnrollTiles, grid.x, grid.x / comm->nRanks, block.x,
+         partTiles * TileBytes, pieces, autoPieces ? " (auto)" : "", dynSmem);
+    dda::common::ddaAllToAllFabricTdmPushPeerPipe<TileBytes, kUnrollTiles><<<grid, block, dynSmem, stream>>>(
+      reinterpret_cast<uint8_t* const*>(comm->ddaPeerPtrsDev), static_cast<uint8_t*>(recvbuff),
+      static_cast<const uint8_t*>(sendbuff), bytesPerRank, comm->rank, comm->nRanks, barrierHost, partTiles, pieces);
+    *launched = true;
+    return ncclSuccess;
+  }
+
   if (!ddaAllToAllFabricTdmPrepare<&dda::common::ddaAllToAllFabricTdmPushPeer<TileBytes, kUnrollTiles>>(comm->cudaDev)) {
     return ncclSuccess;
   }
-  const size_t dynSmem = (block.x / comm->WarpSize) * kDdaA2ATdmWindowBytes;
 
   INFO(NCCL_COLL,
        "DDA fabric AllToAll: launching TDM peer-major push kernel: nRanks=%d count=%zu tile=%d x%d grid=%u (%u per "
@@ -330,7 +351,10 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
     // count is already the byte count (kernel instantiated for int8_t).
     if (ddaAllToAllFabricTdmEligible(comm, count) && ddaA2ATdmAligned(sendbuff) && ddaA2ATdmAligned(recvbuff)) {
       bool launched = false;
-      const bool peerMajor = rcclParamDdaA2APushPeer() && sendbuff != recvbuff;
+      // The pipelined TDM kernel pairs each drain with the block that read the same sendbuff slot, so it also runs in
+      // place; the full-barrier TDM peer-major kernel does not.
+      const bool peerMajor =
+        rcclParamDdaA2APushPeer() && (sendbuff != recvbuff || rcclParamDdaA2APushPeerPipe() != 0);
       NCCLCHECK(ncclAllToAllDdaFabricTdmDispatch<true>(sendbuff, recvbuff, count, comm, barrierHost, stream, peerMajor,
                                                        &launched));
       if (launched) {
