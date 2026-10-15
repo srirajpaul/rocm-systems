@@ -352,7 +352,9 @@ __launch_bounds__(512)
 // and each warp drains exactly the tiles it pushed, so the kernel runs in place. Piece i's flag is epoch
 // flag + 2 + i in the slot this block owns at the peer; every wave polls the flag itself. The entry barrier stays a
 // full barrier unless dbuf chains it (double-buffered scratch, as in ddaAllToAllFabricPushPeerPipe; the two kernels
-// share the records and the half offset, so either can follow the other). gridDim.x must be a multiple of nRanks.
+// share the records and the half offset, so either can follow the other). spread: no peer group for the own chunk
+// (nRanks - 1 groups) and every block first copies a slice of it, as in ddaAllToAllFabricPushPeerPipe. gridDim.x must
+// be a multiple of the number of groups.
 template <int TileBytes, int UnrollTiles>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
@@ -360,11 +362,33 @@ __launch_bounds__(512)
   __global__ void ddaAllToAllFabricTdmPushPeerPipe(uint8_t* const* __restrict__ peerScratch, uint8_t* recvbuff,
                                                    const uint8_t* sendbuff, size_t bytesPerRank, int selfRank,
                                                    int nRanks, FabricGpuBarrier barrier, size_t partTiles,
-                                                   int pieces, size_t halfOff, bool dbuf) {
+                                                   int pieces, size_t halfOff, bool dbuf, bool spread) {
   static_assert(TileBytes * UnrollTiles <= kDdaA2ATdmWindowBytes, "tiles overflow the per-warp LDS window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
   const uint32_t flag = barrier.beginEpoch();
+
+  extern __shared__ __attribute__((aligned(128))) uint8_t ddaA2ATdmSmem[];
+  // TDM descriptors live in SGPRs, so every address below must be wave-uniform.
+  const int lw = __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / warpSize));
+  uint8_t* win = ddaA2ATdmSmem + lw * kDdaA2ATdmWindowBytes;
+  const size_t warpOff = static_cast<size_t>(lw) * UnrollTiles;
+  const size_t stride = (blockDim.x / warpSize) * UnrollTiles;
+  const size_t tilesPerPeer = (bytesPerRank + TileBytes - 1) / TileBytes;
+  const int groups = spread ? nRanks - 1 : nRanks;
+  if (spread) {
+    // Own chunk, sendbuff -> recvbuff (local; nothing to do in place): a slice per block, copied while the entry
+    // barrier below, if any, is still pending at the peers.
+    const size_t selfOff = static_cast<size_t>(selfRank) * bytesPerRank;
+    const size_t sl = (tilesPerPeer + gridDim.x - 1) / gridDim.x;
+    const size_t sb = blockIdx.x * sl < tilesPerPeer ? blockIdx.x * sl : tilesPerPeer;
+    const size_t se = sb + sl < tilesPerPeer ? sb + sl : tilesPerPeer;
+    if (sb < se && recvbuff + selfOff != sendbuff + selfOff) {
+      ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(recvbuff + selfOff, sendbuff + selfOff, bytesPerRank, sb + warpOff,
+                                                 se, stride, win);
+    }
+  }
+
   uint32_t lastHalf = 0;
   const bool chained = dbuf && barrier.lastEndedWithRecord(flag, &lastHalf);
   const uint32_t half = chained ? (lastHalf ^ 1u) : 0u;
@@ -382,19 +406,11 @@ __launch_bounds__(512)
     }
   };
 
-  extern __shared__ __attribute__((aligned(128))) uint8_t ddaA2ATdmSmem[];
-  // TDM descriptors live in SGPRs, so every address below must be wave-uniform.
-  const int lw = __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / warpSize));
-  uint8_t* win = ddaA2ATdmSmem + lw * kDdaA2ATdmWindowBytes;
-
-  const size_t nParts = gridDim.x / nRanks;
-  const int k = static_cast<int>(blockIdx.x / nParts);
+  const size_t nParts = gridDim.x / groups;
+  const int k = static_cast<int>(blockIdx.x / nParts) + (spread ? 1 : 0);
   const size_t part = blockIdx.x % nParts;
-  const size_t tilesPerPeer = (bytesPerRank + TileBytes - 1) / TileBytes;
   const size_t tileBegin = part * partTiles;
   const size_t tileEnd = tileBegin + partTiles < tilesPerPeer ? tileBegin + partTiles : tilesPerPeer;
-  const size_t warpOff = static_cast<size_t>(lw) * UnrollTiles;
-  const size_t stride = (blockDim.x / warpSize) * UnrollTiles;
 
   const int peer = (selfRank + k) % nRanks;
   uint8_t* dst = (k == 0 ? recvbuff : peerScratch[peer] + dataOff) + static_cast<size_t>(selfRank) * bytesPerRank;
@@ -418,7 +434,8 @@ __launch_bounds__(512)
   const size_t srcOff = static_cast<size_t>(peer) * bytesPerRank;
   const uint8_t* drainSrc = peerScratch[selfRank] + dataOff + srcOff;
   uint8_t* drainDst = recvbuff + srcOff;
-  const FabricGpuBarrier::FlagType* ready = barrier.peerFlag(peer, static_cast<int>((nRanks - k) * nParts + part));
+  const FabricGpuBarrier::FlagType* ready =
+    barrier.peerFlag(peer, static_cast<int>((nRanks - k - (spread ? 1 : 0)) * nParts + part));
 
   for (int i = 0; i <= pieces; ++i) {
     if (i < pieces) {
@@ -444,7 +461,7 @@ __launch_bounds__(512)
 #else
   // Only dispatched on gfx1250; every other arch still has to compile this kernel.
   (void)peerScratch, (void)recvbuff, (void)sendbuff, (void)bytesPerRank, (void)selfRank, (void)nRanks, (void)barrier,
-    (void)partTiles, (void)pieces, (void)halfOff, (void)dbuf;
+    (void)partTiles, (void)pieces, (void)halfOff, (void)dbuf, (void)spread;
   __builtin_trap();
 #endif
 }
