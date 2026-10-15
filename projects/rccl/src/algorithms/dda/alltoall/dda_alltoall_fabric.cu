@@ -146,6 +146,27 @@ static inline std::pair<dim3, dim3> ddaAllToAllFabricTdmGeom(ncclComm* comm, siz
   return std::make_pair(dim3(blocks, 1, 1), dim3(warpsPerBlock * comm->WarpSize, 1, 1));
 }
 
+// Peer-major TDM push grid: blocks per peer as for the vector peer-major push, each with enough warps (up to 16) to
+// give every warp one batch of its block's part. *partTiles is the aligned part. Returns false when the block cap
+// cannot give every peer a block. Depends only on count, so every rank launches the same grid.
+static inline bool ddaAllToAllFabricTdmPushPeerGeom(ncclComm* comm, size_t bytesPerRank, int tileBytes, dim3* grid,
+                                                    dim3* block, size_t* partTiles) {
+  const uint32_t maxPerPeer = static_cast<uint32_t>(comm->ddaFabricMaxBlocks) / comm->nRanks;
+  if (maxPerPeer == 0) return false;
+  const size_t unrollTiles = kDdaA2ATdmWindowBytes / tileBytes;
+  const size_t tilesPerPeer = dda::common::divRoundUp(bytesPerRank, static_cast<size_t>(tileBytes));
+  const int64_t b = rcclParamDdaA2APushPeerBlocks();
+  uint32_t perPeer = (b >= 1 && b <= maxPerPeer) ? static_cast<uint32_t>(b) : maxPerPeer;
+  perPeer = std::min<uint32_t>(perPeer, static_cast<uint32_t>(dda::common::divRoundUp(tilesPerPeer, unrollTiles)));
+  perPeer = std::max<uint32_t>(perPeer, 1);
+  *partTiles = ddaAllToAllFabricPushPeerPartUnits(tilesPerPeer, perPeer, tileBytes);
+  const uint32_t warps = std::min<uint32_t>(kDdaA2ATdmMaxWarpsPerBlock,
+                                            static_cast<uint32_t>(dda::common::divRoundUp(*partTiles, unrollTiles)));
+  *grid = dim3(perPeer * comm->nRanks, 1, 1);
+  *block = dim3(warps * comm->WarpSize, 1, 1);
+  return true;
+}
+
 // Raise the kernel's dynamic LDS cap once per device. Returns false if the device cannot grant it.
 template <auto Kernel>
 static bool ddaAllToAllFabricTdmPrepare(int cudaDev) {
@@ -169,12 +190,48 @@ static bool ddaAllToAllFabricTdmPrepare(int cudaDev) {
   return ok;
 }
 
+// *launched stays false if the block cap cannot give every peer a block or the device cannot grant the LDS.
+template <int TileBytes>
+static ncclResult_t ncclAllToAllDdaFabricTdmPushPeerLaunch(const void* sendbuff, void* recvbuff, size_t bytesPerRank,
+                                                           ncclComm* comm, dda::common::FabricGpuBarrier barrierHost,
+                                                           cudaStream_t stream, bool* launched) {
+  constexpr int kUnrollTiles = kDdaA2ATdmWindowBytes / TileBytes;
+  *launched = false;
+  dim3 grid, block;
+  size_t partTiles;
+  if (!ddaAllToAllFabricTdmPushPeerGeom(comm, bytesPerRank, TileBytes, &grid, &block, &partTiles)) return ncclSuccess;
+  if (!ddaAllToAllFabricTdmPrepare<&dda::common::ddaAllToAllFabricTdmPushPeer<TileBytes, kUnrollTiles>>(comm->cudaDev)) {
+    return ncclSuccess;
+  }
+  const size_t dynSmem = (block.x / comm->WarpSize) * kDdaA2ATdmWindowBytes;
+
+  INFO(NCCL_COLL,
+       "DDA fabric AllToAll: launching TDM peer-major push kernel: nRanks=%d count=%zu tile=%d x%d grid=%u (%u per "
+       "peer) block=%u part=%zu B lds=%zu",
+       comm->nRanks, bytesPerRank, TileBytes, kUnrollTiles, grid.x, grid.x / comm->nRanks, block.x,
+       partTiles * TileBytes, dynSmem);
+
+  dda::common::ddaAllToAllFabricTdmPushPeer<TileBytes, kUnrollTiles><<<grid, block, dynSmem, stream>>>(
+    reinterpret_cast<uint8_t* const*>(comm->ddaPeerPtrsDev), static_cast<uint8_t*>(recvbuff),
+    static_cast<const uint8_t*>(sendbuff), bytesPerRank, comm->rank, comm->nRanks, barrierHost, partTiles);
+  *launched = true;
+  return ncclSuccess;
+}
+
+// peerMajor (push only) tries the peer-major TDM push first and falls back to the (tile, peer) item kernel.
 template <int TileBytes, bool Push>
 static ncclResult_t ncclAllToAllDdaFabricTdmLaunch(const void* sendbuff, void* recvbuff, size_t bytesPerRank,
                                                    ncclComm* comm, dda::common::FabricGpuBarrier barrierHost,
-                                                   cudaStream_t stream, bool* launched) {
+                                                   cudaStream_t stream, bool peerMajor, bool* launched) {
   constexpr int kUnrollPeers = kDdaA2ATdmWindowBytes / TileBytes;
   *launched = false;
+  if constexpr (Push) {
+    if (peerMajor) {
+      NCCLCHECK(ncclAllToAllDdaFabricTdmPushPeerLaunch<TileBytes>(sendbuff, recvbuff, bytesPerRank, comm, barrierHost,
+                                                                  stream, launched));
+      if (*launched) return ncclSuccess;
+    }
+  }
   bool ready;
   if constexpr (Push) {
     ready = ddaAllToAllFabricTdmPrepare<&dda::common::ddaAllToAllFabricTdmPush<TileBytes, kUnrollPeers>>(comm->cudaDev);
@@ -210,17 +267,17 @@ static ncclResult_t ncclAllToAllDdaFabricTdmLaunch(const void* sendbuff, void* r
 template <bool Push>
 static ncclResult_t ncclAllToAllDdaFabricTdmDispatch(const void* sendbuff, void* recvbuff, size_t bytesPerRank,
                                                      ncclComm* comm, dda::common::FabricGpuBarrier barrierHost,
-                                                     cudaStream_t stream, bool* launched) {
+                                                     cudaStream_t stream, bool peerMajor, bool* launched) {
   switch (ddaAllToAllFabricTdmTileBytes()) {
   case 4 << 10:
     return ncclAllToAllDdaFabricTdmLaunch<4 << 10, Push>(sendbuff, recvbuff, bytesPerRank, comm, barrierHost, stream,
-                                                         launched);
+                                                         peerMajor, launched);
   case 16 << 10:
     return ncclAllToAllDdaFabricTdmLaunch<16 << 10, Push>(sendbuff, recvbuff, bytesPerRank, comm, barrierHost, stream,
-                                                          launched);
+                                                          peerMajor, launched);
   default:
     return ncclAllToAllDdaFabricTdmLaunch<8 << 10, Push>(sendbuff, recvbuff, bytesPerRank, comm, barrierHost, stream,
-                                                         launched);
+                                                         peerMajor, launched);
   }
 }
 
@@ -254,7 +311,9 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
     // count is already the byte count (kernel instantiated for int8_t).
     if (ddaAllToAllFabricTdmEligible(comm, count) && ddaA2ATdmAligned(sendbuff) && ddaA2ATdmAligned(recvbuff)) {
       bool launched = false;
-      NCCLCHECK(ncclAllToAllDdaFabricTdmDispatch<true>(sendbuff, recvbuff, count, comm, barrierHost, stream, &launched));
+      const bool peerMajor = rcclParamDdaA2APushPeer() && sendbuff != recvbuff;
+      NCCLCHECK(ncclAllToAllDdaFabricTdmDispatch<true>(sendbuff, recvbuff, count, comm, barrierHost, stream, peerMajor,
+                                                       &launched));
       if (launched) {
         CUDACHECK(cudaGetLastError());
         return ncclSuccess;
@@ -305,7 +364,8 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
   // this rank's scratch themselves.
   if (ddaAllToAllFabricTdmEligible(comm, count) && ddaA2ATdmAligned(sendbuff) && ddaA2ATdmAligned(recvbuff)) {
     bool launched = false;
-    NCCLCHECK(ncclAllToAllDdaFabricTdmDispatch<false>(sendbuff, recvbuff, count, comm, barrierHost, stream, &launched));
+    NCCLCHECK(ncclAllToAllDdaFabricTdmDispatch<false>(sendbuff, recvbuff, count, comm, barrierHost, stream,
+                                                      /*peerMajor=*/false, &launched));
     if (launched) {
       CUDACHECK(cudaGetLastError());
       return ncclSuccess;
@@ -384,11 +444,14 @@ bool ncclAllToAllDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* r
 uint32_t ncclAllToAllDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_t datatype) {
   const size_t bytes = count * ncclTypeSize(datatype);
   dim3 grid, block;
-  const bool peerMajor = !ddaAllToAllFabricTdmEligible(comm, bytes) && rcclParamDdaA2APush() &&
-                         rcclParamDdaA2APushPeer() && ddaAllToAllFabricPushPeerGeom(comm, bytes, &grid, &block);
+  size_t partTiles;
+  const bool peerPush = rcclParamDdaA2APush() && rcclParamDdaA2APushPeer();
   if (ddaAllToAllFabricTdmEligible(comm, bytes)) {
-    grid = ddaAllToAllFabricTdmGeom(comm, bytes, ddaAllToAllFabricTdmTileBytes()).first;
-  } else if (!peerMajor) {
+    const int tileBytes = ddaAllToAllFabricTdmTileBytes();
+    if (!peerPush || !ddaAllToAllFabricTdmPushPeerGeom(comm, bytes, tileBytes, &grid, &block, &partTiles)) {
+      grid = ddaAllToAllFabricTdmGeom(comm, bytes, tileBytes).first;
+    }
+  } else if (!peerPush || !ddaAllToAllFabricPushPeerGeom(comm, bytes, &grid, &block)) {
     grid = ddaAllToAllFabricVectorGeom(comm, bytes).first;
   }
   return grid.x * grid.y;
