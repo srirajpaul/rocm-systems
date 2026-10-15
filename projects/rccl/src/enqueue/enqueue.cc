@@ -23,6 +23,7 @@
 #include "transport.h"
 #include "register_inline.h"
 #include "ce_coll.h"
+#include "algorithms/dda/fabric/fabric_init.h"
 #include "nvtx.h"
 #include "scheduler.h"
 #include "common.h"
@@ -4500,6 +4501,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
                                      opDev));
         } else {
           INFO(NCCL_TUNING, "Taking CE collective path for %s via DDA scratch, count=%zu", collName, info->count);
+          NCCLCHECK(ncclDdaFabricScratchUsedOutsideEpochs(comm, info->stream));
           NCCLCHECK(ceCollTaskAppend(comm, info, /*sendWin=*/nullptr, /*recvWin=*/nullptr,
                                      comm->ddaScratch, comm->ddaPeerPtrsHost, opDev));
         }
@@ -4522,6 +4524,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
                  rcclParamForceCe() && CeScratchAvailable && !hasSysmemSegment && comm->ddaScratch != nullptr &&
                  recvBytes <= comm->ddaScratchBytes && info->coll != ncclFuncAllReduce) {
         INFO(NCCL_TUNING, "Using DDA scratch for CE collective, count=%zu, recvBytes=%zu", info->count, recvBytes);
+        NCCLCHECK(ncclDdaFabricScratchUsedOutsideEpochs(comm, info->stream));
         NCCLCHECK(ceCollTaskAppend(comm, info, /*sendWin=*/nullptr, /*recvWin=*/nullptr, comm->ddaScratch,
                                    comm->ddaPeerPtrsHost, opDev));
       } else if (ceAllReduceFits && !hasSysmemSegment) {

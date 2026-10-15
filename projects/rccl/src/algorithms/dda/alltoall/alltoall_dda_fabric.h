@@ -325,11 +325,30 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
 #endif
   __global__ void ddaAllToAllFabricPushPeerPipe(T* const* __restrict__ ipcbuffs, T* recvbuff, size_t count,
                                                 const T* sendbuff, int selfRank, int nRanks, FabricGpuBarrier barrier,
-                                                size_t partLines, int pieces) {
+                                                size_t partLines, int pieces, size_t halfOff, bool dbuf) {
   const uint32_t flag = barrier.beginEpoch();
+  // Double buffering (dbuf): the scratch is used in two halves, halfOff elements apart. If the last fabric kernel on
+  // the communicator was this one in dbuf mode (its records still match the epoch cells), that launch finished on this
+  // rank only after every peer had started it, so every peer finished the launch before, the last one to use the other
+  // half: use that half without an entry barrier. A peer can then be at most one launch behind (this launch cannot
+  // finish before every peer starts it), and it only touches the half its launch uses. Otherwise use half 0 behind the
+  // full entry barrier.
+  uint32_t lastHalf = 0;
+  const bool chained = dbuf && barrier.lastEndedWithRecord(flag, &lastHalf);
+  const uint32_t half = chained ? (lastHalf ^ 1u) : 0u;
+  const size_t dataOff = static_cast<size_t>(half) * halfOff;
   // Only local sendbuff is read before the next barrier, so no acquire is needed here.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
-                             true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 1);
+  if (!chained) {
+    barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
+                               true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 1);
+  }
+  auto finish = [&]() {
+    if (dbuf) {
+      barrier.endEpochRecord(flag + 1 + pieces, half);
+    } else {
+      barrier.endEpoch(flag + 1 + pieces);
+    }
+  };
 
   constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
   constexpr size_t kPieceAlignLines = 4096 / sizeof(uint4);
@@ -340,7 +359,7 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
   const size_t lineBegin = part * partLines;
   const size_t lineEnd = lineBegin + partLines < nLines ? lineBegin + partLines : nLines;
   const int peer = (selfRank + k) % nRanks;
-  T* dst = (k == 0 ? recvbuff : ipcbuffs[peer]) + static_cast<size_t>(selfRank) * count;
+  T* dst = (k == 0 ? recvbuff : ipcbuffs[peer] + dataOff) + static_cast<size_t>(selfRank) * count;
   const T* src = sendbuff + static_cast<size_t>(peer) * count;
 
   if (k == 0 || lineBegin >= lineEnd) {
@@ -349,7 +368,7 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
     if (lineBegin < lineEnd && dst != src) {
       ddaA2APushPeerCopyM<U, false, false>(dst, src, lineBegin + threadIdx.x, lineEnd, blockDim.x);
     }
-    barrier.endEpoch(flag + 1 + pieces);
+    finish();
     return;
   }
 
@@ -360,7 +379,7 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
     return b < lineEnd ? b : lineEnd;
   };
   const size_t srcOff = static_cast<size_t>(peer) * count;
-  const T* drainSrc = ipcbuffs[selfRank] + srcOff;
+  const T* drainSrc = ipcbuffs[selfRank] + dataOff + srcOff;
   T* drainDst = recvbuff + srcOff;
   const FabricGpuBarrier::FlagType* ready = barrier.peerFlag(peer, static_cast<int>((nRanks - k) * nParts + part));
 
@@ -382,7 +401,7 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
       if (threadIdx.x == 0) barrier.postPeer(peer, flag + 2 + i);
     }
   }
-  barrier.endEpoch(flag + 1 + pieces);
+  finish();
 }
 
 } // namespace dda::common

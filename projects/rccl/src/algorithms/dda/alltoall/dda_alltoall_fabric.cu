@@ -54,6 +54,9 @@ RCCL_PARAM(DdaA2APushPeerP2p, "DDA_A2A_PUSH_PEER_P2P", 0);
 RCCL_PARAM(DdaA2APushPeerPipe, "DDA_A2A_PUSH_PEER_PIPE", 0);
 // Pieces per block part for the pipelined peer-major push (1 .. 64); 0 = from the part size.
 RCCL_PARAM(DdaA2APushPeerPieces, "DDA_A2A_PUSH_PEER_PIECES", 0);
+// Pipelined peer-major push: use the scratch in two halves on alternate launches, so a launch that directly follows
+// another such launch on the communicator skips its entry barrier (needs nRanks * count <= half the scratch).
+RCCL_PARAM(DdaA2APushPeerDbuf, "DDA_A2A_PUSH_PEER_DBUF", 0);
 
 namespace {
 
@@ -377,31 +380,35 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
       const bool autoPieces = pc < 1 || pc > 64;
       const int pieces =
         autoPieces ? ddaAllToAllFabricPushPeerAutoPieces(partLines * sizeof(uint4)) : static_cast<int>(pc);
-      // One automatic piece runs the non-pipelined kernel with the p2p drain sync, which is faster at that size.
-      if (pipe && (pieces > 1 || !autoPieces)) {
+      // Double buffering needs both halves of the scratch to hold the op.
+      const size_t halfOff = (comm->ddaScratchBytes / 2) & ~static_cast<size_t>(4095);
+      const bool dbuf = pipe && rcclParamDdaA2APushPeerDbuf() && static_cast<size_t>(nRanks) * count <= halfOff;
+      // One automatic piece runs the non-pipelined kernel with the p2p drain sync, which is faster at that size
+      // (double buffering is only in the pipelined kernel).
+      if (pipe && (pieces > 1 || !autoPieces || dbuf)) {
         INFO(NCCL_COLL,
              "DDA fabric AllToAll: launching pipelined peer-major push kernel: nRanks=%d count=%zu grid=%u (%u per "
-             "peer) block=%u part=%zu B unroll=%ld pieces=%d%s",
+             "peer) block=%u part=%zu B unroll=%ld pieces=%d%s%s",
              nRanks, count, peerGrid.x, peerGrid.x / nRanks, peerBlock.x, partLines * sizeof(uint4),
-             static_cast<long>(unroll), pieces, autoPieces ? " (auto)" : "");
+             static_cast<long>(unroll), pieces, autoPieces ? " (auto)" : "", dbuf ? " dbuf" : "");
         auto* rb = static_cast<T*>(recvbuff);
         auto* sb = static_cast<const T*>(sendbuff);
         switch (unroll) {
         case 2:
           dda::common::ddaAllToAllFabricPushPeerPipe<T, 2><<<peerGrid, peerBlock, 0, stream>>>(
-            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces);
+            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces, halfOff, dbuf);
           break;
         case 4:
           dda::common::ddaAllToAllFabricPushPeerPipe<T, 4><<<peerGrid, peerBlock, 0, stream>>>(
-            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces);
+            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces, halfOff, dbuf);
           break;
         case 16:
           dda::common::ddaAllToAllFabricPushPeerPipe<T, 16><<<peerGrid, peerBlock, 0, stream>>>(
-            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces);
+            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces, halfOff, dbuf);
           break;
         default:
           dda::common::ddaAllToAllFabricPushPeerPipe<T, 8><<<peerGrid, peerBlock, 0, stream>>>(
-            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces);
+            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces, halfOff, dbuf);
           break;
         }
         CUDACHECK(cudaGetLastError());
