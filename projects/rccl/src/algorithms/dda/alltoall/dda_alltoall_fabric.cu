@@ -257,14 +257,18 @@ static ncclResult_t ncclAllToAllDdaFabricTdmPushPeerLaunch(const void* sendbuff,
     const int64_t pc = rcclParamDdaA2APushPeerPieces();
     const bool autoPieces = pc < 1 || pc > 64;
     const int pieces = autoPieces ? ddaAllToAllFabricPushPeerAutoPieces(partTiles * TileBytes) : static_cast<int>(pc);
+    // Same half offset and condition as the vector pipelined push, which shares the double-buffer records.
+    const size_t halfOff = (comm->ddaScratchBytes / 2) & ~static_cast<size_t>(4095);
+    const bool dbuf = rcclParamDdaA2APushPeerDbuf() && static_cast<size_t>(comm->nRanks) * bytesPerRank <= halfOff;
     INFO(NCCL_COLL,
          "DDA fabric AllToAll: launching pipelined TDM peer-major push kernel: nRanks=%d count=%zu tile=%d x%d "
-         "grid=%u (%u per peer) block=%u part=%zu B pieces=%d%s lds=%zu",
+         "grid=%u (%u per peer) block=%u part=%zu B pieces=%d%s%s lds=%zu",
          comm->nRanks, bytesPerRank, TileBytes, kUnrollTiles, grid.x, grid.x / comm->nRanks, block.x,
-         partTiles * TileBytes, pieces, autoPieces ? " (auto)" : "", dynSmem);
+         partTiles * TileBytes, pieces, autoPieces ? " (auto)" : "", dbuf ? " dbuf" : "", dynSmem);
     dda::common::ddaAllToAllFabricTdmPushPeerPipe<TileBytes, kUnrollTiles><<<grid, block, dynSmem, stream>>>(
       reinterpret_cast<uint8_t* const*>(comm->ddaPeerPtrsDev), static_cast<uint8_t*>(recvbuff),
-      static_cast<const uint8_t*>(sendbuff), bytesPerRank, comm->rank, comm->nRanks, barrierHost, partTiles, pieces);
+      static_cast<const uint8_t*>(sendbuff), bytesPerRank, comm->rank, comm->nRanks, barrierHost, partTiles, pieces,
+      halfOff, dbuf);
     *launched = true;
     return ncclSuccess;
   }

@@ -351,7 +351,8 @@ __launch_bounds__(512)
 // block pushes to, (self + k): the block drains the slot that peer's block with offset nRanks - k (same part) wrote,
 // and each warp drains exactly the tiles it pushed, so the kernel runs in place. Piece i's flag is epoch
 // flag + 2 + i in the slot this block owns at the peer; every wave polls the flag itself. The entry barrier stays a
-// full barrier. gridDim.x must be a multiple of nRanks.
+// full barrier unless dbuf chains it (double-buffered scratch, as in ddaAllToAllFabricPushPeerPipe; the two kernels
+// share the records and the half offset, so either can follow the other). gridDim.x must be a multiple of nRanks.
 template <int TileBytes, int UnrollTiles>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
@@ -359,14 +360,27 @@ __launch_bounds__(512)
   __global__ void ddaAllToAllFabricTdmPushPeerPipe(uint8_t* const* __restrict__ peerScratch, uint8_t* recvbuff,
                                                    const uint8_t* sendbuff, size_t bytesPerRank, int selfRank,
                                                    int nRanks, FabricGpuBarrier barrier, size_t partTiles,
-                                                   int pieces) {
+                                                   int pieces, size_t halfOff, bool dbuf) {
   static_assert(TileBytes * UnrollTiles <= kDdaA2ATdmWindowBytes, "tiles overflow the per-warp LDS window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
   const uint32_t flag = barrier.beginEpoch();
+  uint32_t lastHalf = 0;
+  const bool chained = dbuf && barrier.lastEndedWithRecord(flag, &lastHalf);
+  const uint32_t half = chained ? (lastHalf ^ 1u) : 0u;
+  const size_t dataOff = static_cast<size_t>(half) * halfOff;
   // Only local sendbuff is read before the next barrier, so no acquire is needed here.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
-                             true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 1);
+  if (!chained) {
+    barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
+                               true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 1);
+  }
+  auto finish = [&]() {
+    if (dbuf) {
+      barrier.endEpochRecord(flag + 1 + pieces, half);
+    } else {
+      barrier.endEpoch(flag + 1 + pieces);
+    }
+  };
 
   extern __shared__ __attribute__((aligned(128))) uint8_t ddaA2ATdmSmem[];
   // TDM descriptors live in SGPRs, so every address below must be wave-uniform.
@@ -383,7 +397,7 @@ __launch_bounds__(512)
   const size_t stride = (blockDim.x / warpSize) * UnrollTiles;
 
   const int peer = (selfRank + k) % nRanks;
-  uint8_t* dst = (k == 0 ? recvbuff : peerScratch[peer]) + static_cast<size_t>(selfRank) * bytesPerRank;
+  uint8_t* dst = (k == 0 ? recvbuff : peerScratch[peer] + dataOff) + static_cast<size_t>(selfRank) * bytesPerRank;
   const uint8_t* src = sendbuff + static_cast<size_t>(peer) * bytesPerRank;
 
   if (k == 0 || tileBegin >= tileEnd) {
@@ -392,7 +406,7 @@ __launch_bounds__(512)
     if (tileBegin < tileEnd && dst != src) {
       ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(dst, src, bytesPerRank, tileBegin + warpOff, tileEnd, stride, win);
     }
-    barrier.endEpoch(flag + 1 + pieces);
+    finish();
     return;
   }
 
@@ -402,7 +416,7 @@ __launch_bounds__(512)
     return b < tileEnd ? b : tileEnd;
   };
   const size_t srcOff = static_cast<size_t>(peer) * bytesPerRank;
-  const uint8_t* drainSrc = peerScratch[selfRank] + srcOff;
+  const uint8_t* drainSrc = peerScratch[selfRank] + dataOff + srcOff;
   uint8_t* drainDst = recvbuff + srcOff;
   const FabricGpuBarrier::FlagType* ready = barrier.peerFlag(peer, static_cast<int>((nRanks - k) * nParts + part));
 
@@ -426,11 +440,11 @@ __launch_bounds__(512)
       if (threadIdx.x == 0) barrier.postPeer(peer, flag + 2 + i);
     }
   }
-  barrier.endEpoch(flag + 1 + pieces);
+  finish();
 #else
   // Only dispatched on gfx1250; every other arch still has to compile this kernel.
   (void)peerScratch, (void)recvbuff, (void)sendbuff, (void)bytesPerRank, (void)selfRank, (void)nRanks, (void)barrier,
-    (void)partTiles, (void)pieces;
+    (void)partTiles, (void)pieces, (void)halfOff, (void)dbuf;
   __builtin_trap();
 #endif
 }
