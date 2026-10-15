@@ -52,8 +52,8 @@ RCCL_PARAM(DdaA2APushPeerP2p, "DDA_A2A_PUSH_PEER_P2P", 0);
 // Peer-major vector push: pipeline each block's push and drain over RCCL_DDA_A2A_PUSH_PEER_PIECES pieces with a
 // ready flag per piece (ddaAllToAllFabricPushPeerPipe).
 RCCL_PARAM(DdaA2APushPeerPipe, "DDA_A2A_PUSH_PEER_PIPE", 0);
-// Pieces per block part for the pipelined peer-major push (1 .. 64).
-RCCL_PARAM(DdaA2APushPeerPieces, "DDA_A2A_PUSH_PEER_PIECES", 4);
+// Pieces per block part for the pipelined peer-major push (1 .. 64); 0 = from the part size.
+RCCL_PARAM(DdaA2APushPeerPieces, "DDA_A2A_PUSH_PEER_PIECES", 0);
 
 namespace {
 
@@ -114,6 +114,15 @@ static inline size_t ddaAllToAllFabricPushPeerPartUnits(size_t units, uint32_t p
     alignUnits /= 2;
   }
   return partUnits();
+}
+
+// Pipelined peer-major push pieces for a block part of partBytes, from 8-rank measurements: every piece adds a few us
+// of store completion and a flag round trip across the fabric, so parts below 128 KiB keep one piece.
+static inline int ddaAllToAllFabricPushPeerAutoPieces(size_t partBytes) {
+  if (partBytes < (128u << 10)) return 1;
+  if (partBytes < (256u << 10)) return 2;
+  if (partBytes < (2u << 20)) return 4;
+  return 16;
 }
 
 static inline int ddaAllToAllFabricTdmTileBytes() {
@@ -336,14 +345,18 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
       const size_t partLines = ddaAllToAllFabricPushPeerPartUnits(count / sizeof(uint4), peerGrid.x / nRanks,
                                                                   sizeof(uint4));
       const int64_t unroll = rcclParamDdaA2APushPeerUnroll();
-      if (rcclParamDdaA2APushPeerPipe()) {
-        const int64_t pc = rcclParamDdaA2APushPeerPieces();
-        const int pieces = (pc >= 1 && pc <= 64) ? static_cast<int>(pc) : 4;
+      const bool pipe = rcclParamDdaA2APushPeerPipe() != 0;
+      const int64_t pc = rcclParamDdaA2APushPeerPieces();
+      const bool autoPieces = pc < 1 || pc > 64;
+      const int pieces =
+        autoPieces ? ddaAllToAllFabricPushPeerAutoPieces(partLines * sizeof(uint4)) : static_cast<int>(pc);
+      // One automatic piece runs the non-pipelined kernel with the p2p drain sync, which is faster at that size.
+      if (pipe && (pieces > 1 || !autoPieces)) {
         INFO(NCCL_COLL,
              "DDA fabric AllToAll: launching pipelined peer-major push kernel: nRanks=%d count=%zu grid=%u (%u per "
-             "peer) block=%u part=%zu B unroll=%ld pieces=%d",
+             "peer) block=%u part=%zu B unroll=%ld pieces=%d%s",
              nRanks, count, peerGrid.x, peerGrid.x / nRanks, peerBlock.x, partLines * sizeof(uint4),
-             static_cast<long>(unroll), pieces);
+             static_cast<long>(unroll), pieces, autoPieces ? " (auto)" : "");
         auto* rb = static_cast<T*>(recvbuff);
         auto* sb = static_cast<const T*>(sendbuff);
         switch (unroll) {
@@ -367,7 +380,7 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
         CUDACHECK(cudaGetLastError());
         return ncclSuccess;
       }
-      const bool p2p = rcclParamDdaA2APushPeerP2p() != 0;
+      const bool p2p = pipe || rcclParamDdaA2APushPeerP2p() != 0;
       INFO(NCCL_COLL, "DDA fabric AllToAll: launching peer-major push kernel: nRanks=%d count=%zu grid=%u (%u per peer) "
            "block=%u part=%zu B unroll=%ld%s", nRanks, count, peerGrid.x, peerGrid.x / nRanks, peerBlock.x,
            partLines * sizeof(uint4), static_cast<long>(unroll), p2p ? " p2p" : "");
