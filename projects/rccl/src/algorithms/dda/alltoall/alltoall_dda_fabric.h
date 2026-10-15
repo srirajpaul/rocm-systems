@@ -162,4 +162,77 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
   barrier.endEpoch(flag + 2);
 }
 
+constexpr int kDdaA2APushPeerUnroll = 8;
+
+// Copies 16 B lines [begin, end) of src to dst with system-scope accesses, kDdaA2APushPeerUnroll loads in flight per
+// thread. The line helpers are compiler memory barriers, so every load of a group is issued before its stores.
+template <typename T>
+__device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t begin, size_t end, size_t stride) {
+  constexpr int U = kDdaA2APushPeerUnroll;
+  constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
+  size_t i = begin;
+  for (; i + (U - 1) * stride < end; i += U * stride) {
+    uint32_t w[U][4];
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(src + (i + u * stride) * countPerThread), w[u][0], w[u][1],
+                        w[u][2], w[u][3]);
+    }
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(dst + (i + u * stride) * countPerThread), w[u][0], w[u][1],
+                         w[u][2], w[u][3]);
+    }
+  }
+  for (; i < end; i += stride) {
+    uint32_t w0, w1, w2, w3;
+    ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(src + i * countPerThread), w0, w1, w2, w3);
+    ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(dst + i * countPerThread), w0, w1, w2, w3);
+  }
+}
+
+// Peer-major push: every block serves a single peer, so its stores stream to one destination instead of one line
+// to each rank. With P = gridDim.x / nRanks blocks per peer, block b serves peer offset k = b / P and contiguous
+// part j = b % P of that peer's chunk, 16 B lines [j * partLines, (j + 1) * partLines). It pushes to peer (self + k)
+// and later drains the slot of peer (self - k), which that peer's block b wrote, so the per-block barrier pairs the
+// write with the read. k == 0 copies sendbuff straight to recvbuff and drains nothing.
+// gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
+// this rank may still be reading from sendbuff.
+template <typename T>
+#if defined(USE_ROCM)
+__launch_bounds__(kDdaA2APushThreadsPerBlock)
+#endif
+  __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
+                                            const T* __restrict__ sendbuff, int selfRank, int nRanks,
+                                            FabricGpuBarrier barrier, size_t partLines) {
+  const uint32_t flag = barrier.beginEpoch();
+  // Only local sendbuff is read before the next barrier, so no acquire is needed here.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
+                             true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 1);
+
+  constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
+  const size_t nParts = gridDim.x / nRanks;
+  const int k = static_cast<int>(blockIdx.x / nParts);
+  const size_t part = blockIdx.x % nParts;
+  const size_t nLines = count / countPerThread;
+  const size_t lineBegin = part * partLines;
+  const size_t lineEnd = lineBegin + partLines < nLines ? lineBegin + partLines : nLines;
+  const size_t begin = lineBegin + threadIdx.x;
+
+  const int peer = (selfRank + k) % nRanks;
+  T* dst = (k == 0 ? recvbuff : ipcbuffs[peer]) + static_cast<size_t>(selfRank) * count;
+  ddaA2APushPeerCopy(dst, sendbuff + static_cast<size_t>(peer) * count, begin, lineEnd, blockDim.x);
+
+  ddaFabricWaitMemOps();
+  // Publish our remote writes. The drain below reads only with system-scope loads, so no acquire is needed.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
+                             true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 2);
+
+  if (k != 0) {
+    const size_t src = static_cast<size_t>((selfRank - k + nRanks) % nRanks) * count;
+    ddaA2APushPeerCopy(recvbuff + src, ipcbuffs[selfRank] + src, begin, lineEnd, blockDim.x);
+  }
+  barrier.endEpoch(flag + 2);
+}
+
 } // namespace dda::common
