@@ -164,11 +164,10 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
 
 constexpr int kDdaA2APushPeerUnroll = 8;
 
-// Copies 16 B lines [begin, end) of src to dst with system-scope accesses, kDdaA2APushPeerUnroll loads in flight per
-// thread. The line helpers are compiler memory barriers, so every load of a group is issued before its stores.
-template <typename T>
+// Copies 16 B lines [begin, end) of src to dst with system-scope accesses, U loads in flight per thread. The line
+// helpers are compiler memory barriers, so every load of a group is issued before its stores.
+template <int U, typename T>
 __device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t begin, size_t end, size_t stride) {
-  constexpr int U = kDdaA2APushPeerUnroll;
   constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
   size_t i = begin;
   for (; i + (U - 1) * stride < end; i += U * stride) {
@@ -198,7 +197,7 @@ __device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t 
 // write with the read. k == 0 copies sendbuff straight to recvbuff and drains nothing.
 // gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
 // this rank may still be reading from sendbuff.
-template <typename T>
+template <typename T, int U = kDdaA2APushPeerUnroll>
 #if defined(USE_ROCM)
 __launch_bounds__(kDdaA2APushThreadsPerBlock)
 #endif
@@ -221,7 +220,7 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
 
   const int peer = (selfRank + k) % nRanks;
   T* dst = (k == 0 ? recvbuff : ipcbuffs[peer]) + static_cast<size_t>(selfRank) * count;
-  ddaA2APushPeerCopy(dst, sendbuff + static_cast<size_t>(peer) * count, begin, lineEnd, blockDim.x);
+  ddaA2APushPeerCopy<U>(dst, sendbuff + static_cast<size_t>(peer) * count, begin, lineEnd, blockDim.x);
 
   ddaFabricWaitMemOps();
   // Publish our remote writes. The drain below reads only with system-scope loads, so no acquire is needed.
@@ -230,7 +229,7 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
 
   if (k != 0) {
     const size_t src = static_cast<size_t>((selfRank - k + nRanks) % nRanks) * count;
-    ddaA2APushPeerCopy(recvbuff + src, ipcbuffs[selfRank] + src, begin, lineEnd, blockDim.x);
+    ddaA2APushPeerCopy<U>(recvbuff + src, ipcbuffs[selfRank] + src, begin, lineEnd, blockDim.x);
   }
   barrier.endEpoch(flag + 2);
 }
