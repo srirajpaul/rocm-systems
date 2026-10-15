@@ -195,15 +195,18 @@ __device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t 
 // part j = b % P of that peer's chunk, 16 B lines [j * partLines, (j + 1) * partLines). It pushes to peer (self + k)
 // and later drains the slot of peer (self - k), which that peer's block b wrote, so the per-block barrier pairs the
 // write with the read. k == 0 copies sendbuff straight to recvbuff and drains nothing.
-// gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
-// this rank may still be reading from sendbuff.
+// With p2p the block instead drains the slot of the peer it pushed to, (self + k), which that peer's block with offset
+// nRanks - k (same part) wrote, and waits on that block's flag. The only block that writes recvbuff slot (self + k)
+// is then the one that read sendbuff slot (self + k), each thread on the lines it read, so p2p also runs in place.
+// gridDim.x must be a multiple of nRanks. Without p2p out of place only: a block drains into recvbuff slots that
+// other blocks of this rank may still be reading from sendbuff.
 template <typename T, int U = kDdaA2APushPeerUnroll>
 #if defined(USE_ROCM)
 __launch_bounds__(kDdaA2APushThreadsPerBlock)
 #endif
-  __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
-                                            const T* __restrict__ sendbuff, int selfRank, int nRanks,
-                                            FabricGpuBarrier barrier, size_t partLines, bool p2p) {
+  __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* recvbuff, size_t count,
+                                            const T* sendbuff, int selfRank, int nRanks, FabricGpuBarrier barrier,
+                                            size_t partLines, bool p2p) {
   const uint32_t flag = barrier.beginEpoch();
   // Only local sendbuff is read before the next barrier, so no acquire is needed here.
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
@@ -220,18 +223,20 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
 
   const int peer = (selfRank + k) % nRanks;
   T* dst = (k == 0 ? recvbuff : ipcbuffs[peer]) + static_cast<size_t>(selfRank) * count;
-  ddaA2APushPeerCopy<U>(dst, sendbuff + static_cast<size_t>(peer) * count, begin, lineEnd, blockDim.x);
+  const T* src = sendbuff + static_cast<size_t>(peer) * count;
+  // In place, this rank's own slot is already where it belongs.
+  if (dst != src) ddaA2APushPeerCopy<U>(dst, src, begin, lineEnd, blockDim.x);
 
   ddaFabricWaitMemOps();
   // Publish our remote writes. The drain below reads only with system-scope loads, so no acquire is needed. With p2p
-  // this block only tells the peer it wrote and waits for the peer whose slot it drains; blocks of this rank's own
+  // this block only tells the peer it wrote and waits for the block whose write it drains; blocks of this rank's own
   // chunk (k == 0) neither wrote remotely nor drain, so they skip it.
-  const int srcRank = (selfRank - k + nRanks) % nRanks;
+  const int srcRank = p2p ? peer : (selfRank - k + nRanks) % nRanks;
   if (!p2p) {
     barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
                                true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 2);
   } else if (k != 0) {
-    barrier.signalWaitPeer(peer, srcRank, flag + 2);
+    barrier.signalWaitPeer(peer, srcRank, static_cast<int>((nRanks - k) * nParts + part), flag + 2);
   }
 
   if (k != 0) {
@@ -259,17 +264,20 @@ __device__ __forceinline__ void ddaA2AWaitWaveStores() {
 // Pipelined peer-major push: the same block roles and parts as ddaAllToAllFabricPushPeer, with each part cut into
 // `pieces` pieces of whole 4 KiB. Step i issues the push of piece i, then, while those stores are in flight, waits for
 // the source's piece i - 1 and drains it, and only then waits for its own stores and tells the peer piece i is ready;
-// a final step drains the last piece. Piece i's ready flag is epoch flag + 2 + i in the barrier slot this block owns
-// at the peer, so values only grow and the next barrier posts a higher one. Every wave polls the flag itself, so
-// draining does not wait for the block's other waves. The entry barrier stays a full barrier (the previous call may be
-// a kernel that posts nothing after its drain). Out of place only, gridDim.x a multiple of nRanks.
+// a final step drains the last piece. The source is the peer this block pushes to, (self + k): the block drains the
+// slot that peer's block with offset nRanks - k (same part) wrote, so the only block writing recvbuff slot (self + k)
+// is the one that read sendbuff slot (self + k), each thread on the lines it pushed, and the kernel runs in place.
+// Piece i's ready flag is epoch flag + 2 + i in the barrier slot this block owns at the peer, so values only grow and
+// the next barrier posts a higher one. Every wave polls the flag itself, so draining does not wait for the block's
+// other waves. The entry barrier stays a full barrier (the previous call may be a kernel that posts nothing after its
+// drain). gridDim.x must be a multiple of nRanks.
 template <typename T, int U = kDdaA2APushPeerUnroll>
 #if defined(USE_ROCM)
 __launch_bounds__(kDdaA2APushThreadsPerBlock)
 #endif
-  __global__ void ddaAllToAllFabricPushPeerPipe(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff,
-                                                size_t count, const T* __restrict__ sendbuff, int selfRank,
-                                                int nRanks, FabricGpuBarrier barrier, size_t partLines, int pieces) {
+  __global__ void ddaAllToAllFabricPushPeerPipe(T* const* __restrict__ ipcbuffs, T* recvbuff, size_t count,
+                                                const T* sendbuff, int selfRank, int nRanks, FabricGpuBarrier barrier,
+                                                size_t partLines, int pieces) {
   const uint32_t flag = barrier.beginEpoch();
   // Only local sendbuff is read before the next barrier, so no acquire is needed here.
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
@@ -288,8 +296,11 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
   const T* src = sendbuff + static_cast<size_t>(peer) * count;
 
   if (k == 0 || lineBegin >= lineEnd) {
-    // Own chunk (no remote write, no drain) or an empty part: nothing to signal or wait for.
-    if (lineBegin < lineEnd) ddaA2APushPeerCopy<U>(dst, src, lineBegin + threadIdx.x, lineEnd, blockDim.x);
+    // Own chunk (no remote write, no drain; in place it is already in recvbuff) or an empty part: nothing to signal
+    // or wait for.
+    if (lineBegin < lineEnd && dst != src) {
+      ddaA2APushPeerCopy<U>(dst, src, lineBegin + threadIdx.x, lineEnd, blockDim.x);
+    }
     barrier.endEpoch(flag + 1 + pieces);
     return;
   }
@@ -300,11 +311,10 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
     const size_t b = lineBegin + static_cast<size_t>(i) * pieceLines;
     return b < lineEnd ? b : lineEnd;
   };
-  const int srcRank = (selfRank - k + nRanks) % nRanks;
-  const size_t srcOff = static_cast<size_t>(srcRank) * count;
+  const size_t srcOff = static_cast<size_t>(peer) * count;
   const T* drainSrc = ipcbuffs[selfRank] + srcOff;
   T* drainDst = recvbuff + srcOff;
-  const FabricGpuBarrier::FlagType* ready = barrier.peerFlag(srcRank);
+  const FabricGpuBarrier::FlagType* ready = barrier.peerFlag(peer, static_cast<int>((nRanks - k) * nParts + part));
 
   for (int i = 0; i <= pieces; ++i) {
     if (i < pieces) ddaA2APushPeerCopy<U>(dst, src, pieceBegin(i) + threadIdx.x, pieceBegin(i + 1), blockDim.x);

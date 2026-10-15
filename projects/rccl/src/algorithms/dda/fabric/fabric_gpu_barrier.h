@@ -134,21 +134,25 @@ public:
   // for rank `from`, both for this block index. Same slots and epoch rules, so it can stand in for a full barrier
   // between this block and the one peer it writes to and the one it reads from; ranks it does not post to see
   // their slot stay behind until the next barrier posts a higher epoch.
+  // fromBlock: the block index of `from` whose post to wait for (the slot `from` writes from that block).
   __device__ __forceinline__ void signalWaitPeer(int to, int from, FlagType epoch) {
+    signalWaitPeer(to, from, static_cast<int>(blockIdx.x), epoch);
+  }
+  __device__ __forceinline__ void signalWaitPeer(int to, int from, int fromBlock, FlagType epoch) {
     __syncthreads();
     if (threadIdx.x == 0) {
       __scoped_atomic_store_n(peerFlags_[to] + getFlagIdx(selfRank_, blockIdx.x), epoch, __ATOMIC_RELAXED,
                               __MEMORY_SCOPE_SYSTEM);
-      FlagType* flag = peerFlags_[selfRank_] + getFlagIdx(from, blockIdx.x);
+      FlagType* flag = peerFlags_[selfRank_] + getFlagIdx(from, fromBlock);
       while (static_cast<int32_t>(__scoped_atomic_load_n(flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - epoch) < 0) {
       }
     }
     __syncthreads();
   }
 
-  // The slot rank `from` posts to for this block index, in this rank's flag buffer.
-  __device__ __forceinline__ const FlagType* peerFlag(int from) {
-    return peerFlags_[selfRank_] + getFlagIdx(from, blockIdx.x);
+  // The slot rank `from` posts to from its block `fromBlock`, in this rank's flag buffer.
+  __device__ __forceinline__ const FlagType* peerFlag(int from, int fromBlock) {
+    return peerFlags_[selfRank_] + getFlagIdx(from, fromBlock);
   }
 
   // Posts epoch to rank `to` for this block index, without waiting. The caller orders its prior writes.

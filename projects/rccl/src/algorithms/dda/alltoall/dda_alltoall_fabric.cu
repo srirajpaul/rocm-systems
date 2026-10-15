@@ -340,7 +340,10 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
     }
 
     dim3 peerGrid, peerBlock;
-    if (rcclParamDdaA2APushPeer() && sendbuff != recvbuff &&
+    // The pipelined kernel and the p2p drain sync pair each drain with the block that read the same sendbuff slot, so
+    // they also run in place; the full-barrier peer-major kernel does not.
+    const bool peerInPlace = rcclParamDdaA2APushPeerPipe() || rcclParamDdaA2APushPeerP2p();
+    if (rcclParamDdaA2APushPeer() && (sendbuff != recvbuff || peerInPlace) &&
         ddaAllToAllFabricPushPeerGeom(comm, count, &peerGrid, &peerBlock)) {
       const size_t partLines = ddaAllToAllFabricPushPeerPartUnits(count / sizeof(uint4), peerGrid.x / nRanks,
                                                                   sizeof(uint4));
