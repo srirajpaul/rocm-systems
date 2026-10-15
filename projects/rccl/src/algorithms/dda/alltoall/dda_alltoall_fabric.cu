@@ -46,6 +46,9 @@ RCCL_PARAM(DdaA2APushPeerBlocks, "DDA_A2A_PUSH_PEER_BLOCKS", 0);// Peer-major pu
 RCCL_PARAM(DdaA2APushPeerAlignKB, "DDA_A2A_PUSH_PEER_ALIGN_KB", 64);
 // Peer-major vector push: 16 B loads in flight per thread (2, 4, 8 or 16; other values use 8).
 RCCL_PARAM(DdaA2APushPeerUnroll, "DDA_A2A_PUSH_PEER_UNROLL", 8);
+// Peer-major vector push: replace the barrier between push and drain with a flag to the one peer a block wrote to and
+// a wait on the one peer whose slot it drains (the entry barrier stays a full barrier).
+RCCL_PARAM(DdaA2APushPeerP2p, "DDA_A2A_PUSH_PEER_P2P", 0);
 
 namespace {
 
@@ -328,27 +331,28 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
       const size_t partLines = ddaAllToAllFabricPushPeerPartUnits(count / sizeof(uint4), peerGrid.x / nRanks,
                                                                   sizeof(uint4));
       const int64_t unroll = rcclParamDdaA2APushPeerUnroll();
+      const bool p2p = rcclParamDdaA2APushPeerP2p() != 0;
       INFO(NCCL_COLL, "DDA fabric AllToAll: launching peer-major push kernel: nRanks=%d count=%zu grid=%u (%u per peer) "
-           "block=%u part=%zu B unroll=%ld", nRanks, count, peerGrid.x, peerGrid.x / nRanks, peerBlock.x,
-           partLines * sizeof(uint4), static_cast<long>(unroll));
+           "block=%u part=%zu B unroll=%ld%s", nRanks, count, peerGrid.x, peerGrid.x / nRanks, peerBlock.x,
+           partLines * sizeof(uint4), static_cast<long>(unroll), p2p ? " p2p" : "");
       auto* rb = static_cast<T*>(recvbuff);
       auto* sb = static_cast<const T*>(sendbuff);
       switch (unroll) {
       case 2:
         dda::common::ddaAllToAllFabricPushPeer<T, 2><<<peerGrid, peerBlock, 0, stream>>>(
-          d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines);
+          d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, p2p);
         break;
       case 4:
         dda::common::ddaAllToAllFabricPushPeer<T, 4><<<peerGrid, peerBlock, 0, stream>>>(
-          d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines);
+          d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, p2p);
         break;
       case 16:
         dda::common::ddaAllToAllFabricPushPeer<T, 16><<<peerGrid, peerBlock, 0, stream>>>(
-          d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines);
+          d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, p2p);
         break;
       default:
         dda::common::ddaAllToAllFabricPushPeer<T, 8><<<peerGrid, peerBlock, 0, stream>>>(
-          d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines);
+          d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, p2p);
         break;
       }
       CUDACHECK(cudaGetLastError());

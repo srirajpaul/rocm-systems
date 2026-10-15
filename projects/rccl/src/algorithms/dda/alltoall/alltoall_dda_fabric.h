@@ -203,7 +203,7 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
 #endif
   __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                             const T* __restrict__ sendbuff, int selfRank, int nRanks,
-                                            FabricGpuBarrier barrier, size_t partLines) {
+                                            FabricGpuBarrier barrier, size_t partLines, bool p2p) {
   const uint32_t flag = barrier.beginEpoch();
   // Only local sendbuff is read before the next barrier, so no acquire is needed here.
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
@@ -223,12 +223,19 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
   ddaA2APushPeerCopy<U>(dst, sendbuff + static_cast<size_t>(peer) * count, begin, lineEnd, blockDim.x);
 
   ddaFabricWaitMemOps();
-  // Publish our remote writes. The drain below reads only with system-scope loads, so no acquire is needed.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
-                             true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 2);
+  // Publish our remote writes. The drain below reads only with system-scope loads, so no acquire is needed. With p2p
+  // this block only tells the peer it wrote and waits for the peer whose slot it drains; blocks of this rank's own
+  // chunk (k == 0) neither wrote remotely nor drain, so they skip it.
+  const int srcRank = (selfRank - k + nRanks) % nRanks;
+  if (!p2p) {
+    barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
+                               true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 2);
+  } else if (k != 0) {
+    barrier.signalWaitPeer(peer, srcRank, flag + 2);
+  }
 
   if (k != 0) {
-    const size_t src = static_cast<size_t>((selfRank - k + nRanks) % nRanks) * count;
+    const size_t src = static_cast<size_t>(srcRank) * count;
     ddaA2APushPeerCopy<U>(recvbuff + src, ipcbuffs[selfRank] + src, begin, lineEnd, blockDim.x);
   }
   barrier.endEpoch(flag + 2);

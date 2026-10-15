@@ -130,6 +130,22 @@ public:
     }
   }
 
+  // Point-to-point form of syncOnSameBlockIdx<true, true, true, true>: posts epoch to rank `to` only and waits only
+  // for rank `from`, both for this block index. Same slots and epoch rules, so it can stand in for a full barrier
+  // between this block and the one peer it writes to and the one it reads from; ranks it does not post to see
+  // their slot stay behind until the next barrier posts a higher epoch.
+  __device__ __forceinline__ void signalWaitPeer(int to, int from, FlagType epoch) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      __scoped_atomic_store_n(peerFlags_[to] + getFlagIdx(selfRank_, blockIdx.x), epoch, __ATOMIC_RELAXED,
+                              __MEMORY_SCOPE_SYSTEM);
+      FlagType* flag = peerFlags_[selfRank_] + getFlagIdx(from, blockIdx.x);
+      while (static_cast<int32_t>(__scoped_atomic_load_n(flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - epoch) < 0) {
+      }
+    }
+    __syncthreads();
+  }
+
 private:
   int nBlocks_{-1};
   int selfRank_{-1};
