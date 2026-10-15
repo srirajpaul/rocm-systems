@@ -62,6 +62,9 @@ RCCL_PARAM(DdaA2APushPeerDbuf, "DDA_A2A_PUSH_PEER_DBUF", 0);
 RCCL_PARAM(DdaA2APushPeerSpread, "DDA_A2A_PUSH_PEER_SPREAD", 0);
 // Smallest per-peer chunk (bytes) that spreads; below it the own chunk keeps its blocks, which measured faster there.
 RCCL_PARAM(DdaA2APushPeerSpreadMin, "DDA_A2A_PUSH_PEER_SPREAD_MIN", 8ll << 20);
+// With spread, give the block slots the peer groups leave free (block cap minus the push grid) to the own-chunk copy
+// instead of a slice per push block (0 = slices). Falls back to slices when no slot is free.
+RCCL_PARAM(DdaA2APushPeerSpreadCopy, "DDA_A2A_PUSH_PEER_SPREAD_COPY", 1);
 
 namespace {
 
@@ -141,6 +144,13 @@ static inline int ddaAllToAllFabricPushPeerAutoPieces(size_t partBytes) {
 static inline bool ddaAllToAllFabricPushPeerSpread(ncclComm* comm, size_t bytes) {
   return rcclParamDdaA2APushPeerPipe() && rcclParamDdaA2APushPeerSpread() && comm->nRanks > 1 &&
          static_cast<int64_t>(bytes) >= rcclParamDdaA2APushPeerSpreadMin();
+}
+
+// Own-chunk copy blocks appended to a spread push grid of pushGrid blocks: the slots the block cap leaves free.
+static inline int ddaAllToAllFabricPushPeerCopyBlocks(ncclComm* comm, bool spread, uint32_t pushGrid) {
+  if (!spread || !rcclParamDdaA2APushPeerSpreadCopy()) return 0;
+  const int freeSlots = comm->ddaFabricMaxBlocks - static_cast<int>(pushGrid);
+  return freeSlots > 0 ? freeSlots : 0;
 }
 
 static inline int ddaAllToAllFabricTdmTileBytes() {
@@ -404,30 +414,32 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
       // One automatic piece runs the non-pipelined kernel with the p2p drain sync, which is faster at that size
       // (double buffering is only in the pipelined kernel).
       if (pipe && (pieces > 1 || !autoPieces || dbuf || spread)) {
+        const int copyBlocks = ddaAllToAllFabricPushPeerCopyBlocks(comm, spread, peerGrid.x);
         INFO(NCCL_COLL,
              "DDA fabric AllToAll: launching pipelined peer-major push kernel: nRanks=%d count=%zu grid=%u (%u per "
-             "peer) block=%u part=%zu B unroll=%ld pieces=%d%s%s%s",
+             "peer) block=%u part=%zu B unroll=%ld pieces=%d%s%s%s copyBlocks=%d",
              nRanks, count, peerGrid.x, peerGrid.x / groups, peerBlock.x, partLines * sizeof(uint4),
              static_cast<long>(unroll), pieces, autoPieces ? " (auto)" : "", dbuf ? " dbuf" : "",
-             spread ? " spread" : "");
+             spread ? " spread" : "", copyBlocks);
+        peerGrid.x += copyBlocks;
         auto* rb = static_cast<T*>(recvbuff);
         auto* sb = static_cast<const T*>(sendbuff);
         switch (unroll) {
         case 2:
           dda::common::ddaAllToAllFabricPushPeerPipe<T, 2><<<peerGrid, peerBlock, 0, stream>>>(
-            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces, halfOff, dbuf, spread);
+            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces, halfOff, dbuf, spread, copyBlocks);
           break;
         case 4:
           dda::common::ddaAllToAllFabricPushPeerPipe<T, 4><<<peerGrid, peerBlock, 0, stream>>>(
-            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces, halfOff, dbuf, spread);
+            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces, halfOff, dbuf, spread, copyBlocks);
           break;
         case 16:
           dda::common::ddaAllToAllFabricPushPeerPipe<T, 16><<<peerGrid, peerBlock, 0, stream>>>(
-            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces, halfOff, dbuf, spread);
+            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces, halfOff, dbuf, spread, copyBlocks);
           break;
         default:
           dda::common::ddaAllToAllFabricPushPeerPipe<T, 8><<<peerGrid, peerBlock, 0, stream>>>(
-            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces, halfOff, dbuf, spread);
+            d_ipcbuffs, rb, count, sb, comm->rank, nRanks, barrierHost, partLines, pieces, halfOff, dbuf, spread, copyBlocks);
           break;
         }
         CUDACHECK(cudaGetLastError());
@@ -582,6 +594,8 @@ uint32_t ncclAllToAllDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_
     if (!peerPush ||
         !ddaAllToAllFabricPushPeerGeom(comm, bytes, &grid, &block, spread ? comm->nRanks - 1 : comm->nRanks)) {
       grid = ddaAllToAllFabricVectorGeom(comm, bytes).first;
+    } else {
+      grid.x += ddaAllToAllFabricPushPeerCopyBlocks(comm, spread, grid.x);
     }
   }
   return grid.x * grid.y;

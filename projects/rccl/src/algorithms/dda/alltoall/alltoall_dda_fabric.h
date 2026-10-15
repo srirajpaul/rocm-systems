@@ -326,21 +326,43 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
   __global__ void ddaAllToAllFabricPushPeerPipe(T* const* __restrict__ ipcbuffs, T* recvbuff, size_t count,
                                                 const T* sendbuff, int selfRank, int nRanks, FabricGpuBarrier barrier,
                                                 size_t partLines, int pieces, size_t halfOff, bool dbuf,
-                                                bool spread) {
+                                                bool spread, int copyBlocks) {
   const uint32_t flag = barrier.beginEpoch();
   constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
   const size_t nLines = count / countPerThread;
-  // spread: no blocks for this rank's own chunk. The grid holds nRanks - 1 groups (peer offsets 1 .. nRanks - 1) and
-  // every block first copies a slice of the own chunk, sendbuff -> recvbuff (local; nothing to do in place), while the
-  // entry barrier below, if any, is still pending at the peers.
+  // spread: no peer group for this rank's own chunk; the grid holds nRanks - 1 groups (peer offsets 1 .. nRanks - 1).
+  // The own chunk, sendbuff -> recvbuff (local; nothing to do in place), is copied by the copyBlocks blocks at the end
+  // of the grid if there are any (they touch no fabric memory, so they skip the barrier), else every block first copies
+  // a slice of it while the entry barrier below, if any, is still pending at the peers.
   const int groups = spread ? nRanks - 1 : nRanks;
-  if (spread) {
+  const int pushBlocks = static_cast<int>(gridDim.x) - (spread ? copyBlocks : 0);
+  const size_t selfOff = static_cast<size_t>(selfRank) * count;
+  if (spread && copyBlocks > 0 && static_cast<int>(blockIdx.x) >= pushBlocks) {
+    constexpr size_t kSliceAlignLines = 4096 / sizeof(uint4);
+    const size_t sl =
+      ((nLines + copyBlocks - 1) / copyBlocks + kSliceAlignLines - 1) / kSliceAlignLines * kSliceAlignLines;
+    const size_t c = blockIdx.x - pushBlocks;
+    const size_t sb = c * sl < nLines ? c * sl : nLines;
+    const size_t se = sb + sl < nLines ? sb + sl : nLines;
+    if (sb < se && recvbuff + selfOff != sendbuff + selfOff) {
+      ddaA2APushPeerCopyM<U, false, false>(recvbuff + selfOff, sendbuff + selfOff, sb + threadIdx.x, se, blockDim.x);
+    }
+    uint32_t lastTag = 0;
+    const bool chainedCopy = dbuf && barrier.lastEndedWithRecord(flag, &lastTag);
+    const uint32_t copyHalf = chainedCopy ? (lastTag ^ 1u) : 0u;
+    if (dbuf) {
+      barrier.endEpochRecord(flag + 1 + pieces, copyHalf);
+    } else {
+      barrier.endEpoch(flag + 1 + pieces);
+    }
+    return;
+  }
+  if (spread && copyBlocks <= 0) {
     constexpr size_t kSliceAlignLines = 4096 / sizeof(uint4);
     const size_t sl =
       ((nLines + gridDim.x - 1) / gridDim.x + kSliceAlignLines - 1) / kSliceAlignLines * kSliceAlignLines;
     const size_t sb = blockIdx.x * sl < nLines ? blockIdx.x * sl : nLines;
     const size_t se = sb + sl < nLines ? sb + sl : nLines;
-    const size_t selfOff = static_cast<size_t>(selfRank) * count;
     if (sb < se && recvbuff + selfOff != sendbuff + selfOff) {
       ddaA2APushPeerCopyM<U, false, false>(recvbuff + selfOff, sendbuff + selfOff, sb + threadIdx.x, se, blockDim.x);
     }
@@ -369,7 +391,7 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
   };
 
   constexpr size_t kPieceAlignLines = 4096 / sizeof(uint4);
-  const size_t nParts = gridDim.x / groups;
+  const size_t nParts = pushBlocks / groups;
   const int k = static_cast<int>(blockIdx.x / nParts) + (spread ? 1 : 0);
   const size_t part = blockIdx.x % nParts;
   const size_t lineBegin = part * partLines;
