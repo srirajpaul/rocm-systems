@@ -246,6 +246,53 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
   barrier.endEpoch(flag + 2);
 }
 
+// 16 B line accesses: system scope (Sys) for fabric memory, i.e. peer scratch and this rank's scratch, which peers
+// write; plain for this GPU's own sendbuff and recvbuff, which only this GPU touches during the kernel.
+typedef unsigned ddaA2AV4 __attribute__((ext_vector_type(4)));
+typedef __attribute__((address_space(1))) ddaA2AV4* ddaA2AGV4;
+template <bool Sys>
+__device__ __forceinline__ void ddaA2ALoadLine(const uint32_t* p, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d) {
+  if constexpr (Sys) {
+    ddaLLLoadLineB128(p, a, b, c, d);
+  } else {
+    const ddaA2AV4 v = *(ddaA2AGV4)p;
+    a = v.x, b = v.y, c = v.z, d = v.w;
+  }
+}
+template <bool Sys>
+__device__ __forceinline__ void ddaA2AStoreLine(uint32_t* p, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+  if constexpr (Sys) {
+    ddaLLStoreLineB128(p, a, b, c, d);
+  } else {
+    const ddaA2AV4 v = {a, b, c, d};
+    *(ddaA2AGV4)p = v;
+  }
+}
+// ddaA2APushPeerCopy with the load and store scope chosen per side.
+template <int U, bool SysLoad, bool SysStore, typename T>
+__device__ __forceinline__ void ddaA2APushPeerCopyM(T* dst, const T* src, size_t begin, size_t end, size_t stride) {
+  constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
+  size_t i = begin;
+  for (; i + (U - 1) * stride < end; i += U * stride) {
+    uint32_t w[U][4];
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      ddaA2ALoadLine<SysLoad>(reinterpret_cast<const uint32_t*>(src + (i + u * stride) * countPerThread), w[u][0],
+                              w[u][1], w[u][2], w[u][3]);
+    }
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      ddaA2AStoreLine<SysStore>(reinterpret_cast<uint32_t*>(dst + (i + u * stride) * countPerThread), w[u][0],
+                                w[u][1], w[u][2], w[u][3]);
+    }
+  }
+  for (; i < end; i += stride) {
+    uint32_t w0, w1, w2, w3;
+    ddaA2ALoadLine<SysLoad>(reinterpret_cast<const uint32_t*>(src + i * countPerThread), w0, w1, w2, w3);
+    ddaA2AStoreLine<SysStore>(reinterpret_cast<uint32_t*>(dst + i * countPerThread), w0, w1, w2, w3);
+  }
+}
+
 // Waits for every store this wave has issued to complete.
 __device__ __forceinline__ void ddaA2AWaitWaveStores() {
 #if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
@@ -269,8 +316,9 @@ __device__ __forceinline__ void ddaA2AWaitWaveStores() {
 // is the one that read sendbuff slot (self + k), each thread on the lines it pushed, and the kernel runs in place.
 // Piece i's ready flag is epoch flag + 2 + i in the barrier slot this block owns at the peer, so values only grow and
 // the next barrier posts a higher one. Every wave polls the flag itself, so draining does not wait for the block's
-// other waves. The entry barrier stays a full barrier (the previous call may be a kernel that posts nothing after its
-// drain). gridDim.x must be a multiple of nRanks.
+// other waves. Scratch accesses are system scope; this GPU's own sendbuff and recvbuff use plain accesses. The entry
+// barrier stays a full barrier (the previous call may be a kernel that posts nothing after its drain). gridDim.x must
+// be a multiple of nRanks.
 template <typename T, int U = kDdaA2APushPeerUnroll>
 #if defined(USE_ROCM)
 __launch_bounds__(kDdaA2APushThreadsPerBlock)
@@ -299,7 +347,7 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
     // Own chunk (no remote write, no drain; in place it is already in recvbuff) or an empty part: nothing to signal
     // or wait for.
     if (lineBegin < lineEnd && dst != src) {
-      ddaA2APushPeerCopy<U>(dst, src, lineBegin + threadIdx.x, lineEnd, blockDim.x);
+      ddaA2APushPeerCopyM<U, false, false>(dst, src, lineBegin + threadIdx.x, lineEnd, blockDim.x);
     }
     barrier.endEpoch(flag + 1 + pieces);
     return;
@@ -317,13 +365,16 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
   const FabricGpuBarrier::FlagType* ready = barrier.peerFlag(peer, static_cast<int>((nRanks - k) * nParts + part));
 
   for (int i = 0; i <= pieces; ++i) {
-    if (i < pieces) ddaA2APushPeerCopy<U>(dst, src, pieceBegin(i) + threadIdx.x, pieceBegin(i + 1), blockDim.x);
+    if (i < pieces) {
+      ddaA2APushPeerCopyM<U, false, true>(dst, src, pieceBegin(i) + threadIdx.x, pieceBegin(i + 1), blockDim.x);
+    }
     if (i > 0) {
       const FabricGpuBarrier::FlagType want = flag + 1 + i;
       while (static_cast<int32_t>(__scoped_atomic_load_n(ready, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - want) < 0) {
       }
       __atomic_signal_fence(__ATOMIC_SEQ_CST);
-      ddaA2APushPeerCopy<U>(drainDst, drainSrc, pieceBegin(i - 1) + threadIdx.x, pieceBegin(i), blockDim.x);
+      ddaA2APushPeerCopyM<U, true, false>(drainDst, drainSrc, pieceBegin(i - 1) + threadIdx.x, pieceBegin(i),
+                                          blockDim.x);
     }
     if (i < pieces) {
       ddaA2AWaitWaveStores();
