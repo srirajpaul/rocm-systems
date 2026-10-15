@@ -146,6 +146,17 @@ public:
     __syncthreads();
   }
 
+  // The slot rank `from` posts to for this block index, in this rank's flag buffer.
+  __device__ __forceinline__ const FlagType* peerFlag(int from) {
+    return peerFlags_[selfRank_] + getFlagIdx(from, blockIdx.x);
+  }
+
+  // Posts epoch to rank `to` for this block index, without waiting. The caller orders its prior writes.
+  __device__ __forceinline__ void postPeer(int to, FlagType epoch) {
+    __scoped_atomic_store_n(peerFlags_[to] + getFlagIdx(selfRank_, blockIdx.x), epoch, __ATOMIC_RELAXED,
+                            __MEMORY_SCOPE_SYSTEM);
+  }
+
 private:
   int nBlocks_{-1};
   int selfRank_{-1};

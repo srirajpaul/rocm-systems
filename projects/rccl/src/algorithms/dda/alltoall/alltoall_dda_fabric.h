@@ -241,4 +241,87 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
   barrier.endEpoch(flag + 2);
 }
 
+// Waits for every store this wave has issued to complete.
+__device__ __forceinline__ void ddaA2AWaitWaveStores() {
+#if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#if defined(__gfx1250__)
+  asm volatile("s_wait_storecnt 0x0");
+#else
+  asm volatile("s_waitcnt vmcnt(0)");
+#endif
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#else
+  __threadfence_system();
+#endif
+}
+
+// Pipelined peer-major push: the same block roles and parts as ddaAllToAllFabricPushPeer, with each part cut into
+// `pieces` pieces of whole 4 KiB. Step i issues the push of piece i, then, while those stores are in flight, waits for
+// the source's piece i - 1 and drains it, and only then waits for its own stores and tells the peer piece i is ready;
+// a final step drains the last piece. Piece i's ready flag is epoch flag + 2 + i in the barrier slot this block owns
+// at the peer, so values only grow and the next barrier posts a higher one. Every wave polls the flag itself, so
+// draining does not wait for the block's other waves. The entry barrier stays a full barrier (the previous call may be
+// a kernel that posts nothing after its drain). Out of place only, gridDim.x a multiple of nRanks.
+template <typename T, int U = kDdaA2APushPeerUnroll>
+#if defined(USE_ROCM)
+__launch_bounds__(kDdaA2APushThreadsPerBlock)
+#endif
+  __global__ void ddaAllToAllFabricPushPeerPipe(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff,
+                                                size_t count, const T* __restrict__ sendbuff, int selfRank,
+                                                int nRanks, FabricGpuBarrier barrier, size_t partLines, int pieces) {
+  const uint32_t flag = barrier.beginEpoch();
+  // Only local sendbuff is read before the next barrier, so no acquire is needed here.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
+                             true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 1);
+
+  constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
+  constexpr size_t kPieceAlignLines = 4096 / sizeof(uint4);
+  const size_t nParts = gridDim.x / nRanks;
+  const int k = static_cast<int>(blockIdx.x / nParts);
+  const size_t part = blockIdx.x % nParts;
+  const size_t nLines = count / countPerThread;
+  const size_t lineBegin = part * partLines;
+  const size_t lineEnd = lineBegin + partLines < nLines ? lineBegin + partLines : nLines;
+  const int peer = (selfRank + k) % nRanks;
+  T* dst = (k == 0 ? recvbuff : ipcbuffs[peer]) + static_cast<size_t>(selfRank) * count;
+  const T* src = sendbuff + static_cast<size_t>(peer) * count;
+
+  if (k == 0 || lineBegin >= lineEnd) {
+    // Own chunk (no remote write, no drain) or an empty part: nothing to signal or wait for.
+    if (lineBegin < lineEnd) ddaA2APushPeerCopy<U>(dst, src, lineBegin + threadIdx.x, lineEnd, blockDim.x);
+    barrier.endEpoch(flag + 1 + pieces);
+    return;
+  }
+
+  const size_t pieceLines =
+    (((lineEnd - lineBegin + pieces - 1) / pieces + kPieceAlignLines - 1) / kPieceAlignLines) * kPieceAlignLines;
+  auto pieceBegin = [&](int i) {
+    const size_t b = lineBegin + static_cast<size_t>(i) * pieceLines;
+    return b < lineEnd ? b : lineEnd;
+  };
+  const int srcRank = (selfRank - k + nRanks) % nRanks;
+  const size_t srcOff = static_cast<size_t>(srcRank) * count;
+  const T* drainSrc = ipcbuffs[selfRank] + srcOff;
+  T* drainDst = recvbuff + srcOff;
+  const FabricGpuBarrier::FlagType* ready = barrier.peerFlag(srcRank);
+
+  for (int i = 0; i <= pieces; ++i) {
+    if (i < pieces) ddaA2APushPeerCopy<U>(dst, src, pieceBegin(i) + threadIdx.x, pieceBegin(i + 1), blockDim.x);
+    if (i > 0) {
+      const FabricGpuBarrier::FlagType want = flag + 1 + i;
+      while (static_cast<int32_t>(__scoped_atomic_load_n(ready, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - want) < 0) {
+      }
+      __atomic_signal_fence(__ATOMIC_SEQ_CST);
+      ddaA2APushPeerCopy<U>(drainDst, drainSrc, pieceBegin(i - 1) + threadIdx.x, pieceBegin(i), blockDim.x);
+    }
+    if (i < pieces) {
+      ddaA2AWaitWaveStores();
+      __syncthreads();
+      if (threadIdx.x == 0) barrier.postPeer(peer, flag + 2 + i);
+    }
+  }
+  barrier.endEpoch(flag + 1 + pieces);
+}
+
 } // namespace dda::common
