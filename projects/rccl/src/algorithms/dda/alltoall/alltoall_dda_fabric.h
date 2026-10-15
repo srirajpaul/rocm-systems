@@ -318,15 +318,33 @@ __device__ __forceinline__ void ddaA2AWaitWaveStores() {
 // the next barrier posts a higher one. Every wave polls the flag itself, so draining does not wait for the block's
 // other waves. Scratch accesses are system scope; this GPU's own sendbuff and recvbuff use plain accesses. The entry
 // barrier stays a full barrier (the previous call may be a kernel that posts nothing after its drain). gridDim.x must
-// be a multiple of nRanks.
+// be a multiple of nRanks, or of nRanks - 1 with spread (see below).
 template <typename T, int U = kDdaA2APushPeerUnroll>
 #if defined(USE_ROCM)
 __launch_bounds__(kDdaA2APushThreadsPerBlock)
 #endif
   __global__ void ddaAllToAllFabricPushPeerPipe(T* const* __restrict__ ipcbuffs, T* recvbuff, size_t count,
                                                 const T* sendbuff, int selfRank, int nRanks, FabricGpuBarrier barrier,
-                                                size_t partLines, int pieces, size_t halfOff, bool dbuf) {
+                                                size_t partLines, int pieces, size_t halfOff, bool dbuf,
+                                                bool spread) {
   const uint32_t flag = barrier.beginEpoch();
+  constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
+  const size_t nLines = count / countPerThread;
+  // spread: no blocks for this rank's own chunk. The grid holds nRanks - 1 groups (peer offsets 1 .. nRanks - 1) and
+  // every block first copies a slice of the own chunk, sendbuff -> recvbuff (local; nothing to do in place), while the
+  // entry barrier below, if any, is still pending at the peers.
+  const int groups = spread ? nRanks - 1 : nRanks;
+  if (spread) {
+    constexpr size_t kSliceAlignLines = 4096 / sizeof(uint4);
+    const size_t sl =
+      ((nLines + gridDim.x - 1) / gridDim.x + kSliceAlignLines - 1) / kSliceAlignLines * kSliceAlignLines;
+    const size_t sb = blockIdx.x * sl < nLines ? blockIdx.x * sl : nLines;
+    const size_t se = sb + sl < nLines ? sb + sl : nLines;
+    const size_t selfOff = static_cast<size_t>(selfRank) * count;
+    if (sb < se && recvbuff + selfOff != sendbuff + selfOff) {
+      ddaA2APushPeerCopyM<U, false, false>(recvbuff + selfOff, sendbuff + selfOff, sb + threadIdx.x, se, blockDim.x);
+    }
+  }
   // Double buffering (dbuf): the scratch is used in two halves, halfOff elements apart. If the last fabric kernel on
   // the communicator was this one in dbuf mode (its records still match the epoch cells), that launch finished on this
   // rank only after every peer had started it, so every peer finished the launch before, the last one to use the other
@@ -350,12 +368,10 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
     }
   };
 
-  constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
   constexpr size_t kPieceAlignLines = 4096 / sizeof(uint4);
-  const size_t nParts = gridDim.x / nRanks;
-  const int k = static_cast<int>(blockIdx.x / nParts);
+  const size_t nParts = gridDim.x / groups;
+  const int k = static_cast<int>(blockIdx.x / nParts) + (spread ? 1 : 0);
   const size_t part = blockIdx.x % nParts;
-  const size_t nLines = count / countPerThread;
   const size_t lineBegin = part * partLines;
   const size_t lineEnd = lineBegin + partLines < nLines ? lineBegin + partLines : nLines;
   const int peer = (selfRank + k) % nRanks;
@@ -381,7 +397,8 @@ __launch_bounds__(kDdaA2APushThreadsPerBlock)
   const size_t srcOff = static_cast<size_t>(peer) * count;
   const T* drainSrc = ipcbuffs[selfRank] + dataOff + srcOff;
   T* drainDst = recvbuff + srcOff;
-  const FabricGpuBarrier::FlagType* ready = barrier.peerFlag(peer, static_cast<int>((nRanks - k) * nParts + part));
+  const int partner = static_cast<int>((nRanks - k - (spread ? 1 : 0)) * nParts + part);
+  const FabricGpuBarrier::FlagType* ready = barrier.peerFlag(peer, partner);
 
   for (int i = 0; i <= pieces; ++i) {
     if (i < pieces) {
