@@ -131,20 +131,17 @@ TEST(SymkBlockWidthTest, AllReduceLDWideAboveOccupancyBound)
 }
 
 // ===========================================================================
-// ReduceScatter LD: wide below 1 MB bus, widest to 16 MB bus, narrow above.
+// ReduceScatter LD: wide below 16 MB bus, narrow above.
 // Thresholds are bus bytes, so they match the rccl-tests size column.
 // ===========================================================================
 
 TEST(SymkBlockWidthTest, ReduceScatterLDBands)
 {
-    // Below the 1 MB bus floor.
+    // Below 16 MB bus takes the wide block.
     EXPECT_EQ(ldWidth(ncclFuncReduceScatter, busToBytes(512 * KiB)), kWide);
-    EXPECT_EQ(ldWidth(ncclFuncReduceScatter, busToBytes(1 * MiB) - 1), kWide);
-
-    // 1 MB to 16 MB bus takes the widest block.
-    EXPECT_EQ(ldWidth(ncclFuncReduceScatter, busToBytes(1 * MiB)), kWidest);
-    EXPECT_EQ(ldWidth(ncclFuncReduceScatter, busToBytes(8 * MiB)), kWidest);
-    EXPECT_EQ(ldWidth(ncclFuncReduceScatter, busToBytes(16 * MiB) - 1), kWidest);
+    EXPECT_EQ(ldWidth(ncclFuncReduceScatter, busToBytes(1 * MiB)), kWide);
+    EXPECT_EQ(ldWidth(ncclFuncReduceScatter, busToBytes(8 * MiB)), kWide);
+    EXPECT_EQ(ldWidth(ncclFuncReduceScatter, busToBytes(16 * MiB) - 1), kWide);
 
     // 16 MB bus and up narrows to keep iterations per globally strided warp high.
     EXPECT_EQ(ldWidth(ncclFuncReduceScatter, busToBytes(16 * MiB)), kNarrow);

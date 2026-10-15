@@ -410,7 +410,6 @@ bool ncclSymkAvailable(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRedO
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 // Thresholds bounding the block width of the gfx950 symmetric kernels, fitted on 8 ranks only.
 // ReduceScatter's and AllGather's are bus bytes since their counts are per rank. AllReduce's are message bytes.
-static constexpr size_t ncclSymkRsWideBlockMinBusBytes = 1 << 20;
 static constexpr size_t ncclSymkRsNarrowBlockBusBytes = 16 << 20;
 static constexpr size_t ncclSymkArTailSaturatedBytes = 512 << 10;
 static constexpr size_t ncclSymkArDeepTierBytes = 2 << 20;
@@ -425,7 +424,6 @@ static constexpr size_t ncclSymkAgStoreMinBusBytes = 1 << 20;
 // Block widths those thresholds select between. 1024 is the widest workgroup gfx950 will launch.
 static constexpr int ncclSymkGfx950NarrowThreads = 256;
 static constexpr int ncclSymkGfx950WideThreads = 512;
-static constexpr int ncclSymkGfx950WidestThreads = 1024;
 
 bool ncclSymkGfx950AllGatherPrefersStore(int nRanks, size_t nBytes) {
   return size_t(nRanks) * nBytes >= ncclSymkAgStoreMinBusBytes;
@@ -449,12 +447,10 @@ int ncclSymkGfx950BlockThreads(ncclFunc_t coll, bool isLL, int nRanks, size_t nB
   }
 
   if (coll == ncclFuncReduceScatter) {
-    // Small sizes are latency bound on per-peer loads and want every thread. Large ones are
+    // Small sizes are latency bound on per-peer loads and want the wider block. Large ones are
     // bandwidth bound, where a narrower block keeps iterations per globally strided warp high.
     size_t busBytes = size_t(nRanks) * nBytes;
-    if (busBytes >= ncclSymkRsNarrowBlockBusBytes) return ncclSymkGfx950NarrowThreads;
-    if (busBytes >= ncclSymkRsWideBlockMinBusBytes) return ncclSymkGfx950WidestThreads;
-    return ncclSymkGfx950WideThreads;
+    return busBytes >= ncclSymkRsNarrowBlockBusBytes ? ncclSymkGfx950NarrowThreads : ncclSymkGfx950WideThreads;
   }
 
   // AllReduce folds rank into its thread index, so across the deep tiers a wider block halves
