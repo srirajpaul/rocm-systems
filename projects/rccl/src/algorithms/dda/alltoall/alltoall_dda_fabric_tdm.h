@@ -353,8 +353,9 @@ __launch_bounds__(512)
 // flag + 2 + i in the slot this block owns at the peer; every wave polls the flag itself. The entry barrier stays a
 // full barrier unless dbuf chains it (double-buffered scratch, as in ddaAllToAllFabricPushPeerPipe; the two kernels
 // share the records and the half offset, so either can follow the other). spread: no peer group for the own chunk
-// (nRanks - 1 groups) and every block first copies a slice of it, as in ddaAllToAllFabricPushPeerPipe. gridDim.x must
-// be a multiple of the number of groups.
+// (nRanks - 1 groups), as in ddaAllToAllFabricPushPeerPipe; the copyBlocks blocks at the end of the grid copy it (they
+// touch no fabric memory, so they skip the barrier), else every block first copies a slice of it. gridDim.x minus
+// copyBlocks must be a multiple of the number of groups.
 template <int TileBytes, int UnrollTiles>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
@@ -362,11 +363,23 @@ __launch_bounds__(512)
   __global__ void ddaAllToAllFabricTdmPushPeerPipe(uint8_t* const* __restrict__ peerScratch, uint8_t* recvbuff,
                                                    const uint8_t* sendbuff, size_t bytesPerRank, int selfRank,
                                                    int nRanks, FabricGpuBarrier barrier, size_t partTiles,
-                                                   int pieces, size_t halfOff, bool dbuf, bool spread) {
+                                                   int pieces, size_t halfOff, bool dbuf, bool spread,
+                                                   int copyBlocks) {
   static_assert(TileBytes * UnrollTiles <= kDdaA2ATdmWindowBytes, "tiles overflow the per-warp LDS window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
   const uint32_t flag = barrier.beginEpoch();
+  uint32_t lastHalf = 0;
+  const bool chained = dbuf && barrier.lastEndedWithRecord(flag, &lastHalf);
+  const uint32_t half = chained ? (lastHalf ^ 1u) : 0u;
+  const size_t dataOff = static_cast<size_t>(half) * halfOff;
+  auto finish = [&]() {
+    if (dbuf) {
+      barrier.endEpochRecord(flag + 1 + pieces, half);
+    } else {
+      barrier.endEpoch(flag + 1 + pieces);
+    }
+  };
 
   extern __shared__ __attribute__((aligned(128))) uint8_t ddaA2ATdmSmem[];
   // TDM descriptors live in SGPRs, so every address below must be wave-uniform.
@@ -376,37 +389,36 @@ __launch_bounds__(512)
   const size_t stride = (blockDim.x / warpSize) * UnrollTiles;
   const size_t tilesPerPeer = (bytesPerRank + TileBytes - 1) / TileBytes;
   const int groups = spread ? nRanks - 1 : nRanks;
+  const int pushBlocks = static_cast<int>(gridDim.x) - (spread ? copyBlocks : 0);
   if (spread) {
-    // Own chunk, sendbuff -> recvbuff (local; nothing to do in place): a slice per block, copied while the entry
-    // barrier below, if any, is still pending at the peers.
-    const size_t selfOff = static_cast<size_t>(selfRank) * bytesPerRank;
-    const size_t sl = (tilesPerPeer + gridDim.x - 1) / gridDim.x;
-    const size_t sb = blockIdx.x * sl < tilesPerPeer ? blockIdx.x * sl : tilesPerPeer;
-    const size_t se = sb + sl < tilesPerPeer ? sb + sl : tilesPerPeer;
-    if (sb < se && recvbuff + selfOff != sendbuff + selfOff) {
-      ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(recvbuff + selfOff, sendbuff + selfOff, bytesPerRank, sb + warpOff,
-                                                 se, stride, win);
+    // Own chunk, sendbuff -> recvbuff (local; nothing to do in place): by the copy blocks if any, else a slice per
+    // block, copied while the entry barrier below, if any, is still pending at the peers.
+    const bool copyBlock = copyBlocks > 0 && static_cast<int>(blockIdx.x) >= pushBlocks;
+    const size_t nSlices = copyBlocks > 0 ? static_cast<size_t>(copyBlocks) : gridDim.x;
+    const size_t s = copyBlocks > 0 ? blockIdx.x - pushBlocks : blockIdx.x;
+    if (copyBlocks <= 0 || copyBlock) {
+      const size_t selfOff = static_cast<size_t>(selfRank) * bytesPerRank;
+      const size_t sl = (tilesPerPeer + nSlices - 1) / nSlices;
+      const size_t sb = s * sl < tilesPerPeer ? s * sl : tilesPerPeer;
+      const size_t se = sb + sl < tilesPerPeer ? sb + sl : tilesPerPeer;
+      if (sb < se && recvbuff + selfOff != sendbuff + selfOff) {
+        ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(recvbuff + selfOff, sendbuff + selfOff, bytesPerRank, sb + warpOff,
+                                                   se, stride, win);
+      }
+    }
+    if (copyBlock) {
+      finish();
+      return;
     }
   }
 
-  uint32_t lastHalf = 0;
-  const bool chained = dbuf && barrier.lastEndedWithRecord(flag, &lastHalf);
-  const uint32_t half = chained ? (lastHalf ^ 1u) : 0u;
-  const size_t dataOff = static_cast<size_t>(half) * halfOff;
   // Only local sendbuff is read before the next barrier, so no acquire is needed here.
   if (!chained) {
     barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */,
                                true /* sysScopeWrites */, true /* sysScopeReads */>(flag + 1);
   }
-  auto finish = [&]() {
-    if (dbuf) {
-      barrier.endEpochRecord(flag + 1 + pieces, half);
-    } else {
-      barrier.endEpoch(flag + 1 + pieces);
-    }
-  };
 
-  const size_t nParts = gridDim.x / groups;
+  const size_t nParts = pushBlocks / groups;
   const int k = static_cast<int>(blockIdx.x / nParts) + (spread ? 1 : 0);
   const size_t part = blockIdx.x % nParts;
   const size_t tileBegin = part * partTiles;
@@ -461,7 +473,7 @@ __launch_bounds__(512)
 #else
   // Only dispatched on gfx1250; every other arch still has to compile this kernel.
   (void)peerScratch, (void)recvbuff, (void)sendbuff, (void)bytesPerRank, (void)selfRank, (void)nRanks, (void)barrier,
-    (void)partTiles, (void)pieces, (void)halfOff, (void)dbuf, (void)spread;
+    (void)partTiles, (void)pieces, (void)halfOff, (void)dbuf, (void)spread, (void)copyBlocks;
   __builtin_trap();
 #endif
 }

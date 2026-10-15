@@ -267,16 +267,18 @@ static ncclResult_t ncclAllToAllDdaFabricTdmPushPeerLaunch(const void* sendbuff,
     // Same half offset and condition as the vector pipelined push, which shares the double-buffer records.
     const size_t halfOff = (comm->ddaScratchBytes / 2) & ~static_cast<size_t>(4095);
     const bool dbuf = rcclParamDdaA2APushPeerDbuf() && static_cast<size_t>(comm->nRanks) * bytesPerRank <= halfOff;
+    const int copyBlocks = ddaAllToAllFabricPushPeerCopyBlocks(comm, spread, grid.x);
     INFO(NCCL_COLL,
          "DDA fabric AllToAll: launching pipelined TDM peer-major push kernel: nRanks=%d count=%zu tile=%d x%d "
-         "grid=%u (%u per peer) block=%u part=%zu B pieces=%d%s%s%s lds=%zu",
+         "grid=%u (%u per peer) block=%u part=%zu B pieces=%d%s%s%s copyBlocks=%d lds=%zu",
          comm->nRanks, bytesPerRank, TileBytes, kUnrollTiles, grid.x, grid.x / groups, block.x,
          partTiles * TileBytes, pieces, autoPieces ? " (auto)" : "", dbuf ? " dbuf" : "", spread ? " spread" : "",
-         dynSmem);
+         copyBlocks, dynSmem);
+    grid.x += copyBlocks;
     dda::common::ddaAllToAllFabricTdmPushPeerPipe<TileBytes, kUnrollTiles><<<grid, block, dynSmem, stream>>>(
       reinterpret_cast<uint8_t* const*>(comm->ddaPeerPtrsDev), static_cast<uint8_t*>(recvbuff),
       static_cast<const uint8_t*>(sendbuff), bytesPerRank, comm->rank, comm->nRanks, barrierHost, partTiles, pieces,
-      halfOff, dbuf, spread);
+      halfOff, dbuf, spread, copyBlocks);
     *launched = true;
     return ncclSuccess;
   }
@@ -602,6 +604,8 @@ uint32_t ncclAllToAllDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_
     if (!peerPush || !ddaAllToAllFabricTdmPushPeerGeom(comm, bytes, tileBytes, &grid, &block, &partTiles,
                                                        spread ? comm->nRanks - 1 : comm->nRanks)) {
       grid = ddaAllToAllFabricTdmGeom(comm, bytes, tileBytes).first;
+    } else {
+      grid.x += ddaAllToAllFabricPushPeerCopyBlocks(comm, spread, grid.x);
     }
   } else {
     const bool spread = ddaAllToAllFabricPushPeerSpread(comm, bytes);
