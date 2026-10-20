@@ -24,6 +24,10 @@
 
 // Push model: each rank writes its chunks into peers' scratch instead of reading from them. Env: RCCL_DDA_A2A_PUSH.
 RCCL_PARAM(DdaA2APush, "DDA_A2A_PUSH", 0);
+// Peer-major push: each block serves one peer (out of place only). Env: RCCL_DDA_A2A_PUSH_PEER.
+RCCL_PARAM(DdaA2APushPeer, "DDA_A2A_PUSH_PEER", 0);
+// Peer-major push threads per block (one warp .. 512, multiple of 64).
+RCCL_PARAM(DdaA2APushPeerThreads, "DDA_A2A_PUSH_PEER_THREADS", 256);
 
 namespace {
 
@@ -33,6 +37,24 @@ using nccl_dda_detail::DdaFabricBarrierState;
 // kernel is instantiated for int8_t, so `bytes` is the per-block element count.
 static inline std::pair<dim3, dim3> ddaAllToAllFabricGeom(ncclComm* comm, size_t bytes) {
   return dda::common::getGridAndBlockDims(bytes, 1, comm->ddaFabricMaxBlocks);
+}
+
+// Peer-major push grid: nRanks groups of blocks, one group per peer offset, within the barrier's block cap.
+// Depends only on bytes, so every rank launches the same grid. Returns false when the cap cannot give every peer
+// a block.
+static inline bool ddaAllToAllFabricPushPeerGeom(ncclComm* comm, size_t bytes, dim3* grid, dim3* block) {
+  constexpr uint32_t kThreadsPerWarp = 64;
+  const uint32_t maxPerPeer = static_cast<uint32_t>(comm->ddaFabricMaxBlocks) / comm->nRanks;
+  if (maxPerPeer == 0) return false;
+  const int64_t t = rcclParamDdaA2APushPeerThreads();
+  const uint32_t threadsCap =
+    (t >= kThreadsPerWarp && t <= 512) ? static_cast<uint32_t>(t) / kThreadsPerWarp * kThreadsPerWarp : 256;
+  const size_t lines = dda::common::divRoundUp(bytes, sizeof(uint4));
+  const uint32_t perPeer = std::min<uint32_t>(maxPerPeer, dda::common::divRoundUp(lines, threadsCap));
+  const uint32_t warps = dda::common::divRoundUp(dda::common::divRoundUp(lines, perPeer), kThreadsPerWarp);
+  *grid = dim3(perPeer * comm->nRanks, 1, 1);
+  *block = dim3(std::min<uint32_t>(threadsCap, warps * kThreadsPerWarp), 1, 1);
+  return true;
 }
 
 template <typename T>
@@ -62,6 +84,23 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
 
   void* peerPtrsDev = comm->ddaPeerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
+
+  // In-place calls take the vector push: a peer-major block drains into recvbuff slots that other blocks may
+  // still be reading from sendbuff.
+  dim3 peerGrid, peerBlock;
+  if (rcclParamDdaA2APush() && rcclParamDdaA2APushPeer() && sendbuff != recvbuff &&
+      ddaAllToAllFabricPushPeerGeom(comm, count, &peerGrid, &peerBlock)) {
+    INFO(NCCL_COLL,
+         "DDA fabric AllToAll: launching peer-major push kernel: nRanks=%d count=%zu grid=%u (%u per peer) block=%u",
+         nRanks, count, peerGrid.x, peerGrid.x / nRanks, peerBlock.x);
+
+    const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
+    hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPushPeer<T>), peerGrid, peerBlock, 0, stream,
+                          /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<T*>(recvbuff), count,
+                          static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+    CUDACHECK(cudaGetLastError());
+    return ncclSuccess;
+  }
 
   if (rcclParamDdaA2APush()) {
     INFO(NCCL_COLL, "DDA fabric AllToAll: launching push kernel: nRanks=%d count=%zu grid=%u block=%u%s", nRanks,
@@ -163,7 +202,12 @@ bool ncclAllToAllDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* r
 }
 
 uint32_t ncclAllToAllDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_t datatype) {
-  const auto grid = ddaAllToAllFabricGeom(comm, count * ncclTypeSize(datatype)).first;
+  const size_t bytes = count * ncclTypeSize(datatype);
+  dim3 grid, block;
+  if (!rcclParamDdaA2APush() || !rcclParamDdaA2APushPeer() ||
+      !ddaAllToAllFabricPushPeerGeom(comm, bytes, &grid, &block)) {
+    grid = ddaAllToAllFabricGeom(comm, bytes).first;
+  }
   return grid.x * grid.y;
 }
 

@@ -113,4 +113,80 @@ __launch_bounds__(512)
   }
 }
 
+constexpr int kDdaA2APushPeerUnroll = 8;
+
+template <bool sysScope>
+__device__ __forceinline__ void ddaA2APushPeerStore(uint4* p, const uint4& v) {
+  if constexpr (sysScope) {
+    ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(p), v.x, v.y, v.z, v.w);
+  } else {
+    *p = v;
+  }
+}
+
+// Copies 16 B lines i = begin, begin + stride, ... < end of src to dst, kDdaA2APushPeerUnroll loads in flight per
+// thread. sysScopeStore selects system-scope stores, whose helper is a compiler memory barrier, so every load of a
+// group is issued before its stores. Full groups carry no per-line bounds check; leftover lines are copied one at a
+// time.
+template <bool sysScopeStore, typename T>
+__device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t begin, size_t end, size_t stride) {
+  constexpr int U = kDdaA2APushPeerUnroll;
+  const uint4* s = reinterpret_cast<const uint4*>(src);
+  uint4* d = reinterpret_cast<uint4*>(dst);
+  size_t i = begin;
+  for (; i + (U - 1) * stride < end; i += U * stride) {
+    uint4 v[U];
+#pragma unroll
+    for (int u = 0; u < U; ++u) v[u] = s[i + u * stride];
+#pragma unroll
+    for (int u = 0; u < U; ++u) ddaA2APushPeerStore<sysScopeStore>(&d[i + u * stride], v[u]);
+  }
+  for (; i < end; i += stride) {
+    ddaA2APushPeerStore<sysScopeStore>(&d[i], s[i]);
+  }
+}
+
+// Peer-major push: every block serves a single peer, so its stores stream to one destination instead of one line to
+// each rank. With P = gridDim.x / nRanks blocks per peer, block b serves peer offset k = b / P, and the P blocks of a
+// group interleave over the chunk one block-sized run of 16 B lines at a time. The block pushes chunk (self + k) of
+// sendbuff into that peer's scratch at slot selfRank with system-scope stores, and after the closing barrier drains
+// the slot of peer (self - k), which that peer's block b wrote, so the per-block barrier pairs the write with the
+// read. k == 0 copies sendbuff straight to recvbuff and drains nothing.
+// gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
+// this rank may still be reading from sendbuff.
+template <typename T>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+  __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
+                                            const T* __restrict__ sendbuff, int selfRank, int nRanks,
+                                            FabricGpuBarrier barrier) {
+  // A peer's scratch is free to overwrite once that peer has reached this op.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+
+  constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
+  const unsigned perPeer = gridDim.x / nRanks;
+  const int k = static_cast<int>(blockIdx.x / perPeer);
+  const size_t nLines = count / countPerThread;
+  const size_t begin = static_cast<size_t>(blockIdx.x % perPeer) * blockDim.x + threadIdx.x;
+  const size_t stride = static_cast<size_t>(perPeer) * blockDim.x;
+
+  const int peer = (selfRank + k) % nRanks;
+  const T* src = sendbuff + static_cast<size_t>(peer) * count;
+  const size_t selfSlot = static_cast<size_t>(selfRank) * count;
+  if (k == 0) {
+    ddaA2APushPeerCopy<false>(recvbuff + selfSlot, src, begin, nLines, stride);
+  } else {
+    ddaA2APushPeerCopy<true>(ipcbuffs[peer] + selfSlot, src, begin, nLines, stride);
+  }
+
+  // Release our remote writes and acquire every peer's writes into our scratch.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+
+  if (k != 0) {
+    const size_t slot = static_cast<size_t>((selfRank - k + nRanks) % nRanks) * count;
+    ddaA2APushPeerCopy<false>(recvbuff + slot, ipcbuffs[selfRank] + slot, begin, nLines, stride);
+  }
+}
+
 } // namespace dda::common
