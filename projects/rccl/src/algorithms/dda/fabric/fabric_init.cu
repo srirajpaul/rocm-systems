@@ -191,14 +191,9 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
 
   // Device epoch cells for the LL collectives: zero-initialised
   // so the first device-derived flag is 1. Bumped on the device every LL launch.
-  // Followed by the barrier's per-block-slot records ({epoch, tag} for nBlocksMax slots, FabricGpuBarrier::setRecords),
-  // all ones so that no record matches before a kernel has written one.
-  CUDACHECKGOTO(cudaMalloc(&epochDev, (epochLen + 2 * static_cast<size_t>(nBlocksMax)) * sizeof(uint32_t)), res, fail);
+  CUDACHECKGOTO(cudaMalloc(&epochDev, epochLen * sizeof(uint32_t)), res, fail);
   CUDACHECKGOTO(cudaMemset(epochDev, 0, epochLen * sizeof(uint32_t)), res, fail);
-  CUDACHECKGOTO(cudaMemset(epochDev + epochLen, 0xff, 2 * static_cast<size_t>(nBlocksMax) * sizeof(uint32_t)), res,
-                fail);
   barrierState->barrierHost.setEpochs(epochDev, (int)epochLen);
-  barrierState->barrierHost.setRecords(epochDev + epochLen);
 
   // Success: hand ownership of every resource to comm.
   comm->ddaFabricMemHandler = handler;
@@ -241,15 +236,6 @@ fail:
   if (scratch != nullptr) {
     (void)ncclCuMemFree(scratch, comm->memManager);
   }
-  return ncclSuccess;
-}
-
-ncclResult_t ncclDdaFabricScratchUsedOutsideEpochs(ncclComm* comm, cudaStream_t stream) {
-  if (comm == nullptr || comm->ddaLLEpochDev == nullptr || comm->ddaFabricMaxBlocks < 1) {
-    return ncclSuccess;
-  }
-  CUDACHECK(cudaMemsetAsync(comm->ddaLLEpochDev + comm->ddaLLEpochLen, 0xff,
-                            2 * static_cast<size_t>(comm->ddaFabricMaxBlocks) * sizeof(uint32_t), stream));
   return ncclSuccess;
 }
 

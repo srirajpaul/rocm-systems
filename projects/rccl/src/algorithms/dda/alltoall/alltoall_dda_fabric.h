@@ -173,12 +173,6 @@ __device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t 
 // remote stores are in flight, then posts piece p. Piece p's flag is epoch flag + 2 + p in the block's slot at the
 // peer; values only grow, so a post does not wait for the destination. The drain reads with system-scope loads, so no
 // fence is needed per piece.
-// Double buffering (dbuf): the scratch is used in two halves, halfOff elements apart. If the last fabric kernel on the
-// communicator was a peer-major push in dbuf mode (its records still match the epoch cells), that launch finished on
-// this rank only after every peer had started it (each block waits for its source peer, and the groups cover every
-// peer), so every peer finished the launch before, the last one to use the other half: use that half without an entry
-// barrier. A peer can then be at most one launch behind, and it only touches the half its own launch uses. Otherwise
-// use half 0 behind the full entry barrier.
 // gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
 // this rank may still be reading from sendbuff.
 template <typename T>
@@ -187,16 +181,10 @@ __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                             const T* __restrict__ sendbuff, int selfRank, int nRanks,
-                                            FabricGpuBarrier barrier, size_t pieceLines, size_t halfOff, bool dbuf) {
+                                            FabricGpuBarrier barrier, size_t pieceLines) {
   const uint32_t flag = barrier.beginEpoch();
-  uint32_t lastHalf = 0;
-  const bool chained = dbuf && barrier.lastEndedWithRecord(flag, &lastHalf);
-  const uint32_t half = chained ? (lastHalf ^ 1u) : 0u;
-  const size_t dataOff = static_cast<size_t>(half) * halfOff;
   // A peer's scratch is free to overwrite once that peer has reached this op.
-  if (!chained) {
-    barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
-  }
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
 
   constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
   const unsigned perPeer = gridDim.x / nRanks;
@@ -207,28 +195,21 @@ __launch_bounds__(512)
   const size_t nPieces = pieceLines == 0 ? 1 : (nLines + pieceLines - 1) / pieceLines;
   // Every block ends on the same epoch, including the blocks that post nothing.
   const uint32_t lastFlag = flag + 1 + static_cast<uint32_t>(nPieces);
-  auto finish = [&]() {
-    if (dbuf) {
-      barrier.endEpochRecord(lastFlag, half);
-    } else {
-      barrier.endEpoch(lastFlag);
-    }
-  };
 
   const int peer = (selfRank + k) % nRanks;
   const T* src = sendbuff + static_cast<size_t>(peer) * count;
   const size_t selfSlot = static_cast<size_t>(selfRank) * count;
   if (k == 0) {
     ddaA2APushPeerCopy<false>(recvbuff + selfSlot, src, begin, nLines, stride);
-    finish();
+    barrier.endEpoch(lastFlag);
     return;
   }
 
-  T* dst = ipcbuffs[peer] + dataOff + selfSlot;
+  T* dst = ipcbuffs[peer] + selfSlot;
   const int srcRank = (selfRank - k + nRanks) % nRanks;
   const size_t slot = static_cast<size_t>(srcRank) * count;
   T* drainDst = recvbuff + slot;
-  const T* drainSrc = ipcbuffs[selfRank] + dataOff + slot;
+  const T* drainSrc = ipcbuffs[selfRank] + slot;
 
   if (pieceLines == 0) {
     ddaA2APushPeerCopy<true>(dst, src, begin, nLines, stride);
@@ -237,7 +218,7 @@ __launch_bounds__(512)
     // so they skip it.
     barrier.signalWaitPeer(peer, srcRank, blockIdx.x, flag + 2);
     ddaA2APushPeerCopy<false>(drainDst, drainSrc, begin, nLines, stride);
-    finish();
+    barrier.endEpoch(lastFlag);
     return;
   }
 
@@ -258,7 +239,7 @@ __launch_bounds__(512)
       if (threadIdx.x == 0) barrier.postPeerRelaxed(peer, blockIdx.x, flag + 2 + static_cast<uint32_t>(p));
     }
   }
-  finish();
+  barrier.endEpoch(lastFlag);
 }
 
 } // namespace dda::common
