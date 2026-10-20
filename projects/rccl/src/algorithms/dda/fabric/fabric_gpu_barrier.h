@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 
+#include "algorithms/dda/device/CollCommon.h"
 #include "algorithms/dda/device/device_buffer.h"
 #include "algorithms/dda/fabric/fabric_mem_handler.h"
 #include "algorithms/dda/ipc/ipc_gpu_barrier.h"
@@ -35,6 +36,11 @@ struct FabricGpuBarrierResources {
   std::unique_ptr<DeviceBuffer> peerFlagsDev;
 };
 
+// Flags carry an epoch and only grow, so a slot is never reset and a waiter only needs "flag >= epoch". The epoch
+// comes from the comm's LL epoch cells, so every fabric collective advances the same per-block counter: a kernel reads
+// flag = beginEpoch(), passes flag + k to its k-th sync and stores the last value it used with endEpoch(). A peer can
+// be at most one sync ahead on a slot (it cannot pass epoch e before we post e), so the wrap-safe signed-difference
+// compare is exact.
 class FabricGpuBarrier {
 public:
   using FlagType = uint32_t;
@@ -45,6 +51,21 @@ public:
   // fabric shareable handles and builds a device-resident pointer table.
   static __host__ std::pair<std::unique_ptr<FabricGpuBarrierResources>, FabricGpuBarrier> mallocAndInit(
     int nRanks, int nBlocks, int selfRank, void* bootstrap, struct ncclMemManager* manager);
+
+  // Attaches the comm's LL epoch cells (comm->ddaLLEpochDev), which the barrier shares with the LL/LL128 kernels so
+  // every fabric collective advances one epoch.
+  __host__ void setEpochs(uint32_t* epochDev, int epochLen) {
+    epochDev_ = epochDev;
+    epochLen_ = epochLen;
+  }
+
+  // Both must be called by every thread of the block.
+  __device__ __forceinline__ FlagType beginEpoch() const {
+    return ddaGetLLEpochInc(epochDev_, blockIdx.x, 1);
+  }
+  __device__ __forceinline__ void endEpoch(FlagType epoch) const {
+    ddaSetLLEpoch(epochDev_, epochLen_, blockIdx.x, gridDim.x, epoch);
+  }
 
 // Waits until every store this wave has issued has completed. A system-scope store has then reached its destination.
 __device__ __forceinline__ void orderDestWrites() {
@@ -62,19 +83,8 @@ __device__ __forceinline__ void orderDestWrites() {
 }
 
   template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess>
-  __device__ __forceinline__ void syncOnSameBlockIdx() {
-    enum class MemFenceType {
-      RELEASE_ACQUIRE,
-      RELEASE_ONLY,
-      ACQUIRE_ONLY,
-    };
-
+  __device__ __forceinline__ void syncOnSameBlockIdx(FlagType epoch) {
     static_assert(hasPreviousMemAccess || hasSubsequentMemAccess);
-
-    constexpr MemFenceType fenceType =
-      hasPreviousMemAccess && hasSubsequentMemAccess ?
-        MemFenceType::RELEASE_ACQUIRE :
-        (!hasPreviousMemAccess ? MemFenceType::ACQUIRE_ONLY : MemFenceType::RELEASE_ONLY);
 
     if constexpr (hasPreviousMemAccess) {
       __syncthreads();
@@ -83,24 +93,20 @@ __device__ __forceinline__ void orderDestWrites() {
     // stays correct when blockDim.x < nRanks_. A small count can launch as few
     // as 64 threads while a clique may have up to kDdaMaxNranks ranks; with a
     // single thread per peer, peers with rank >= blockDim.x would never be
-    // signaled or waited on, hanging the barrier. Every rank walks peers in the
-    // same increasing order, so the interleaved signal/wait cannot deadlock.
-    FlagType* selfBuf = peerFlags_[selfRank_];
-    for (int peerRank = threadIdx.x; peerRank < nRanks_; peerRank += blockDim.x) {
-      FlagType* peerBuf = peerFlags_[peerRank];
-
-      // Signal the peer that this rank reached the barrier for this block.
-      if constexpr (fenceType == MemFenceType::ACQUIRE_ONLY) {
-        putFlag<std::memory_order_relaxed>(peerBuf + getFlagIdx(selfRank_, blockIdx.x));
-      } else {
-        putFlag<std::memory_order_release>(peerBuf + getFlagIdx(selfRank_, blockIdx.x));
+    // signaled or waited on, hanging the barrier.
+    if (static_cast<int>(threadIdx.x) < nRanks_) {
+      if constexpr (hasPreviousMemAccess) {
+        __atomic_thread_fence(__ATOMIC_RELEASE);
       }
-
-      // Wait for the peer's signal in this rank's own buffer.
-      if constexpr (fenceType == MemFenceType::RELEASE_ONLY) {
-        waitFlag<std::memory_order_relaxed>(selfBuf + getFlagIdx(peerRank, blockIdx.x));
-      } else {
-        waitFlag<std::memory_order_acquire>(selfBuf + getFlagIdx(peerRank, blockIdx.x));
+      for (int peerRank = threadIdx.x; peerRank < nRanks_; peerRank += blockDim.x) {
+        storeFlag(peerFlags_[peerRank] + getFlagIdx(selfRank_, blockIdx.x), epoch);
+      }
+      FlagType* selfBuf = peerFlags_[selfRank_];
+      for (int peerRank = threadIdx.x; peerRank < nRanks_; peerRank += blockDim.x) {
+        waitFlagAtLeast(selfBuf + getFlagIdx(peerRank, blockIdx.x), epoch);
+      }
+      if constexpr (hasSubsequentMemAccess) {
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
       }
     }
     if constexpr (hasSubsequentMemAccess) {
@@ -108,27 +114,29 @@ __device__ __forceinline__ void orderDestWrites() {
     }
   }
 
-  // Two-rank form of syncOnSameBlockIdx<true, true>: posts this rank's flag into dstRank's slot for block dstBlock
-  // and waits for srcRank's flag in this rank's slot for this block. A flag slot holds one token, consumed by its
-  // wait, so every post must be matched by exactly one wait within the same kernel.
-  __device__ __forceinline__ void signalWaitPeer(int dstRank, int srcRank, int dstBlock) {
+  // Two-rank form of syncOnSameBlockIdx<true, true>: posts epoch into dstRank's slot for block dstBlock and waits for
+  // srcRank's slot for this block in this rank's buffer to reach it.
+  __device__ __forceinline__ void signalWaitPeer(int dstRank, int srcRank, int dstBlock, FlagType epoch) {
     __syncthreads();
     orderDestWrites();
     if (threadIdx.x == 0) {
-      putFlag<std::memory_order_release>(peerFlags_[dstRank] + getFlagIdx(selfRank_, dstBlock));
-      waitFlag<std::memory_order_acquire>(peerFlags_[selfRank_] + getFlagIdx(srcRank, blockIdx.x));
+      __atomic_thread_fence(__ATOMIC_RELEASE);
+      storeFlag(peerFlags_[dstRank] + getFlagIdx(selfRank_, dstBlock), epoch);
+      waitFlagAtLeast(peerFlags_[selfRank_] + getFlagIdx(srcRank, blockIdx.x), epoch);
+      __atomic_thread_fence(__ATOMIC_ACQUIRE);
     }
     __syncthreads();
   }
 
   // Single-thread halves of signalWaitPeer with relaxed ordering, for callers that order their data accesses
-  // themselves (system-scope accesses and an explicit wait for their own stores). Same one-token-per-slot rule.
-  __device__ __forceinline__ void postPeerRelaxed(int dstRank, int dstBlock) {
+  // themselves (system-scope accesses and an explicit wait for their own stores). A post does not wait for the
+  // previous value to be seen, so successive posts to one slot can carry increasing values.
+  __device__ __forceinline__ void postPeerRelaxed(int dstRank, int dstBlock, FlagType value) {
     orderDestWrites();
-    putFlag<std::memory_order_relaxed>(peerFlags_[dstRank] + getFlagIdx(selfRank_, dstBlock));
+    storeFlag(peerFlags_[dstRank] + getFlagIdx(selfRank_, dstBlock), value);
   }
-  __device__ __forceinline__ void waitPeerRelaxed(int srcRank) {
-    waitFlag<std::memory_order_relaxed>(peerFlags_[selfRank_] + getFlagIdx(srcRank, blockIdx.x));
+  __device__ __forceinline__ void waitPeerRelaxed(int srcRank, FlagType value) {
+    waitFlagAtLeast(peerFlags_[selfRank_] + getFlagIdx(srcRank, blockIdx.x), value);
   }
 
 private:
@@ -136,12 +144,22 @@ private:
   int selfRank_{-1};
   int nRanks_{-1};
   FlagType** peerFlags_{nullptr};
+  uint32_t* epochDev_{nullptr};
+  int epochLen_{0};
 
   __host__ FabricGpuBarrier(int nBlocks, int selfRank, int nRanks, FlagType** peerFlags)
     : nBlocks_(nBlocks), selfRank_(selfRank), nRanks_(nRanks), peerFlags_(peerFlags) {}
 
   __device__ inline int getFlagIdx(int rank, int block) {
     return block * nRanks_ + rank;
+  }
+
+  static __device__ __forceinline__ void storeFlag(FlagType* flag, FlagType value) {
+    __scoped_atomic_store_n(flag, value, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+  }
+  static __device__ __forceinline__ void waitFlagAtLeast(FlagType* flag, FlagType value) {
+    while (static_cast<int32_t>(__scoped_atomic_load_n(flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - value) < 0) {
+    }
   }
 };
 

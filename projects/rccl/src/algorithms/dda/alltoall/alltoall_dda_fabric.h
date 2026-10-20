@@ -26,8 +26,10 @@ __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabric(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                     int selfRank, int nRanks, FabricGpuBarrier barrier) {
+  const uint32_t flag = barrier.beginEpoch();
+
   // Release-acquire barrier ensures the stream-ordered scratch write is visible to peers.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
 
   // use uint4 to do 16-byte loads to maximize memory efficiency. We assume
   // that count % countPerThread == 0, enforced before kernel launch.
@@ -54,7 +56,8 @@ __launch_bounds__(512)
   }
 
   // barrier to ensure remote ranks won't free their buffers until I'm done
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>(flag + 2);
+  barrier.endEpoch(flag + 2);
 }
 
 // Push model: each rank writes chunk r of its sendbuff into peer r's scratch at slot selfRank, then drains its
@@ -66,9 +69,10 @@ __launch_bounds__(512)
   __global__ void ddaAllToAllFabricPush(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                         const T* __restrict__ sendbuff, int selfRank, int nRanks,
                                         FabricGpuBarrier barrier) {
+  const uint32_t flag = barrier.beginEpoch();
   // A peer's scratch is free to overwrite once that peer has reached this op, i.e. its previous
   // stream-ordered scratch -> recvbuff copy has drained.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
 
   const int nRanksEff = (NRANKS_CT > 0) ? NRANKS_CT : nRanks;
   constexpr int kUnroll = (NRANKS_CT > 0) ? NRANKS_CT : 8;
@@ -99,7 +103,7 @@ __launch_bounds__(512)
   }
 
   // Release our remote writes and acquire every peer's writes into our scratch.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 2);
 
   // Drain our scratch into recvbuff. Peer r's thread gtIdx wrote exactly the positions this thread reads
   // from slot r, since every rank launches the same grid.
@@ -111,6 +115,7 @@ __launch_bounds__(512)
       *reinterpret_cast<uint4*>(&recvbuff[i]) = reinterpret_cast<const uint4*>(&selfScratch[i])[0];
     }
   }
+  barrier.endEpoch(flag + 2);
 }
 
 constexpr int kDdaA2APushPeerUnroll = 8;
@@ -165,9 +170,9 @@ __device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t 
 // recvbuff and drains nothing.
 // With pieceLines > 0 (a multiple of the group's stride) the chunk is cut into pieces of pieceLines lines and the
 // sync becomes a pipeline: step p pushes piece p, waits for the source's piece p - 1 and drains it while piece p's
-// remote stores are in flight, then waits for its own stores and posts piece p. The pieces reuse the block's flag
-// slot, so a post first waits for the destination to consume the previous piece; the drain reads with system-scope
-// loads, so no fence is needed per piece.
+// remote stores are in flight, then posts piece p. Piece p's flag is epoch flag + 2 + p in the block's slot at the
+// peer; values only grow, so a post does not wait for the destination. The drain reads with system-scope loads, so no
+// fence is needed per piece.
 // gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
 // this rank may still be reading from sendbuff.
 template <typename T>
@@ -177,8 +182,9 @@ __launch_bounds__(512)
   __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                             const T* __restrict__ sendbuff, int selfRank, int nRanks,
                                             FabricGpuBarrier barrier, size_t pieceLines) {
+  const uint32_t flag = barrier.beginEpoch();
   // A peer's scratch is free to overwrite once that peer has reached this op.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
 
   constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
   const unsigned perPeer = gridDim.x / nRanks;
@@ -186,12 +192,16 @@ __launch_bounds__(512)
   const size_t nLines = count / countPerThread;
   const size_t begin = static_cast<size_t>(blockIdx.x % perPeer) * blockDim.x + threadIdx.x;
   const size_t stride = static_cast<size_t>(perPeer) * blockDim.x;
+  const size_t nPieces = pieceLines == 0 ? 1 : (nLines + pieceLines - 1) / pieceLines;
+  // Every block ends on the same epoch, including the blocks that post nothing.
+  const uint32_t lastFlag = flag + 1 + static_cast<uint32_t>(nPieces);
 
   const int peer = (selfRank + k) % nRanks;
   const T* src = sendbuff + static_cast<size_t>(peer) * count;
   const size_t selfSlot = static_cast<size_t>(selfRank) * count;
   if (k == 0) {
     ddaA2APushPeerCopy<false>(recvbuff + selfSlot, src, begin, nLines, stride);
+    barrier.endEpoch(lastFlag);
     return;
   }
 
@@ -206,19 +216,19 @@ __launch_bounds__(512)
     // Point-to-point closing sync: release our writes to the peer we pushed to and acquire the writes of the peer
     // whose slot we drain, block b on both sides. Blocks of this rank's own chunk neither wrote remotely nor drain,
     // so they skip it.
-    barrier.signalWaitPeer(peer, srcRank, blockIdx.x);
+    barrier.signalWaitPeer(peer, srcRank, blockIdx.x, flag + 2);
     ddaA2APushPeerCopy<false>(drainDst, drainSrc, begin, nLines, stride);
+    barrier.endEpoch(lastFlag);
     return;
   }
 
-  const size_t nPieces = (nLines + pieceLines - 1) / pieceLines;
   for (size_t p = 0; p <= nPieces; ++p) {
     if (p < nPieces) {
       const size_t end = (p + 1) * pieceLines < nLines ? (p + 1) * pieceLines : nLines;
       ddaA2APushPeerCopy<true>(dst, src, p * pieceLines + begin, end, stride);
     }
     if (p > 0) {
-      if (threadIdx.x == 0) barrier.waitPeerRelaxed(srcRank);
+      if (threadIdx.x == 0) barrier.waitPeerRelaxed(srcRank, flag + 1 + static_cast<uint32_t>(p));
       __syncthreads();
       const size_t end = p * pieceLines < nLines ? p * pieceLines : nLines;
       ddaA2APushPeerCopy<false, T, true /* sysScopeLoad */>(drainDst, drainSrc, (p - 1) * pieceLines + begin, end,
@@ -226,9 +236,10 @@ __launch_bounds__(512)
     }
     if (p < nPieces) {
       __syncthreads();
-      if (threadIdx.x == 0) barrier.postPeerRelaxed(peer, blockIdx.x);
+      if (threadIdx.x == 0) barrier.postPeerRelaxed(peer, blockIdx.x, flag + 2 + static_cast<uint32_t>(p));
     }
   }
+  barrier.endEpoch(lastFlag);
 }
 
 } // namespace dda::common
