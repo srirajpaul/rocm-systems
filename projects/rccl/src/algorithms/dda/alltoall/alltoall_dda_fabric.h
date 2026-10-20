@@ -124,11 +124,22 @@ __device__ __forceinline__ void ddaA2APushPeerStore(uint4* p, const uint4& v) {
   }
 }
 
+template <bool sysScope>
+__device__ __forceinline__ uint4 ddaA2APushPeerLoad(const uint4* p) {
+  uint4 v;
+  if constexpr (sysScope) {
+    ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(p), v.x, v.y, v.z, v.w);
+  } else {
+    v = *p;
+  }
+  return v;
+}
+
 // Copies 16 B lines i = begin, begin + stride, ... < end of src to dst, kDdaA2APushPeerUnroll loads in flight per
-// thread. sysScopeStore selects system-scope stores, whose helper is a compiler memory barrier, so every load of a
-// group is issued before its stores. Full groups carry no per-line bounds check; leftover lines are copied one at a
-// time.
-template <bool sysScopeStore, typename T>
+// thread. sysScopeStore / sysScopeLoad select system-scope accesses, whose helpers are compiler memory barriers, so
+// every load of a group is issued before its stores. Full groups carry no per-line bounds check; leftover lines are
+// copied one at a time.
+template <bool sysScopeStore, typename T, bool sysScopeLoad = false>
 __device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t begin, size_t end, size_t stride) {
   constexpr int U = kDdaA2APushPeerUnroll;
   const uint4* s = reinterpret_cast<const uint4*>(src);
@@ -137,13 +148,28 @@ __device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t 
   for (; i + (U - 1) * stride < end; i += U * stride) {
     uint4 v[U];
 #pragma unroll
-    for (int u = 0; u < U; ++u) v[u] = s[i + u * stride];
+    for (int u = 0; u < U; ++u) v[u] = ddaA2APushPeerLoad<sysScopeLoad>(&s[i + u * stride]);
 #pragma unroll
     for (int u = 0; u < U; ++u) ddaA2APushPeerStore<sysScopeStore>(&d[i + u * stride], v[u]);
   }
   for (; i < end; i += stride) {
-    ddaA2APushPeerStore<sysScopeStore>(&d[i], s[i]);
+    ddaA2APushPeerStore<sysScopeStore>(&d[i], ddaA2APushPeerLoad<sysScopeLoad>(&s[i]));
   }
+}
+
+// Waits until every store this wave has issued has completed. A system-scope store has then reached its destination.
+__device__ __forceinline__ void ddaA2APushPeerWaitStores() {
+#if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#if defined(__gfx1250__) || defined(__GFX12__)
+  asm volatile("s_wait_storecnt 0x0" ::: "memory");
+#else
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#else
+  __threadfence_system();
+#endif
 }
 
 // Peer-major push: every block serves a single peer, so its stores stream to one destination instead of one line to
@@ -152,6 +178,11 @@ __device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t 
 // sendbuff into that peer's scratch at slot selfRank with system-scope stores, then syncs with just those two peers
 // and drains the slot of peer (self - k), which that peer's block b wrote. k == 0 copies sendbuff straight to
 // recvbuff and drains nothing.
+// With pieceLines > 0 (a multiple of the group's stride) the chunk is cut into pieces of pieceLines lines and the
+// sync becomes a pipeline: step p pushes piece p, waits for the source's piece p - 1 and drains it while piece p's
+// remote stores are in flight, then waits for its own stores and posts piece p. The pieces reuse the block's flag
+// slot, so a post first waits for the destination to consume the previous piece; the drain reads with system-scope
+// loads, so no fence is needed per piece.
 // gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
 // this rank may still be reading from sendbuff.
 template <typename T>
@@ -160,7 +191,7 @@ __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                             const T* __restrict__ sendbuff, int selfRank, int nRanks,
-                                            FabricGpuBarrier barrier) {
+                                            FabricGpuBarrier barrier, size_t pieceLines) {
   // A peer's scratch is free to overwrite once that peer has reached this op.
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
 
@@ -176,18 +207,43 @@ __launch_bounds__(512)
   const size_t selfSlot = static_cast<size_t>(selfRank) * count;
   if (k == 0) {
     ddaA2APushPeerCopy<false>(recvbuff + selfSlot, src, begin, nLines, stride);
-  } else {
-    ddaA2APushPeerCopy<true>(ipcbuffs[peer] + selfSlot, src, begin, nLines, stride);
+    return;
   }
 
-  // Point-to-point closing sync: release our writes to the peer we pushed to and acquire the writes of the peer
-  // whose slot we drain, block b on both sides. Blocks of this rank's own chunk neither wrote remotely nor drain,
-  // so they skip it.
-  if (k != 0) {
-    const int srcRank = (selfRank - k + nRanks) % nRanks;
+  T* dst = ipcbuffs[peer] + selfSlot;
+  const int srcRank = (selfRank - k + nRanks) % nRanks;
+  const size_t slot = static_cast<size_t>(srcRank) * count;
+  T* drainDst = recvbuff + slot;
+  const T* drainSrc = ipcbuffs[selfRank] + slot;
+
+  if (pieceLines == 0) {
+    ddaA2APushPeerCopy<true>(dst, src, begin, nLines, stride);
+    // Point-to-point closing sync: release our writes to the peer we pushed to and acquire the writes of the peer
+    // whose slot we drain, block b on both sides. Blocks of this rank's own chunk neither wrote remotely nor drain,
+    // so they skip it.
     barrier.signalWaitPeer(peer, srcRank, blockIdx.x);
-    const size_t slot = static_cast<size_t>(srcRank) * count;
-    ddaA2APushPeerCopy<false>(recvbuff + slot, ipcbuffs[selfRank] + slot, begin, nLines, stride);
+    ddaA2APushPeerCopy<false>(drainDst, drainSrc, begin, nLines, stride);
+    return;
+  }
+
+  const size_t nPieces = (nLines + pieceLines - 1) / pieceLines;
+  for (size_t p = 0; p <= nPieces; ++p) {
+    if (p < nPieces) {
+      const size_t end = (p + 1) * pieceLines < nLines ? (p + 1) * pieceLines : nLines;
+      ddaA2APushPeerCopy<true>(dst, src, p * pieceLines + begin, end, stride);
+    }
+    if (p > 0) {
+      if (threadIdx.x == 0) barrier.waitPeerRelaxed(srcRank);
+      __syncthreads();
+      const size_t end = p * pieceLines < nLines ? p * pieceLines : nLines;
+      ddaA2APushPeerCopy<false, T, true /* sysScopeLoad */>(drainDst, drainSrc, (p - 1) * pieceLines + begin, end,
+                                                            stride);
+    }
+    if (p < nPieces) {
+      ddaA2APushPeerWaitStores();
+      __syncthreads();
+      if (threadIdx.x == 0) barrier.postPeerRelaxed(peer, blockIdx.x);
+    }
   }
 }
 

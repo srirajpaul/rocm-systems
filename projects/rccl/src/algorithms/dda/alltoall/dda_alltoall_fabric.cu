@@ -31,6 +31,11 @@ RCCL_PARAM(DdaA2APush, "DDA_A2A_PUSH", 0);
 RCCL_PARAM(DdaA2APushPeer, "DDA_A2A_PUSH_PEER", 0);
 // Peer-major push threads per block (one warp .. 512, multiple of 64).
 RCCL_PARAM(DdaA2APushPeerThreads, "DDA_A2A_PUSH_PEER_THREADS", 256);
+// Peer-major push pipeline: total alltoall bytes at or below which the chunk is pushed and drained in one piece.
+RCCL_PARAM(DdaA2APushPeerPipeThreshold, "DDA_A2A_PUSH_PEER_PIPE_THRESHOLD", (int64_t)128 * 1024 * 1024);
+// Peer-major push pipeline: pieces per peer chunk above that threshold, each pushed while the previous one drains
+// (0 or 1 = no pipeline).
+RCCL_PARAM(DdaA2APushPeerPieces, "DDA_A2A_PUSH_PEER_PIECES", 8);
 // Peer-major push through LDS with the gfx1250 Tensor Data Mover, with RCCL_DDA_A2A_PUSH=1 and
 // RCCL_DDA_A2A_PUSH_PEER=1. Env: RCCL_DDA_A2A_TDM.
 RCCL_PARAM(DdaA2ATdm, "DDA_A2A_TDM", 0);
@@ -66,6 +71,20 @@ static inline bool ddaAllToAllFabricPushPeerGeom(ncclComm* comm, size_t bytes, d
   *grid = dim3(perPeer * comm->nRanks, 1, 1);
   *block = dim3(std::min<uint32_t>(threadsCap, warps * kThreadsPerWarp), 1, 1);
   return true;
+}
+
+// Lines per pipeline piece for a peer chunk of `bytes`: the requested piece count's even split, rounded up to whole
+// groups of the block group's interleaved runs. 0 = no pipeline (one piece), which every alltoall up to
+// RCCL_DDA_A2A_PUSH_PEER_PIPE_THRESHOLD total bytes uses.
+static inline size_t ddaAllToAllFabricPushPeerPieceLines(size_t bytes, dim3 grid, dim3 block, int nRanks) {
+  const int64_t threshold = rcclParamDdaA2APushPeerPipeThreshold();
+  if (threshold >= 0 && bytes * nRanks <= static_cast<size_t>(threshold)) return 0;
+  const int64_t pieces = rcclParamDdaA2APushPeerPieces();
+  if (pieces <= 1) return 0;
+  const size_t lines = bytes / sizeof(uint4);
+  const size_t groupLines = static_cast<size_t>(grid.x / nRanks) * block.x * dda::common::kDdaA2APushPeerUnroll;
+  const size_t pieceLines = dda::common::divRoundUp(dda::common::divRoundUp(lines, pieces), groupLines) * groupLines;
+  return pieceLines >= lines ? 0 : pieceLines;
 }
 
 static inline int ddaAllToAllFabricTdmTileBytes() {
@@ -241,14 +260,16 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
 
   dim3 peerGrid, peerBlock;
   if (peerPush && ddaAllToAllFabricPushPeerGeom(comm, count, &peerGrid, &peerBlock)) {
+    const size_t pieceLines = ddaAllToAllFabricPushPeerPieceLines(count, peerGrid, peerBlock, nRanks);
     INFO(NCCL_COLL,
-         "DDA fabric AllToAll: launching peer-major push kernel: nRanks=%d count=%zu grid=%u (%u per peer) block=%u",
-         nRanks, count, peerGrid.x, peerGrid.x / nRanks, peerBlock.x);
+         "DDA fabric AllToAll: launching peer-major push kernel: nRanks=%d count=%zu grid=%u (%u per peer) block=%u "
+         "piece=%zu B",
+         nRanks, count, peerGrid.x, peerGrid.x / nRanks, peerBlock.x, pieceLines * sizeof(uint4));
 
     const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
     hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPushPeer<T>), peerGrid, peerBlock, 0, stream,
                           /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<T*>(recvbuff), count,
-                          static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+                          static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost, pieceLines);
     CUDACHECK(cudaGetLastError());
     return ncclSuccess;
   }
