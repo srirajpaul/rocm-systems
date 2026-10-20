@@ -73,13 +73,19 @@ static inline bool ddaAllToAllFabricPushPeerGeom(ncclComm* comm, size_t bytes, d
   return true;
 }
 
-// Lines per pipeline piece for a peer chunk of `bytes`: the requested piece count's even split, rounded up to whole
-// groups of the block group's interleaved runs. 0 = no pipeline (one piece), which every alltoall up to
-// RCCL_DDA_A2A_PUSH_PEER_PIPE_THRESHOLD total bytes uses.
-static inline size_t ddaAllToAllFabricPushPeerPieceLines(size_t bytes, dim3 grid, dim3 block, int nRanks) {
+// Pipeline pieces for a peer-major push of a peer chunk of `bytes`: RCCL_DDA_A2A_PUSH_PEER_PIECES above
+// RCCL_DDA_A2A_PUSH_PEER_PIPE_THRESHOLD total bytes, else 0 (no pipeline).
+static inline int64_t ddaAllToAllFabricPushPeerPipePieces(size_t bytes, int nRanks) {
   const int64_t threshold = rcclParamDdaA2APushPeerPipeThreshold();
   if (threshold >= 0 && bytes * nRanks <= static_cast<size_t>(threshold)) return 0;
   const int64_t pieces = rcclParamDdaA2APushPeerPieces();
+  return pieces > 1 ? pieces : 0;
+}
+
+// Lines per pipeline piece for the vector peer-major push: the piece count's even split of a peer chunk of `bytes`,
+// rounded up to whole groups of the block group's interleaved runs. 0 = no pipeline (one piece).
+static inline size_t ddaAllToAllFabricPushPeerPieceLines(size_t bytes, dim3 grid, dim3 block, int nRanks) {
+  const int64_t pieces = ddaAllToAllFabricPushPeerPipePieces(bytes, nRanks);
   if (pieces <= 1) return 0;
   const size_t lines = bytes / sizeof(uint4);
   const size_t groupLines = static_cast<size_t>(grid.x / nRanks) * block.x * dda::common::kDdaA2APushPeerUnroll;
@@ -181,19 +187,23 @@ static ncclResult_t ncclAllToAllDdaFabricTdmPushPeerLaunch(const void* sendbuff,
     return ncclSuccess;
   }
   const size_t dynSmem = (block.x / comm->WarpSize) * kDdaA2ATdmWindowBytes;
+  // No more pieces than tiles in a part.
+  const int pieces =
+    static_cast<int>(std::min<int64_t>(ddaAllToAllFabricPushPeerPipePieces(bytesPerRank, comm->nRanks),
+                                       static_cast<int64_t>(partTiles)));
 
   INFO(NCCL_COLL,
        "DDA fabric AllToAll: launching TDM peer-major push kernel: nRanks=%d count=%zu tile=%d x%d grid=%u (%u per "
-       "peer) block=%u part=%zu B lds=%zu",
+       "peer) block=%u part=%zu B lds=%zu pieces=%d",
        comm->nRanks, bytesPerRank, TileBytes, kUnrollTiles, grid.x, grid.x / comm->nRanks, block.x,
-       partTiles * TileBytes, dynSmem);
+       partTiles * TileBytes, dynSmem, pieces);
 
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
   hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricTdmPushPeer<TileBytes, kUnrollTiles>), grid, block, dynSmem,
                         stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0,
                         reinterpret_cast<uint8_t* const*>(comm->ddaPeerPtrsDev), static_cast<uint8_t*>(recvbuff),
                         static_cast<const uint8_t*>(sendbuff), bytesPerRank, comm->rank, comm->nRanks, barrierHost,
-                        partTiles);
+                        partTiles, pieces);
   *launched = true;
   return ncclSuccess;
 }

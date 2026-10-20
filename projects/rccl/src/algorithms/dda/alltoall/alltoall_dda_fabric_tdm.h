@@ -63,6 +63,12 @@ __device__ __forceinline__ void ddaA2ATdmCopyTiles(uint8_t* dst, const uint8_t* 
 // [j * partTiles, (j + 1) * partTiles) of that peer's chunk, j = b % P; each warp moves UnrollTiles consecutive tiles
 // per batch. The block pushes to peer (self + k), then syncs with just those two peers and drains the slot of peer
 // (self - k), which that peer's block b wrote. k == 0 copies sendbuff straight to recvbuff and drains nothing.
+// With pieces > 1 each block's part is cut into that many pieces of whole tiles and the sync becomes a pipeline: step p
+// pushes piece p, waits for the source's piece p - 1 and drains it, then posts piece p. A wave drains its LDS window
+// before the next transfer, so it does not overlap its own push with its drain; the gain is that each drain waits
+// only for the matching piece while other waves and blocks are in other phases. The pieces reuse the block's flag
+// slot, so a post first waits for the destination to consume the previous piece. Every TDM access bypasses the
+// caches at system scope and tdmWait completes the stores, so no fence is needed per piece.
 // gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
 // this rank may still be reading from sendbuff.
 template <int TileBytes, int UnrollTiles>
@@ -71,7 +77,7 @@ __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* __restrict__ recvbuff,
                                                const uint8_t* __restrict__ sendbuff, size_t bytesPerRank, int selfRank,
-                                               int nRanks, FabricGpuBarrier barrier, size_t partTiles) {
+                                               int nRanks, FabricGpuBarrier barrier, size_t partTiles, int pieces) {
   static_assert(TileBytes * UnrollTiles <= kDdaA2ATdmWindowBytes, "tiles overflow the per-warp LDS window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
@@ -94,23 +100,55 @@ __launch_bounds__(512)
 
   const int peer = (selfRank + k) % nRanks;
   uint8_t* dst = (k == 0 ? recvbuff : peerScratch[peer]) + static_cast<size_t>(selfRank) * bytesPerRank;
-  ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(dst, sendbuff + static_cast<size_t>(peer) * bytesPerRank, bytesPerRank,
-                                             first, tileEnd, stride, win);
+  const uint8_t* src = sendbuff + static_cast<size_t>(peer) * bytesPerRank;
+  if (k == 0) {
+    ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(dst, src, bytesPerRank, first, tileEnd, stride, win);
+    return;
+  }
 
-  // Point-to-point closing sync: release our writes to the peer we pushed to and acquire the writes of the peer
-  // whose slot we drain, block b on both sides. Blocks of this rank's own chunk neither wrote remotely nor drain,
-  // so they skip it.
-  if (k != 0) {
-    const int srcRank = (selfRank - k + nRanks) % nRanks;
+  const int srcRank = (selfRank - k + nRanks) % nRanks;
+  const size_t srcOff = static_cast<size_t>(srcRank) * bytesPerRank;
+  uint8_t* drainDst = recvbuff + srcOff;
+  const uint8_t* drainSrc = peerScratch[selfRank] + srcOff;
+
+  if (pieces <= 1) {
+    ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(dst, src, bytesPerRank, first, tileEnd, stride, win);
+    // Point-to-point closing sync: release our writes to the peer we pushed to and acquire the writes of the peer
+    // whose slot we drain, block b on both sides. Blocks of this rank's own chunk neither wrote remotely nor drain,
+    // so they skip it.
     barrier.signalWaitPeer(peer, srcRank, blockIdx.x);
-    const size_t src = static_cast<size_t>(srcRank) * bytesPerRank;
-    ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(recvbuff + src, peerScratch[selfRank] + src, bytesPerRank, first,
-                                               tileEnd, stride, win);
+    ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(drainDst, drainSrc, bytesPerRank, first, tileEnd, stride, win);
+    return;
+  }
+
+  // Every rank derives the same part and pieces for block b, so posts and waits stay paired even for empty pieces.
+  const size_t warpOff = static_cast<size_t>(lw) * UnrollTiles;
+  const size_t partLen = tileEnd > tileBegin ? tileEnd - tileBegin : 0;
+  const size_t pieceTiles = (partLen + pieces - 1) / pieces;
+  auto pieceBegin = [&](int p) {
+    const size_t b = tileBegin + static_cast<size_t>(p) * pieceTiles;
+    return b < tileEnd ? b : tileEnd;
+  };
+  for (int p = 0; p <= pieces; ++p) {
+    if (p < pieces) {
+      ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(dst, src, bytesPerRank, pieceBegin(p) + warpOff, pieceBegin(p + 1),
+                                                 stride, win);
+    }
+    if (p > 0) {
+      if (threadIdx.x == 0) barrier.waitPeerRelaxed(srcRank);
+      __syncthreads();
+      ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(drainDst, drainSrc, bytesPerRank, pieceBegin(p - 1) + warpOff,
+                                                 pieceBegin(p), stride, win);
+    }
+    if (p < pieces) {
+      __syncthreads();
+      if (threadIdx.x == 0) barrier.postPeerRelaxed(peer, blockIdx.x);
+    }
   }
 #else
   // Only dispatched on gfx1250; every other arch still has to compile this kernel.
   (void)peerScratch, (void)recvbuff, (void)sendbuff, (void)bytesPerRank, (void)selfRank, (void)nRanks, (void)barrier,
-    (void)partTiles;
+    (void)partTiles, (void)pieces;
   __builtin_trap();
 #endif
 }
