@@ -58,7 +58,7 @@ __launch_bounds__(512)
 }
 
 // Push model: each rank writes chunk r of its sendbuff into peer r's scratch at slot selfRank with
-// plain global stores. The caller copies this rank's scratch to recvbuff after the kernel.
+// system-scope global stores. The caller copies this rank's scratch to recvbuff after the kernel.
 template <typename T, int NRANKS_CT>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
@@ -79,12 +79,22 @@ __launch_bounds__(512)
   const auto idxEnd = countPerRank;
   const auto idxStride = gridDim.x * blockDim.x * countPerThread;
 
+  // ddaLLStoreLineB128 is a compiler memory barrier, so issue every load of the group before its stores.
+  const size_t destIdx = selfRank * idxEnd;
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
-#pragma unroll kUnroll
-    for (int r = 0; r < nRanksEff; ++r) {
-      size_t srcIdx = idx + r * idxEnd;
-      size_t destIdx = idx + selfRank * idxEnd;
-      *reinterpret_cast<uint4*>(&ipcbuffs[r][destIdx]) = reinterpret_cast<const uint4*>(&sendbuff[srcIdx])[0];
+    for (int r0 = 0; r0 < nRanksEff; r0 += kUnroll) {
+      uint4 v[kUnroll];
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        if (r0 + u < nRanksEff) v[u] = reinterpret_cast<const uint4*>(&sendbuff[idx + (r0 + u) * idxEnd])[0];
+      }
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        if (r0 + u < nRanksEff) {
+          ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(&ipcbuffs[r0 + u][destIdx + idx]), v[u].x, v[u].y, v[u].z,
+                             v[u].w);
+        }
+      }
     }
   }
 
