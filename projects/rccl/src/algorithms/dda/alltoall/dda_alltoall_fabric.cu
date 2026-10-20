@@ -67,24 +67,25 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
     INFO(NCCL_COLL, "DDA fabric AllToAll: launching push kernel: nRanks=%d count=%zu grid=%u block=%u%s", nRanks,
          count, grid.x, block.x, (nRanks == 4 || nRanks == 8) ? " (unrolled)" : " (runtime)");
 
-    // The scratch -> recvbuff copy below ends the collective, so the kernel does not take the stop event.
+    const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
     switch (nRanks) {
     case 4:
-      dda::common::ddaAllToAllFabricPush<T, 4><<<grid, block, 0, stream>>>(
-        d_ipcbuffs, count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+      hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPush<T, 4>), grid, block, 0, stream,
+                            /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<T*>(recvbuff),
+                            count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
       break;
     case 8:
-      dda::common::ddaAllToAllFabricPush<T, 8><<<grid, block, 0, stream>>>(
-        d_ipcbuffs, count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+      hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPush<T, 8>), grid, block, 0, stream,
+                            /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<T*>(recvbuff),
+                            count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
       break;
     default:
-      dda::common::ddaAllToAllFabricPush<T, 0><<<grid, block, 0, stream>>>(
-        d_ipcbuffs, count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+      hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPush<T, 0>), grid, block, 0, stream,
+                            /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<T*>(recvbuff),
+                            count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
       break;
     }
     CUDACHECK(cudaGetLastError());
-
-    CUDACHECK(cudaMemcpyAsync(recvbuff, comm->ddaScratch, totalBytes, cudaMemcpyDeviceToDevice, stream));
     return ncclSuccess;
   }
 

@@ -58,13 +58,14 @@ __launch_bounds__(512)
 }
 
 // Push model: each rank writes chunk r of its sendbuff into peer r's scratch at slot selfRank with
-// system-scope global stores. The caller copies this rank's scratch to recvbuff after the kernel.
+// system-scope global stores, then drains its own scratch into recvbuff after the closing barrier.
 template <typename T, int NRANKS_CT>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
-  __global__ void ddaAllToAllFabricPush(T* const* __restrict__ ipcbuffs, size_t count, const T* __restrict__ sendbuff,
-                                        int selfRank, int nRanks, FabricGpuBarrier barrier) {
+  __global__ void ddaAllToAllFabricPush(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
+                                        const T* __restrict__ sendbuff, int selfRank, int nRanks,
+                                        FabricGpuBarrier barrier) {
   // A peer's scratch is free to overwrite once that peer has reached this op, i.e. its previous
   // stream-ordered scratch -> recvbuff copy has drained.
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
@@ -100,6 +101,17 @@ __launch_bounds__(512)
 
   // Release our remote writes and acquire every peer's writes into our scratch.
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+
+  // Drain our scratch into recvbuff. Peer r's thread gtIdx wrote exactly the positions this thread reads
+  // from slot r, since every rank launches the same grid.
+  const T* selfScratch = ipcbuffs[selfRank];
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+#pragma unroll kUnroll
+    for (int r = 0; r < nRanksEff; ++r) {
+      size_t i = idx + r * idxEnd;
+      *reinterpret_cast<uint4*>(&recvbuff[i]) = reinterpret_cast<const uint4*>(&selfScratch[i])[0];
+    }
+  }
 }
 
 } // namespace dda::common
