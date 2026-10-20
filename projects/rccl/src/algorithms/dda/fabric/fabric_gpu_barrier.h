@@ -93,6 +93,18 @@ public:
     }
   }
 
+  // Two-rank form of syncOnSameBlockIdx<true, true>: posts this rank's flag into dstRank's slot for block dstBlock
+  // and waits for srcRank's flag in this rank's slot for this block. A flag slot holds one token, consumed by its
+  // wait, so every post must be matched by exactly one wait within the same kernel.
+  __device__ __forceinline__ void signalWaitPeer(int dstRank, int srcRank, int dstBlock) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      putFlag<std::memory_order_release>(peerFlags_[dstRank] + getFlagIdx(selfRank_, dstBlock));
+      waitFlag<std::memory_order_acquire>(peerFlags_[selfRank_] + getFlagIdx(srcRank, blockIdx.x));
+    }
+    __syncthreads();
+  }
+
 private:
   int nBlocks_{-1};
   int selfRank_{-1};

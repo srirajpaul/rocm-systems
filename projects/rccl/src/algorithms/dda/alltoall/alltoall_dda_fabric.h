@@ -149,9 +149,9 @@ __device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t 
 // Peer-major push: every block serves a single peer, so its stores stream to one destination instead of one line to
 // each rank. With P = gridDim.x / nRanks blocks per peer, block b serves peer offset k = b / P, and the P blocks of a
 // group interleave over the chunk one block-sized run of 16 B lines at a time. The block pushes chunk (self + k) of
-// sendbuff into that peer's scratch at slot selfRank with system-scope stores, and after the closing barrier drains
-// the slot of peer (self - k), which that peer's block b wrote, so the per-block barrier pairs the write with the
-// read. k == 0 copies sendbuff straight to recvbuff and drains nothing.
+// sendbuff into that peer's scratch at slot selfRank with system-scope stores, then syncs with just those two peers
+// and drains the slot of peer (self - k), which that peer's block b wrote. k == 0 copies sendbuff straight to
+// recvbuff and drains nothing.
 // gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
 // this rank may still be reading from sendbuff.
 template <typename T>
@@ -180,11 +180,13 @@ __launch_bounds__(512)
     ddaA2APushPeerCopy<true>(ipcbuffs[peer] + selfSlot, src, begin, nLines, stride);
   }
 
-  // Release our remote writes and acquire every peer's writes into our scratch.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
-
+  // Point-to-point closing sync: release our writes to the peer we pushed to and acquire the writes of the peer
+  // whose slot we drain, block b on both sides. Blocks of this rank's own chunk neither wrote remotely nor drain,
+  // so they skip it.
   if (k != 0) {
-    const size_t slot = static_cast<size_t>((selfRank - k + nRanks) % nRanks) * count;
+    const int srcRank = (selfRank - k + nRanks) % nRanks;
+    barrier.signalWaitPeer(peer, srcRank, blockIdx.x);
+    const size_t slot = static_cast<size_t>(srcRank) * count;
     ddaA2APushPeerCopy<false>(recvbuff + slot, ipcbuffs[selfRank] + slot, begin, nLines, stride);
   }
 }

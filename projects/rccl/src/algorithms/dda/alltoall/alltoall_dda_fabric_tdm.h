@@ -61,10 +61,10 @@ __device__ __forceinline__ void ddaA2ATdmCopyTiles(uint8_t* dst, const uint8_t* 
 // Peer-major TDM push: every block serves a single peer, as ddaAllToAllFabricPushPeer does with vector copies.
 // With P = gridDim.x / nRanks blocks per peer, block b serves peer offset k = b / P and tiles
 // [j * partTiles, (j + 1) * partTiles) of that peer's chunk, j = b % P; each warp moves UnrollTiles consecutive tiles
-// per batch. The block pushes to peer (self + k) and later drains the slot of peer (self - k), which that peer's
-// block b wrote, so the per-block barrier pairs the write with the read. k == 0 copies sendbuff straight to recvbuff
-// and drains nothing. gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots
-// that other blocks of this rank may still be reading from sendbuff.
+// per batch. The block pushes to peer (self + k), then syncs with just those two peers and drains the slot of peer
+// (self - k), which that peer's block b wrote. k == 0 copies sendbuff straight to recvbuff and drains nothing.
+// gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
+// this rank may still be reading from sendbuff.
 template <int TileBytes, int UnrollTiles>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
@@ -97,11 +97,13 @@ __launch_bounds__(512)
   ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(dst, sendbuff + static_cast<size_t>(peer) * bytesPerRank, bytesPerRank,
                                              first, tileEnd, stride, win);
 
-  // Release our remote writes and acquire every peer's writes into our scratch.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
-
+  // Point-to-point closing sync: release our writes to the peer we pushed to and acquire the writes of the peer
+  // whose slot we drain, block b on both sides. Blocks of this rank's own chunk neither wrote remotely nor drain,
+  // so they skip it.
   if (k != 0) {
-    const size_t src = static_cast<size_t>((selfRank - k + nRanks) % nRanks) * bytesPerRank;
+    const int srcRank = (selfRank - k + nRanks) % nRanks;
+    barrier.signalWaitPeer(peer, srcRank, blockIdx.x);
+    const size_t src = static_cast<size_t>(srcRank) * bytesPerRank;
     ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(recvbuff + src, peerScratch[selfRank] + src, bytesPerRank, first,
                                                tileEnd, stride, win);
   }
