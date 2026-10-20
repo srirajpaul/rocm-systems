@@ -69,6 +69,8 @@ __device__ __forceinline__ void ddaA2ATdmCopyTiles(uint8_t* dst, const uint8_t* 
 // only for the matching piece while other waves and blocks are in other phases. Piece p's flag is epoch flag + 2 + p
 // in the block's slot at the peer; values only grow, so a post does not wait for the destination. Every TDM access
 // bypasses the caches at system scope and tdmWait completes the stores, so no fence is needed per piece.
+// Double buffering (dbuf) as in ddaAllToAllFabricPushPeer: the two kernels share the records and the half offset
+// (halfOff bytes), so either can chain on the other and skip its entry barrier.
 // gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
 // this rank may still be reading from sendbuff.
 template <int TileBytes, int UnrollTiles>
@@ -77,15 +79,29 @@ __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* __restrict__ recvbuff,
                                                const uint8_t* __restrict__ sendbuff, size_t bytesPerRank, int selfRank,
-                                               int nRanks, FabricGpuBarrier barrier, size_t partTiles, int pieces) {
+                                               int nRanks, FabricGpuBarrier barrier, size_t partTiles, int pieces,
+                                               size_t halfOff, bool dbuf) {
   static_assert(TileBytes * UnrollTiles <= kDdaA2ATdmWindowBytes, "tiles overflow the per-warp LDS window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
   const uint32_t flag = barrier.beginEpoch();
+  uint32_t lastHalf = 0;
+  const bool chained = dbuf && barrier.lastEndedWithRecord(flag, &lastHalf);
+  const uint32_t half = chained ? (lastHalf ^ 1u) : 0u;
+  const size_t dataOff = static_cast<size_t>(half) * halfOff;
   // A peer's scratch is free to overwrite once that peer has reached this op.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
+  if (!chained) {
+    barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(flag + 1);
+  }
   // Every block ends on the same epoch, including the blocks that post nothing.
   const uint32_t lastFlag = flag + 1 + static_cast<uint32_t>(pieces > 1 ? pieces : 1);
+  auto finish = [&]() {
+    if (dbuf) {
+      barrier.endEpochRecord(lastFlag, half);
+    } else {
+      barrier.endEpoch(lastFlag);
+    }
+  };
 
   extern __shared__ __attribute__((aligned(128))) uint8_t ddaA2ATdmSmem[];
   // TDM descriptors live in SGPRs, so every address below must be wave-uniform.
@@ -102,18 +118,18 @@ __launch_bounds__(512)
   const size_t stride = (blockDim.x / warpSize) * UnrollTiles;
 
   const int peer = (selfRank + k) % nRanks;
-  uint8_t* dst = (k == 0 ? recvbuff : peerScratch[peer]) + static_cast<size_t>(selfRank) * bytesPerRank;
+  uint8_t* dst = (k == 0 ? recvbuff : peerScratch[peer] + dataOff) + static_cast<size_t>(selfRank) * bytesPerRank;
   const uint8_t* src = sendbuff + static_cast<size_t>(peer) * bytesPerRank;
   if (k == 0) {
     ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(dst, src, bytesPerRank, first, tileEnd, stride, win);
-    barrier.endEpoch(lastFlag);
+    finish();
     return;
   }
 
   const int srcRank = (selfRank - k + nRanks) % nRanks;
   const size_t srcOff = static_cast<size_t>(srcRank) * bytesPerRank;
   uint8_t* drainDst = recvbuff + srcOff;
-  const uint8_t* drainSrc = peerScratch[selfRank] + srcOff;
+  const uint8_t* drainSrc = peerScratch[selfRank] + dataOff + srcOff;
 
   if (pieces <= 1) {
     ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(dst, src, bytesPerRank, first, tileEnd, stride, win);
@@ -122,7 +138,7 @@ __launch_bounds__(512)
     // so they skip it.
     barrier.signalWaitPeer(peer, srcRank, blockIdx.x, flag + 2);
     ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(drainDst, drainSrc, bytesPerRank, first, tileEnd, stride, win);
-    barrier.endEpoch(lastFlag);
+    finish();
     return;
   }
 
@@ -150,11 +166,11 @@ __launch_bounds__(512)
       if (threadIdx.x == 0) barrier.postPeerRelaxed(peer, blockIdx.x, flag + 2 + static_cast<uint32_t>(p));
     }
   }
-  barrier.endEpoch(lastFlag);
+  finish();
 #else
   // Only dispatched on gfx1250; every other arch still has to compile this kernel.
   (void)peerScratch, (void)recvbuff, (void)sendbuff, (void)bytesPerRank, (void)selfRank, (void)nRanks, (void)barrier,
-    (void)partTiles, (void)pieces;
+    (void)partTiles, (void)pieces, (void)halfOff, (void)dbuf;
   __builtin_trap();
 #endif
 }

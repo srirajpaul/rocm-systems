@@ -67,6 +67,29 @@ public:
     ddaSetLLEpoch(epochDev_, epochLen_, blockIdx.x, gridDim.x, epoch);
   }
 
+  // Per-block-slot records {epoch, tag} (nBlocks of them, initialised to all ones) written by endEpochRecord. Every
+  // fabric kernel moves the epoch cells, so a record whose epoch equals the epoch beginEpoch() just read means the
+  // last fabric kernel on this communicator was one that ended with endEpochRecord, and the record holds its tag.
+  __host__ void setRecords(uint32_t* records) {
+    records_ = records;
+  }
+  __device__ __forceinline__ bool lastEndedWithRecord(FlagType flag, uint32_t* tag) const {
+    const uint32_t* r = records_ + 2 * blockIdx.x;
+    if (r[0] != flag - 1) return false;
+    *tag = r[1];
+    return true;
+  }
+  // endEpoch plus a record in every slot (slot e is written by block e % gridDim.x), so a later launch with any grid
+  // reads the same record in every block. Must be called by every thread of the block.
+  __device__ __forceinline__ void endEpochRecord(FlagType epoch, uint32_t tag) const {
+    __syncthreads(); // every thread has read this block's record (lastEndedWithRecord) before it is rewritten
+    endEpoch(epoch);
+    for (int e = blockIdx.x + threadIdx.x * gridDim.x; e < nBlocks_; e += blockDim.x * gridDim.x) {
+      records_[2 * e] = epoch;
+      records_[2 * e + 1] = tag;
+    }
+  }
+
 // Waits until every store this wave has issued has completed. A system-scope store has then reached its destination.
 __device__ __forceinline__ void orderDestWrites() {
 #if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
@@ -146,6 +169,7 @@ private:
   FlagType** peerFlags_{nullptr};
   uint32_t* epochDev_{nullptr};
   int epochLen_{0};
+  uint32_t* records_{nullptr};
 
   __host__ FabricGpuBarrier(int nBlocks, int selfRank, int nRanks, FlagType** peerFlags)
     : nBlocks_(nBlocks), selfRank_(selfRank), nRanks_(nRanks), peerFlags_(peerFlags) {}

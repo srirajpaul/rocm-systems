@@ -36,6 +36,9 @@ RCCL_PARAM(DdaA2APushPeerPipeThreshold, "DDA_A2A_PUSH_PEER_PIPE_THRESHOLD", (int
 // Peer-major push pipeline: pieces per peer chunk above that threshold, each pushed while the previous one drains
 // (0 or 1 = no pipeline).
 RCCL_PARAM(DdaA2APushPeerPieces, "DDA_A2A_PUSH_PEER_PIECES", 8);
+// Peer-major push (vector and TDM): use the scratch in two halves on alternate launches, so a launch that directly
+// follows another such launch on the communicator skips its entry barrier (needs nRanks * count <= half the scratch).
+RCCL_PARAM(DdaA2APushPeerDbuf, "DDA_A2A_PUSH_PEER_DBUF", 0);
 // Peer-major push through LDS with the gfx1250 Tensor Data Mover, with RCCL_DDA_A2A_PUSH=1 and
 // RCCL_DDA_A2A_PUSH_PEER=1. Env: RCCL_DDA_A2A_TDM.
 RCCL_PARAM(DdaA2ATdm, "DDA_A2A_TDM", 0);
@@ -91,6 +94,18 @@ static inline size_t ddaAllToAllFabricPushPeerPieceLines(size_t bytes, dim3 grid
   const size_t groupLines = static_cast<size_t>(grid.x / nRanks) * block.x * dda::common::kDdaA2APushPeerUnroll;
   const size_t pieceLines = dda::common::divRoundUp(dda::common::divRoundUp(lines, pieces), groupLines) * groupLines;
   return pieceLines >= lines ? 0 : pieceLines;
+}
+
+// Offset in bytes of the second scratch half for the double-buffered peer-major push. Both peer-major kernels use it
+// and the same records, so either can chain on the other.
+static inline size_t ddaAllToAllFabricPushPeerHalfOff(ncclComm* comm) {
+  return (comm->ddaScratchBytes / 2) & ~static_cast<size_t>(4095);
+}
+
+// Double buffering is used only when both halves of the scratch hold the op.
+static inline bool ddaAllToAllFabricPushPeerDbuf(ncclComm* comm, size_t bytesPerRank) {
+  return rcclParamDdaA2APushPeerDbuf() &&
+         static_cast<size_t>(comm->nRanks) * bytesPerRank <= ddaAllToAllFabricPushPeerHalfOff(comm);
 }
 
 static inline int ddaAllToAllFabricTdmTileBytes() {
@@ -191,19 +206,21 @@ static ncclResult_t ncclAllToAllDdaFabricTdmPushPeerLaunch(const void* sendbuff,
   const int pieces =
     static_cast<int>(std::min<int64_t>(ddaAllToAllFabricPushPeerPipePieces(bytesPerRank, comm->nRanks),
                                        static_cast<int64_t>(partTiles)));
+  const size_t halfOff = ddaAllToAllFabricPushPeerHalfOff(comm);
+  const bool dbuf = ddaAllToAllFabricPushPeerDbuf(comm, bytesPerRank);
 
   INFO(NCCL_COLL,
        "DDA fabric AllToAll: launching TDM peer-major push kernel: nRanks=%d count=%zu tile=%d x%d grid=%u (%u per "
-       "peer) block=%u part=%zu B lds=%zu pieces=%d",
+       "peer) block=%u part=%zu B lds=%zu pieces=%d%s",
        comm->nRanks, bytesPerRank, TileBytes, kUnrollTiles, grid.x, grid.x / comm->nRanks, block.x,
-       partTiles * TileBytes, dynSmem, pieces);
+       partTiles * TileBytes, dynSmem, pieces, dbuf ? " dbuf" : "");
 
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
   hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricTdmPushPeer<TileBytes, kUnrollTiles>), grid, block, dynSmem,
                         stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0,
                         reinterpret_cast<uint8_t* const*>(comm->ddaPeerPtrsDev), static_cast<uint8_t*>(recvbuff),
                         static_cast<const uint8_t*>(sendbuff), bytesPerRank, comm->rank, comm->nRanks, barrierHost,
-                        partTiles, pieces);
+                        partTiles, pieces, halfOff, dbuf);
   *launched = true;
   return ncclSuccess;
 }
@@ -271,15 +288,18 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
   dim3 peerGrid, peerBlock;
   if (peerPush && ddaAllToAllFabricPushPeerGeom(comm, count, &peerGrid, &peerBlock)) {
     const size_t pieceLines = ddaAllToAllFabricPushPeerPieceLines(count, peerGrid, peerBlock, nRanks);
+    // count is the byte count (kernel instantiated for int8_t), so the half offset is in elements too.
+    const size_t halfOff = ddaAllToAllFabricPushPeerHalfOff(comm);
+    const bool dbuf = ddaAllToAllFabricPushPeerDbuf(comm, count);
     INFO(NCCL_COLL,
          "DDA fabric AllToAll: launching peer-major push kernel: nRanks=%d count=%zu grid=%u (%u per peer) block=%u "
-         "piece=%zu B",
-         nRanks, count, peerGrid.x, peerGrid.x / nRanks, peerBlock.x, pieceLines * sizeof(uint4));
+         "piece=%zu B%s",
+         nRanks, count, peerGrid.x, peerGrid.x / nRanks, peerBlock.x, pieceLines * sizeof(uint4), dbuf ? " dbuf" : "");
 
     const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
     hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPushPeer<T>), peerGrid, peerBlock, 0, stream,
                           /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<T*>(recvbuff), count,
-                          static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost, pieceLines);
+                          static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost, pieceLines, halfOff, dbuf);
     CUDACHECK(cudaGetLastError());
     return ncclSuccess;
   }

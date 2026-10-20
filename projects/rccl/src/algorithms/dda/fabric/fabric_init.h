@@ -16,3 +16,8 @@ bool ncclDdaUseFabricPath(struct ncclComm* comm);
 
 ncclResult_t ncclDdaFabricCommInit(struct ncclComm* comm);
 ncclResult_t ncclDdaFabricCommFini(struct ncclComm* comm);
+
+// Enqueue on `stream` before work that uses comm->ddaScratch without going through the fabric epoch cells (the CE
+// collectives): clears the barrier's per-block records so the next kernel that chains on them takes its full entry
+// barrier.
+ncclResult_t ncclDdaFabricScratchUsedOutsideEpochs(struct ncclComm* comm, cudaStream_t stream);
