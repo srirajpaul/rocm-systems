@@ -135,14 +135,12 @@ __launch_bounds__(512)
                                                  stride, win);
     }
     if (p > 0) {
-      if (threadIdx.x == 0) barrier.waitPeerRelaxed(srcRank);
-      __syncthreads();
+      barrier.waitPeerRelaxed(srcRank);
       ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(drainDst, drainSrc, bytesPerRank, pieceBegin(p - 1) + warpOff,
                                                  pieceBegin(p), stride, win);
     }
     if (p < pieces) {
-      __syncthreads();
-      if (threadIdx.x == 0) barrier.postPeerRelaxed(peer, blockIdx.x);
+      barrier.postPeerRelaxed(peer, blockIdx.x);
     }
   }
 #else

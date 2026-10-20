@@ -124,11 +124,17 @@ __device__ __forceinline__ void orderDestWrites() {
   // Single-thread halves of signalWaitPeer with relaxed ordering, for callers that order their data accesses
   // themselves (system-scope accesses and an explicit wait for their own stores). Same one-token-per-slot rule.
   __device__ __forceinline__ void postPeerRelaxed(int dstRank, int dstBlock) {
+    __syncthreads();
     orderDestWrites();
-    putFlag<std::memory_order_relaxed>(peerFlags_[dstRank] + getFlagIdx(selfRank_, dstBlock));
+    if (threadIdx.x == 0) {
+      putFlag<std::memory_order_relaxed>(peerFlags_[dstRank] + getFlagIdx(selfRank_, dstBlock));
+    }
   }
   __device__ __forceinline__ void waitPeerRelaxed(int srcRank) {
-    waitFlag<std::memory_order_relaxed>(peerFlags_[selfRank_] + getFlagIdx(srcRank, blockIdx.x));
+    if (threadIdx.x == 0) {
+      waitFlag<std::memory_order_relaxed>(peerFlags_[selfRank_] + getFlagIdx(srcRank, blockIdx.x));
+    }
+    __syncthreads();
   }
 
 private:

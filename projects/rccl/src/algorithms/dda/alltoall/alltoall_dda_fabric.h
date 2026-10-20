@@ -218,15 +218,13 @@ __launch_bounds__(512)
       ddaA2APushPeerCopy<true>(dst, src, p * pieceLines + begin, end, stride);
     }
     if (p > 0) {
-      if (threadIdx.x == 0) barrier.waitPeerRelaxed(srcRank);
-      __syncthreads();
+      barrier.waitPeerRelaxed(srcRank);
       const size_t end = p * pieceLines < nLines ? p * pieceLines : nLines;
       ddaA2APushPeerCopy<false, T, true /* sysScopeLoad */>(drainDst, drainSrc, (p - 1) * pieceLines + begin, end,
                                                             stride);
     }
     if (p < nPieces) {
-      __syncthreads();
-      if (threadIdx.x == 0) barrier.postPeerRelaxed(peer, blockIdx.x);
+      barrier.postPeerRelaxed(peer, blockIdx.x);
     }
   }
 }
