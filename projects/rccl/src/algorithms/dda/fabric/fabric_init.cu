@@ -193,7 +193,6 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
   // so the first device-derived flag is 1. Bumped on the device every LL launch.
   CUDACHECKGOTO(cudaMalloc(&epochDev, epochLen * sizeof(uint32_t)), res, fail);
   CUDACHECKGOTO(cudaMemset(epochDev, 0, epochLen * sizeof(uint32_t)), res, fail);
-  barrierState->barrierHost.setEpochs(epochDev, (int)epochLen);
 
   // Success: hand ownership of every resource to comm.
   comm->ddaFabricMemHandler = handler;
