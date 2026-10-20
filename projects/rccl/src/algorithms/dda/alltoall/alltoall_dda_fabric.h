@@ -57,4 +57,39 @@ __launch_bounds__(512)
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
 }
 
+// Push model: each rank writes chunk r of its sendbuff into peer r's scratch at slot selfRank with
+// plain global stores. The caller copies this rank's scratch to recvbuff after the kernel.
+template <typename T, int NRANKS_CT>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+  __global__ void ddaAllToAllFabricPush(T* const* __restrict__ ipcbuffs, size_t count, const T* __restrict__ sendbuff,
+                                        int selfRank, int nRanks, FabricGpuBarrier barrier) {
+  // A peer's scratch is free to overwrite once that peer has reached this op, i.e. its previous
+  // stream-ordered scratch -> recvbuff copy has drained.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+
+  const int nRanksEff = (NRANKS_CT > 0) ? NRANKS_CT : nRanks;
+  constexpr int kUnroll = (NRANKS_CT > 0) ? NRANKS_CT : 8;
+  const size_t countPerRank = count;
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const auto gtIdx = blockDim.x * blockIdx.x + threadIdx.x;
+
+  const auto idxStart = gtIdx * countPerThread;
+  const auto idxEnd = countPerRank;
+  const auto idxStride = gridDim.x * blockDim.x * countPerThread;
+
+  for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
+#pragma unroll kUnroll
+    for (int r = 0; r < nRanksEff; ++r) {
+      size_t srcIdx = idx + r * idxEnd;
+      size_t destIdx = idx + selfRank * idxEnd;
+      *reinterpret_cast<uint4*>(&ipcbuffs[r][destIdx]) = reinterpret_cast<const uint4*>(&sendbuff[srcIdx])[0];
+    }
+  }
+
+  // Release our remote writes and acquire every peer's writes into our scratch.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+}
+
 } // namespace dda::common

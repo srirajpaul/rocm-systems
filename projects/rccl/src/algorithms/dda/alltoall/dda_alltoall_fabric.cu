@@ -13,6 +13,7 @@
 #include "debug.h"
 #include "algorithms/dda/dda_init_detail.h"
 #include "algorithms/dda/fabric/fabric_gpu_barrier.h"
+#include "param.h"
 
 #include <cuda_runtime.h>
 #include <hip/hip_ext.h>
@@ -20,6 +21,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <utility>
+
+// Push model: each rank writes its chunks into peers' scratch instead of reading from them. Env: RCCL_DDA_A2A_PUSH.
+RCCL_PARAM(DdaA2APush, "DDA_A2A_PUSH", 0);
 
 namespace {
 
@@ -58,6 +62,31 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
 
   void* peerPtrsDev = comm->ddaPeerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
+
+  if (rcclParamDdaA2APush()) {
+    INFO(NCCL_COLL, "DDA fabric AllToAll: launching push kernel: nRanks=%d count=%zu grid=%u block=%u%s", nRanks,
+         count, grid.x, block.x, (nRanks == 4 || nRanks == 8) ? " (unrolled)" : " (runtime)");
+
+    // The scratch -> recvbuff copy below ends the collective, so the kernel does not take the stop event.
+    switch (nRanks) {
+    case 4:
+      dda::common::ddaAllToAllFabricPush<T, 4><<<grid, block, 0, stream>>>(
+        d_ipcbuffs, count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+      break;
+    case 8:
+      dda::common::ddaAllToAllFabricPush<T, 8><<<grid, block, 0, stream>>>(
+        d_ipcbuffs, count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+      break;
+    default:
+      dda::common::ddaAllToAllFabricPush<T, 0><<<grid, block, 0, stream>>>(
+        d_ipcbuffs, count, static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost);
+      break;
+    }
+    CUDACHECK(cudaGetLastError());
+
+    CUDACHECK(cudaMemcpyAsync(recvbuff, comm->ddaScratch, totalBytes, cudaMemcpyDeviceToDevice, stream));
+    return ncclSuccess;
+  }
 
   INFO(NCCL_COLL, "DDA fabric AllToAll: launching kernel: nRanks=%d count=%zu grid=%u block=%u%s", nRanks, count,
        grid.x, block.x, (nRanks == 4 || nRanks == 8) ? " (unrolled)" : " (runtime)");
