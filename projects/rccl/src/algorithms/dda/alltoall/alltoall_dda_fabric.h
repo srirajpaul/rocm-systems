@@ -157,21 +157,6 @@ __device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t 
   }
 }
 
-// Waits until every store this wave has issued has completed. A system-scope store has then reached its destination.
-__device__ __forceinline__ void ddaA2APushPeerWaitStores() {
-#if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
-  __atomic_signal_fence(__ATOMIC_SEQ_CST);
-#if defined(__gfx1250__) || defined(__GFX12__)
-  asm volatile("s_wait_storecnt 0x0" ::: "memory");
-#else
-  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
-#endif
-  __atomic_signal_fence(__ATOMIC_SEQ_CST);
-#else
-  __threadfence_system();
-#endif
-}
-
 // Peer-major push: every block serves a single peer, so its stores stream to one destination instead of one line to
 // each rank. With P = gridDim.x / nRanks blocks per peer, block b serves peer offset k = b / P, and the P blocks of a
 // group interleave over the chunk one block-sized run of 16 B lines at a time. The block pushes chunk (self + k) of
@@ -240,7 +225,6 @@ __launch_bounds__(512)
                                                             stride);
     }
     if (p < nPieces) {
-      ddaA2APushPeerWaitStores();
       __syncthreads();
       if (threadIdx.x == 0) barrier.postPeerRelaxed(peer, blockIdx.x);
     }

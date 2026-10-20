@@ -46,6 +46,21 @@ public:
   static __host__ std::pair<std::unique_ptr<FabricGpuBarrierResources>, FabricGpuBarrier> mallocAndInit(
     int nRanks, int nBlocks, int selfRank, void* bootstrap, struct ncclMemManager* manager);
 
+// Waits until every store this wave has issued has completed. A system-scope store has then reached its destination.
+__device__ __forceinline__ void orderDestWrites() {
+#if RCCL_HAVE_GLOBAL_DWORDX4_BUILTINS
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#if defined(__gfx1250__) || defined(__GFX12__)
+  asm volatile("s_wait_storecnt 0x0" ::: "memory");
+#else
+  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+  __atomic_signal_fence(__ATOMIC_SEQ_CST);
+#else
+  __threadfence_system();
+#endif
+}
+
   template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess>
   __device__ __forceinline__ void syncOnSameBlockIdx() {
     enum class MemFenceType {
@@ -98,6 +113,7 @@ public:
   // wait, so every post must be matched by exactly one wait within the same kernel.
   __device__ __forceinline__ void signalWaitPeer(int dstRank, int srcRank, int dstBlock) {
     __syncthreads();
+    orderDestWrites();
     if (threadIdx.x == 0) {
       putFlag<std::memory_order_release>(peerFlags_[dstRank] + getFlagIdx(selfRank_, dstBlock));
       waitFlag<std::memory_order_acquire>(peerFlags_[selfRank_] + getFlagIdx(srcRank, blockIdx.x));
@@ -108,6 +124,7 @@ public:
   // Single-thread halves of signalWaitPeer with relaxed ordering, for callers that order their data accesses
   // themselves (system-scope accesses and an explicit wait for their own stores). Same one-token-per-slot rule.
   __device__ __forceinline__ void postPeerRelaxed(int dstRank, int dstBlock) {
+    orderDestWrites();
     putFlag<std::memory_order_relaxed>(peerFlags_[dstRank] + getFlagIdx(selfRank_, dstBlock));
   }
   __device__ __forceinline__ void waitPeerRelaxed(int srcRank) {
