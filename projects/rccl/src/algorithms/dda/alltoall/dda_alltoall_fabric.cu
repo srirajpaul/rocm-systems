@@ -44,6 +44,9 @@ RCCL_PARAM(DdaA2APushPeerRing, "DDA_A2A_PUSH_PEER_RING", 1);
 // RCCL_DDA_A2A_PUSH_PEER_SPREAD.
 RCCL_PARAM(DdaA2APushPeerSpread, "DDA_A2A_PUSH_PEER_SPREAD", 0);
 RCCL_PARAM(DdaA2APushPeerSpreadMin, "DDA_A2A_PUSH_PEER_SPREAD_MIN", (int64_t)64 * 1024 * 1024);
+// With spread, give the block slots the peer groups leave free to the own-chunk copy instead of a slice per push block
+// (0 = slices). Falls back to slices when no slot is free. Env: RCCL_DDA_A2A_PUSH_PEER_SPREAD_COPY.
+RCCL_PARAM(DdaA2APushPeerSpreadCopy, "DDA_A2A_PUSH_PEER_SPREAD_COPY", 1);
 // Peer-major push through LDS with the gfx1250 Tensor Data Mover, with RCCL_DDA_A2A_PUSH=1 and
 // RCCL_DDA_A2A_PUSH_PEER=1. Env: RCCL_DDA_A2A_TDM.
 RCCL_PARAM(DdaA2ATdm, "DDA_A2A_TDM", 0);
@@ -94,7 +97,7 @@ static inline bool ddaAllToAllFabricPushPeerGeom(ncclComm* comm, size_t bytes, D
   l->perPeer = std::min<uint32_t>(maxPerPeer, dda::common::divRoundUp(lines, threadsCap));
   const uint32_t warps = dda::common::divRoundUp(dda::common::divRoundUp(lines, l->perPeer), kThreadsPerWarp);
   const uint32_t pushBlocks = l->perPeer * static_cast<uint32_t>(l->groups);
-  l->nCopy = spread ? std::min<uint32_t>(cap - pushBlocks, l->perPeer) : 0;
+  l->nCopy = spread && rcclParamDdaA2APushPeerSpreadCopy() ? std::min<uint32_t>(cap - pushBlocks, l->perPeer) : 0;
   l->grid = dim3(pushBlocks + l->nCopy, 1, 1);
   l->block = dim3(std::min<uint32_t>(threadsCap, warps * kThreadsPerWarp), 1, 1);
   return true;
@@ -213,7 +216,7 @@ static inline bool ddaAllToAllFabricTdmPushPeerGeom(ncclComm* comm, size_t bytes
   const uint32_t warps =
     std::min<uint32_t>(kDdaA2ATdmMaxWarpsPerBlock, dda::common::divRoundUp(*partTiles, unrollTiles));
   const uint32_t pushBlocks = perPeer * static_cast<uint32_t>(*groups);
-  *nCopy = spread ? std::min<uint32_t>(cap - pushBlocks, perPeer) : 0;
+  *nCopy = spread && rcclParamDdaA2APushPeerSpreadCopy() ? std::min<uint32_t>(cap - pushBlocks, perPeer) : 0;
   *grid = dim3(pushBlocks + *nCopy, 1, 1);
   *block = dim3(warps * comm->WarpSize, 1, 1);
   return true;
