@@ -34,7 +34,7 @@ RCCL_PARAM(DdaA2APushPeerThreads, "DDA_A2A_PUSH_PEER_THREADS", 256);
 // Peer-major push pipeline: total alltoall bytes at or below which the chunk is pushed and drained in one piece.
 RCCL_PARAM(DdaA2APushPeerPipeThreshold, "DDA_A2A_PUSH_PEER_PIPE_THRESHOLD", (int64_t)128 * 1024 * 1024);
 // Peer-major push pipeline: pieces per peer chunk above that threshold, each pushed while the previous one drains
-// (0 or 1 = no pipeline).
+// (0 or 1 = no pipeline). An alltoall that does not fit the scratch whole gets as many more as its ring needs.
 RCCL_PARAM(DdaA2APushPeerPieces, "DDA_A2A_PUSH_PEER_PIECES", 8);
 // Peer-major push pipeline: keep only a ring of pieces per sender in the scratch. 0 = never, 1 = when the whole
 // alltoall does not fit the scratch (default), 2 = whenever the pipeline runs. Env: RCCL_DDA_A2A_PUSH_PEER_RING.
@@ -86,14 +86,21 @@ static inline int64_t ddaAllToAllFabricPushPeerPipePieces(size_t bytes, int nRan
 }
 
 // Lines per pipeline piece for the vector peer-major push: the piece count's even split of a peer chunk of `bytes`,
-// rounded up to whole groups of the block group's interleaved runs. 0 = no pipeline (one piece).
-static inline size_t ddaAllToAllFabricPushPeerPieceLines(size_t bytes, dim3 grid, dim3 block, int nRanks) {
+// rounded up to whole groups of the block group's interleaved runs. When the whole alltoall does not fit the scratch
+// and the ring is enabled, at most the largest piece whose ring fits. 0 = no pipeline (one piece).
+static inline size_t ddaAllToAllFabricPushPeerPieceLines(ncclComm* comm, size_t bytes, dim3 grid, dim3 block) {
+  const int nRanks = comm->nRanks;
   const int64_t pieces = ddaAllToAllFabricPushPeerPipePieces(bytes, nRanks);
-  if (pieces <= 1) return 0;
   const size_t lines = bytes / sizeof(uint4);
   const size_t groupLines = static_cast<size_t>(grid.x / nRanks) * block.x * dda::common::kDdaA2APushPeerUnroll;
-  const size_t pieceLines = dda::common::divRoundUp(dda::common::divRoundUp(lines, pieces), groupLines) * groupLines;
-  return pieceLines >= lines ? 0 : pieceLines;
+  size_t pieceLines =
+    pieces > 1 ? dda::common::divRoundUp(dda::common::divRoundUp(lines, pieces), groupLines) * groupLines : lines;
+  if (bytes * nRanks > comm->ddaScratchBytes && rcclParamDdaA2APushPeerRing() != 0) {
+    const size_t ringLines = comm->ddaScratchBytes /
+                             (static_cast<size_t>(nRanks) * dda::common::kDdaA2APushPeerRingPieces * sizeof(uint4));
+    pieceLines = std::min(pieceLines, ringLines / groupLines * groupLines);
+  }
+  return pieceLines == 0 || pieceLines >= lines ? 0 : pieceLines;
 }
 
 // Whether the pipelined vector peer-major push keeps only a ring of pieces per sender in the scratch
@@ -119,7 +126,7 @@ static inline bool ddaAllToAllFabricPushPeerRingFits(ncclComm* comm, size_t byte
   if (!rcclParamDdaA2APush() || !rcclParamDdaA2APushPeer() || rcclParamDdaA2APushPeerRing() == 0) return false;
   dim3 grid, block;
   if (!ddaAllToAllFabricPushPeerGeom(comm, bytes, &grid, &block)) return false;
-  const size_t pieceLines = ddaAllToAllFabricPushPeerPieceLines(bytes, grid, block, comm->nRanks);
+  const size_t pieceLines = ddaAllToAllFabricPushPeerPieceLines(comm, bytes, grid, block);
   return pieceLines != 0 &&
          ddaAllToAllFabricPushPeerRingBytes(bytes, pieceLines, comm->nRanks) <= comm->ddaScratchBytes;
 }
@@ -219,16 +226,21 @@ static ncclResult_t ncclAllToAllDdaFabricTdmPushPeerLaunch(const void* sendbuff,
   }
   const size_t dynSmem = (block.x / comm->WarpSize) * kDdaA2ATdmWindowBytes;
   // No more pieces than tiles in a part.
-  const int pieces =
-    static_cast<int>(std::min<int64_t>(ddaAllToAllFabricPushPeerPipePieces(bytesPerRank, comm->nRanks),
-                                       static_cast<int64_t>(partTiles)));
+  int pieces = static_cast<int>(std::min<int64_t>(ddaAllToAllFabricPushPeerPipePieces(bytesPerRank, comm->nRanks),
+                                                  static_cast<int64_t>(partTiles)));
   // Ring as for the vector kernel (RCCL_DDA_A2A_PUSH_PEER_RING); an alltoall larger than the scratch runs here only if
-  // its ring fits, else the vector peer-major push takes it.
+  // its ring fits, else the vector peer-major push takes it. Such an alltoall gets at least the pieces its ring needs.
   const bool fitsWhole = bytesPerRank * comm->nRanks <= comm->ddaScratchBytes;
   const int64_t ringMode = rcclParamDdaA2APushPeerRing();
+  const size_t perPeer = grid.x / comm->nRanks;
+  if (!fitsWhole && ringMode != 0) {
+    const size_t slotTiles = comm->ddaScratchBytes / (static_cast<size_t>(comm->nRanks) * perPeer *
+                                                      dda::common::kDdaA2ATdmRingPieces * TileBytes);
+    if (slotTiles == 0) return ncclSuccess;
+    pieces = std::max(pieces, static_cast<int>(dda::common::divRoundUp(partTiles, slotTiles)));
+  }
   const bool ring = pieces > 1 && (ringMode >= 2 || (ringMode == 1 && !fitsWhole));
   if (!fitsWhole) {
-    const size_t perPeer = grid.x / comm->nRanks;
     const size_t slotBytes = (partTiles + pieces - 1) / pieces * TileBytes;
     const size_t ringBytes = static_cast<size_t>(comm->nRanks) * perPeer *
                              std::min<size_t>(pieces, dda::common::kDdaA2ATdmRingPieces) * slotBytes;
@@ -315,7 +327,7 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
 
   dim3 peerGrid, peerBlock;
   if (peerPush && ddaAllToAllFabricPushPeerGeom(comm, count, &peerGrid, &peerBlock)) {
-    const size_t pieceLines = ddaAllToAllFabricPushPeerPieceLines(count, peerGrid, peerBlock, nRanks);
+    const size_t pieceLines = ddaAllToAllFabricPushPeerPieceLines(comm, count, peerGrid, peerBlock);
     const bool ring = ddaAllToAllFabricPushPeerRing(comm, count, pieceLines);
     if (!fitsWhole && !ring) {
       WARN("DDA fabric alltoall: total %zu bytes exceeds comm scratch %zu bytes", totalBytes, comm->ddaScratchBytes);
