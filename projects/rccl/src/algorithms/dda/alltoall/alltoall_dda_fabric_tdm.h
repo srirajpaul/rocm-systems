@@ -76,8 +76,11 @@ __device__ __forceinline__ void ddaA2ATdmCopyTiles(uint8_t* dst, const uint8_t* 
 // rank s lands in ring slot (j, p % kDdaA2ATdmRingPieces) of s's ring, each slot ceil(partTiles / pieces) tiles, so
 // the scratch needed no longer grows with the message. The post and wait sequence is the vector kernel's, so the same
 // four slots suffice (see kDdaA2APushPeerRingPieces).
-// gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
-// this rank may still be reading from sendbuff.
+// Spread (groups == nRanks - 1) as in ddaAllToAllFabricPushPeer: only the remote peer groups, k = 1 .. nRanks - 1,
+// with this rank's own chunk copied by the nCopy blocks after them or, with none, in slices by every push block
+// before its entry barrier. Copy blocks skip the barrier.
+// gridDim.x - nCopy must be a multiple of groups. Out of place only: a block drains into recvbuff slots that other
+// blocks of this rank may still be reading from sendbuff.
 constexpr int kDdaA2ATdmRingPieces = 4;
 
 template <int TileBytes, int UnrollTiles>
@@ -87,22 +90,40 @@ __launch_bounds__(512)
   __global__ void ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* __restrict__ recvbuff,
                                                const uint8_t* __restrict__ sendbuff, size_t bytesPerRank, int selfRank,
                                                int nRanks, FabricGpuBarrier barrier, size_t partTiles, int pieces,
-                                               bool ring) {
+                                               bool ring, int groups, unsigned nCopy) {
   static_assert(TileBytes * UnrollTiles <= kDdaA2ATdmWindowBytes, "tiles overflow the per-warp LDS window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
-  // A peer's scratch is free to overwrite once that peer has reached this op.
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
-
   extern __shared__ __attribute__((aligned(128))) uint8_t ddaA2ATdmSmem[];
   // TDM descriptors live in SGPRs, so every address below must be wave-uniform.
   const int lw = __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / warpSize));
   uint8_t* win = ddaA2ATdmSmem + lw * kDdaA2ATdmWindowBytes;
-
-  const size_t nParts = gridDim.x / nRanks;
-  const int k = static_cast<int>(blockIdx.x / nParts);
-  const size_t part = blockIdx.x % nParts;
   const size_t tilesPerPeer = (bytesPerRank + TileBytes - 1) / TileBytes;
+  const size_t warpTiles = (blockDim.x / warpSize) * UnrollTiles;
+  const size_t selfOff = static_cast<size_t>(selfRank) * bytesPerRank;
+  const unsigned pushBlocks = gridDim.x - nCopy;
+  const bool spread = groups < nRanks;
+
+  if (blockIdx.x >= pushBlocks) {
+    ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(
+      recvbuff + selfOff, sendbuff + selfOff, bytesPerRank,
+      static_cast<size_t>(blockIdx.x - pushBlocks) * warpTiles + static_cast<size_t>(lw) * UnrollTiles, tilesPerPeer,
+      static_cast<size_t>(nCopy) * warpTiles, win);
+    return;
+  }
+  if (spread && nCopy == 0) {
+    ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(recvbuff + selfOff, sendbuff + selfOff, bytesPerRank,
+                                               static_cast<size_t>(blockIdx.x) * warpTiles +
+                                                 static_cast<size_t>(lw) * UnrollTiles,
+                                               tilesPerPeer, static_cast<size_t>(pushBlocks) * warpTiles, win);
+  }
+
+  // A peer's scratch is free to overwrite once that peer has reached this op.
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
+
+  const size_t nParts = pushBlocks / groups;
+  const int k = static_cast<int>(blockIdx.x / nParts) + (spread ? 1 : 0);
+  const size_t part = blockIdx.x % nParts;
   const size_t tileBegin = part * partTiles;
   const size_t tileEnd = tileBegin + partTiles < tilesPerPeer ? tileBegin + partTiles : tilesPerPeer;
   const size_t first = tileBegin + static_cast<size_t>(lw) * UnrollTiles;
@@ -182,7 +203,7 @@ __launch_bounds__(512)
 #else
   // Only dispatched on gfx1250; every other arch still has to compile this kernel.
   (void)peerScratch, (void)recvbuff, (void)sendbuff, (void)bytesPerRank, (void)selfRank, (void)nRanks, (void)barrier,
-    (void)partTiles, (void)pieces, (void)ring;
+    (void)partTiles, (void)pieces, (void)ring, (void)groups, (void)nCopy;
   __builtin_trap();
 #endif
 }

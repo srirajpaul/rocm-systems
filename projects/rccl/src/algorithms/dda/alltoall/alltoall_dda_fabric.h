@@ -171,8 +171,12 @@ __device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t 
 // With ring the pipeline keeps only kDdaA2APushPeerRingPieces pieces per sender in the scratch: piece p of the chunk
 // from rank s lands in ring slot p % kDdaA2APushPeerRingPieces of s's ring instead of at its place in the chunk, so
 // the scratch needed no longer grows with the message.
-// gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
-// this rank may still be reading from sendbuff.
+// Spread (groups == nRanks - 1): the grid holds only the remote peer groups, k = 1 .. nRanks - 1, so the block cap
+// gives each peer more blocks, and this rank's own chunk is copied by the nCopy blocks after them or, with none, in
+// slices by every push block before its entry barrier. Copy blocks touch no fabric memory and skip the barrier; every
+// rank launches the same grid, so the flag slots stay paired.
+// gridDim.x - nCopy must be a multiple of groups. Out of place only: a block drains into recvbuff slots that other
+// blocks of this rank may still be reading from sendbuff.
 //
 // Ring slots needed: a post waits until the destination consumes the previous piece's token, but only thread 0
 // waits, so the block's other waves reach the next push as soon as the post is issued. The first block-wide sync
@@ -187,20 +191,36 @@ __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                             const T* __restrict__ sendbuff, int selfRank, int nRanks,
-                                            FabricGpuBarrier barrier, size_t pieceLines, bool ring) {
+                                            FabricGpuBarrier barrier, size_t pieceLines, bool ring, int groups,
+                                            unsigned nCopy) {
+  constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
+  const size_t nLines = count / countPerThread;
+  const size_t selfSlot = static_cast<size_t>(selfRank) * count;
+  const unsigned pushBlocks = gridDim.x - nCopy;
+  const bool spread = groups < nRanks;
+
+  if (blockIdx.x >= pushBlocks) {
+    ddaA2APushPeerCopy<false>(recvbuff + selfSlot, sendbuff + selfSlot,
+                              static_cast<size_t>(blockIdx.x - pushBlocks) * blockDim.x + threadIdx.x, nLines,
+                              static_cast<size_t>(nCopy) * blockDim.x);
+    return;
+  }
+  if (spread && nCopy == 0) {
+    ddaA2APushPeerCopy<false>(recvbuff + selfSlot, sendbuff + selfSlot,
+                              static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x, nLines,
+                              static_cast<size_t>(pushBlocks) * blockDim.x);
+  }
+
   // A peer's scratch is free to overwrite once that peer has reached this op.
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
 
-  constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
-  const unsigned perPeer = gridDim.x / nRanks;
-  const int k = static_cast<int>(blockIdx.x / perPeer);
-  const size_t nLines = count / countPerThread;
+  const unsigned perPeer = pushBlocks / groups;
+  const int k = static_cast<int>(blockIdx.x / perPeer) + (spread ? 1 : 0);
   const size_t begin = static_cast<size_t>(blockIdx.x % perPeer) * blockDim.x + threadIdx.x;
   const size_t stride = static_cast<size_t>(perPeer) * blockDim.x;
 
   const int peer = (selfRank + k) % nRanks;
   const T* src = sendbuff + static_cast<size_t>(peer) * count;
-  const size_t selfSlot = static_cast<size_t>(selfRank) * count;
   if (k == 0) {
     ddaA2APushPeerCopy<false>(recvbuff + selfSlot, src, begin, nLines, stride);
     return;
