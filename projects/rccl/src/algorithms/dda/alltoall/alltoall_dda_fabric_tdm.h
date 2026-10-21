@@ -28,10 +28,12 @@ constexpr CachePolicy kDdaA2ATdmPolicy = createCachePolicy(TemporalHint::NT, Mem
 
 #if TDM_SUPPORTED
 // Copies tiles [first, end) of a bytes-long chunk from src to dst through this warp's LDS window: UnrollTiles
-// consecutive tiles per batch, batches stride tiles apart. Every argument must be wave-uniform.
+// consecutive tiles per batch, batches stride tiles apart. src and dst point at the tiles srcTile0 and dstTile0 of
+// the chunk (0 = the chunk start). Every argument must be wave-uniform.
 template <int TileBytes, int UnrollTiles>
 __device__ __forceinline__ void ddaA2ATdmCopyTiles(uint8_t* dst, const uint8_t* src, size_t bytes, size_t first,
-                                                   size_t end, size_t stride, uint8_t* win) {
+                                                   size_t end, size_t stride, uint8_t* win, size_t srcTile0 = 0,
+                                                   size_t dstTile0 = 0) {
   for (size_t base = first; base < end; base += stride) {
 #pragma unroll
     for (int u = 0; u < UnrollTiles; ++u) {
@@ -39,7 +41,8 @@ __device__ __forceinline__ void ddaA2ATdmCopyTiles(uint8_t* dst, const uint8_t* 
       if (tile < end) {
         const size_t off = tile * TileBytes;
         const size_t n = bytes - off < TileBytes ? bytes - off : TileBytes;
-        tdm::asyncLoadToLDS<SyncPolicy::Async, kDdaA2ATdmPolicy, /*Aligned=*/true>(src + off, win + u * TileBytes, n);
+        tdm::asyncLoadToLDS<SyncPolicy::Async, kDdaA2ATdmPolicy, /*Aligned=*/true>(
+          src + (tile - srcTile0) * TileBytes, win + u * TileBytes, n);
       }
     }
     tdm::tdmWait();
@@ -49,8 +52,8 @@ __device__ __forceinline__ void ddaA2ATdmCopyTiles(uint8_t* dst, const uint8_t* 
       if (tile < end) {
         const size_t off = tile * TileBytes;
         const size_t n = bytes - off < TileBytes ? bytes - off : TileBytes;
-        tdm::asyncStoreFromLDS<SyncPolicy::Async, kDdaA2ATdmPolicy, /*Aligned=*/true>(win + u * TileBytes, dst + off,
-                                                                                      n);
+        tdm::asyncStoreFromLDS<SyncPolicy::Async, kDdaA2ATdmPolicy, /*Aligned=*/true>(
+          win + u * TileBytes, dst + (tile - dstTile0) * TileBytes, n);
       }
     }
     tdm::tdmWait();
@@ -69,15 +72,22 @@ __device__ __forceinline__ void ddaA2ATdmCopyTiles(uint8_t* dst, const uint8_t* 
 // only for the matching piece while other waves and blocks are in other phases. The pieces reuse the block's flag
 // slot, so a post first waits for the destination to consume the previous piece. Every TDM access bypasses the
 // caches at system scope and tdmWait completes the stores, so no fence is needed per piece.
+// With ring the pipeline keeps only kDdaA2ATdmRingPieces pieces per block part in the scratch: piece p of part j from
+// rank s lands in ring slot (j, p % kDdaA2ATdmRingPieces) of s's ring, each slot ceil(partTiles / pieces) tiles, so
+// the scratch needed no longer grows with the message. The post and wait sequence is the vector kernel's, so the same
+// four slots suffice (see kDdaA2APushPeerRingPieces).
 // gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
 // this rank may still be reading from sendbuff.
+constexpr int kDdaA2ATdmRingPieces = 4;
+
 template <int TileBytes, int UnrollTiles>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* __restrict__ recvbuff,
                                                const uint8_t* __restrict__ sendbuff, size_t bytesPerRank, int selfRank,
-                                               int nRanks, FabricGpuBarrier barrier, size_t partTiles, int pieces) {
+                                               int nRanks, FabricGpuBarrier barrier, size_t partTiles, int pieces,
+                                               bool ring) {
   static_assert(TileBytes * UnrollTiles <= kDdaA2ATdmWindowBytes, "tiles overflow the per-warp LDS window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
@@ -129,15 +139,41 @@ __launch_bounds__(512)
     const size_t b = tileBegin + static_cast<size_t>(p) * pieceTiles;
     return b < tileEnd ? b : tileEnd;
   };
+  // Scratch position of piece q: its place in the chunk or, with ring, its ring slot (slots are sized for the longest
+  // piece of any part, so every rank agrees on them).
+  const size_t slotBytes = (partTiles + pieces - 1) / pieces * TileBytes;
+  const size_t ringBytes = static_cast<size_t>(kDdaA2ATdmRingPieces) * slotBytes;
+  auto pushAt = [&](int q, size_t* tile0) -> uint8_t* {
+    if (!ring) {
+      *tile0 = 0;
+      return dst;
+    }
+    *tile0 = pieceBegin(q);
+    return peerScratch[peer] + (static_cast<size_t>(selfRank) * nParts + part) * ringBytes +
+           static_cast<size_t>(q % kDdaA2ATdmRingPieces) * slotBytes;
+  };
+  auto drainAt = [&](int q, size_t* tile0) -> const uint8_t* {
+    if (!ring) {
+      *tile0 = 0;
+      return drainSrc;
+    }
+    *tile0 = pieceBegin(q);
+    return peerScratch[selfRank] + (static_cast<size_t>(srcRank) * nParts + part) * ringBytes +
+           static_cast<size_t>(q % kDdaA2ATdmRingPieces) * slotBytes;
+  };
   for (int p = 0; p <= pieces; ++p) {
     if (p < pieces) {
-      ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(dst, src, bytesPerRank, pieceBegin(p) + warpOff, pieceBegin(p + 1),
-                                                 stride, win);
+      size_t dstTile0;
+      uint8_t* to = pushAt(p, &dstTile0);
+      ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(to, src, bytesPerRank, pieceBegin(p) + warpOff, pieceBegin(p + 1),
+                                                 stride, win, 0, dstTile0);
     }
     if (p > 0) {
       barrier.waitPeerRelaxed(srcRank);
-      ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(drainDst, drainSrc, bytesPerRank, pieceBegin(p - 1) + warpOff,
-                                                 pieceBegin(p), stride, win);
+      size_t srcTile0;
+      const uint8_t* from = drainAt(p - 1, &srcTile0);
+      ddaA2ATdmCopyTiles<TileBytes, UnrollTiles>(drainDst, from, bytesPerRank, pieceBegin(p - 1) + warpOff,
+                                                 pieceBegin(p), stride, win, srcTile0, 0);
     }
     if (p < pieces) {
       barrier.postPeerRelaxed(peer, blockIdx.x);
@@ -146,7 +182,7 @@ __launch_bounds__(512)
 #else
   // Only dispatched on gfx1250; every other arch still has to compile this kernel.
   (void)peerScratch, (void)recvbuff, (void)sendbuff, (void)bytesPerRank, (void)selfRank, (void)nRanks, (void)barrier,
-    (void)partTiles, (void)pieces;
+    (void)partTiles, (void)pieces, (void)ring;
   __builtin_trap();
 #endif
 }

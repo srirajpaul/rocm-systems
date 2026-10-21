@@ -168,15 +168,26 @@ __device__ __forceinline__ void ddaA2APushPeerCopy(T* dst, const T* src, size_t 
 // remote stores are in flight, then waits for its own stores and posts piece p. The pieces reuse the block's flag
 // slot, so a post first waits for the destination to consume the previous piece; the drain reads with system-scope
 // loads, so no fence is needed per piece.
+// With ring the pipeline keeps only kDdaA2APushPeerRingPieces pieces per sender in the scratch: piece p of the chunk
+// from rank s lands in ring slot p % kDdaA2APushPeerRingPieces of s's ring instead of at its place in the chunk, so
+// the scratch needed no longer grows with the message.
 // gridDim.x must be a multiple of nRanks. Out of place only: a block drains into recvbuff slots that other blocks of
 // this rank may still be reading from sendbuff.
+//
+// Ring slots needed: a post waits until the destination consumes the previous piece's token, but only thread 0
+// waits, so the block's other waves reach the next push as soon as the post is issued. The first block-wide sync
+// after thread 0's post of piece p - 2 is the wait of step p - 1, so a wave that pushes piece p only knows that the
+// post of piece p - 2 has completed: the destination has consumed token p - 3, which it does after draining piece
+// p - 4. Piece p can therefore reuse the slot of piece p - 4.
+constexpr int kDdaA2APushPeerRingPieces = 4;
+
 template <typename T>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                             const T* __restrict__ sendbuff, int selfRank, int nRanks,
-                                            FabricGpuBarrier barrier, size_t pieceLines) {
+                                            FabricGpuBarrier barrier, size_t pieceLines, bool ring) {
   // A peer's scratch is free to overwrite once that peer has reached this op.
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
 
@@ -212,15 +223,26 @@ __launch_bounds__(512)
   }
 
   const size_t nPieces = (nLines + pieceLines - 1) / pieceLines;
+  // Lines are indexed from the start of their piece; the scratch position of piece q is its place in the chunk or,
+  // with ring, its ring slot.
+  const size_t pieceElems = pieceLines * countPerThread;
+  const size_t ringElems = static_cast<size_t>(kDdaA2APushPeerRingPieces) * pieceElems;
+  T* const pushBase = ring ? ipcbuffs[peer] + static_cast<size_t>(selfRank) * ringElems : dst;
+  const T* const drainBase = ring ? ipcbuffs[selfRank] + static_cast<size_t>(srcRank) * ringElems : drainSrc;
+  auto scratchPiece = [&](size_t q) {
+    return (ring ? q % kDdaA2APushPeerRingPieces : q) * pieceElems;
+  };
+  auto pieceLen = [&](size_t q) {
+    return (q + 1) * pieceLines < nLines ? pieceLines : nLines - q * pieceLines;
+  };
   for (size_t p = 0; p <= nPieces; ++p) {
     if (p < nPieces) {
-      const size_t end = (p + 1) * pieceLines < nLines ? (p + 1) * pieceLines : nLines;
-      ddaA2APushPeerCopy<true>(dst, src, p * pieceLines + begin, end, stride);
+      ddaA2APushPeerCopy<true>(pushBase + scratchPiece(p), src + p * pieceElems, begin, pieceLen(p), stride);
     }
     if (p > 0) {
       barrier.waitPeerRelaxed(srcRank);
-      const size_t end = p * pieceLines < nLines ? p * pieceLines : nLines;
-      ddaA2APushPeerCopy<false, T, true /* sysScopeLoad */>(drainDst, drainSrc, (p - 1) * pieceLines + begin, end,
+      ddaA2APushPeerCopy<false, T, true /* sysScopeLoad */>(drainDst + (p - 1) * pieceElems,
+                                                            drainBase + scratchPiece(p - 1), begin, pieceLen(p - 1),
                                                             stride);
     }
     if (p < nPieces) {

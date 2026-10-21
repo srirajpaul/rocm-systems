@@ -36,6 +36,9 @@ RCCL_PARAM(DdaA2APushPeerPipeThreshold, "DDA_A2A_PUSH_PEER_PIPE_THRESHOLD", (int
 // Peer-major push pipeline: pieces per peer chunk above that threshold, each pushed while the previous one drains
 // (0 or 1 = no pipeline).
 RCCL_PARAM(DdaA2APushPeerPieces, "DDA_A2A_PUSH_PEER_PIECES", 8);
+// Peer-major push pipeline: keep only a ring of pieces per sender in the scratch. 0 = never, 1 = when the whole
+// alltoall does not fit the scratch (default), 2 = whenever the pipeline runs. Env: RCCL_DDA_A2A_PUSH_PEER_RING.
+RCCL_PARAM(DdaA2APushPeerRing, "DDA_A2A_PUSH_PEER_RING", 1);
 // Peer-major push through LDS with the gfx1250 Tensor Data Mover, with RCCL_DDA_A2A_PUSH=1 and
 // RCCL_DDA_A2A_PUSH_PEER=1. Env: RCCL_DDA_A2A_TDM.
 RCCL_PARAM(DdaA2ATdm, "DDA_A2A_TDM", 0);
@@ -91,6 +94,34 @@ static inline size_t ddaAllToAllFabricPushPeerPieceLines(size_t bytes, dim3 grid
   const size_t groupLines = static_cast<size_t>(grid.x / nRanks) * block.x * dda::common::kDdaA2APushPeerUnroll;
   const size_t pieceLines = dda::common::divRoundUp(dda::common::divRoundUp(lines, pieces), groupLines) * groupLines;
   return pieceLines >= lines ? 0 : pieceLines;
+}
+
+// Whether the pipelined vector peer-major push keeps only a ring of pieces per sender in the scratch
+// (RCCL_DDA_A2A_PUSH_PEER_RING: 0 never, 1 when the whole alltoall does not fit, 2 whenever pipelined).
+static inline bool ddaAllToAllFabricPushPeerRing(ncclComm* comm, size_t bytes, size_t pieceLines) {
+  if (pieceLines == 0) return false;
+  const int64_t mode = rcclParamDdaA2APushPeerRing();
+  if (mode >= 2) return true;
+  return mode == 1 && bytes * comm->nRanks > comm->ddaScratchBytes;
+}
+
+// Scratch bytes the ring takes: kDdaA2APushPeerRingPieces pieces (fewer if the chunk has fewer) per sender.
+static inline size_t ddaAllToAllFabricPushPeerRingBytes(size_t bytes, size_t pieceLines, int nRanks) {
+  const size_t lines = bytes / sizeof(uint4);
+  const size_t pieces = (lines + pieceLines - 1) / pieceLines;
+  const size_t ringPieces = std::min<size_t>(pieces, dda::common::kDdaA2APushPeerRingPieces);
+  return static_cast<size_t>(nRanks) * ringPieces * pieceLines * sizeof(uint4);
+}
+
+// True when an alltoall of `bytes` per peer that does not fit the scratch whole can still run as a pipelined vector
+// peer-major push with a ring that fits.
+static inline bool ddaAllToAllFabricPushPeerRingFits(ncclComm* comm, size_t bytes) {
+  if (!rcclParamDdaA2APush() || !rcclParamDdaA2APushPeer() || rcclParamDdaA2APushPeerRing() == 0) return false;
+  dim3 grid, block;
+  if (!ddaAllToAllFabricPushPeerGeom(comm, bytes, &grid, &block)) return false;
+  const size_t pieceLines = ddaAllToAllFabricPushPeerPieceLines(bytes, grid, block, comm->nRanks);
+  return pieceLines != 0 &&
+         ddaAllToAllFabricPushPeerRingBytes(bytes, pieceLines, comm->nRanks) <= comm->ddaScratchBytes;
 }
 
 static inline int ddaAllToAllFabricTdmTileBytes() {
@@ -191,19 +222,31 @@ static ncclResult_t ncclAllToAllDdaFabricTdmPushPeerLaunch(const void* sendbuff,
   const int pieces =
     static_cast<int>(std::min<int64_t>(ddaAllToAllFabricPushPeerPipePieces(bytesPerRank, comm->nRanks),
                                        static_cast<int64_t>(partTiles)));
+  // Ring as for the vector kernel (RCCL_DDA_A2A_PUSH_PEER_RING); an alltoall larger than the scratch runs here only if
+  // its ring fits, else the vector peer-major push takes it.
+  const bool fitsWhole = bytesPerRank * comm->nRanks <= comm->ddaScratchBytes;
+  const int64_t ringMode = rcclParamDdaA2APushPeerRing();
+  const bool ring = pieces > 1 && (ringMode >= 2 || (ringMode == 1 && !fitsWhole));
+  if (!fitsWhole) {
+    const size_t perPeer = grid.x / comm->nRanks;
+    const size_t slotBytes = (partTiles + pieces - 1) / pieces * TileBytes;
+    const size_t ringBytes = static_cast<size_t>(comm->nRanks) * perPeer *
+                             std::min<size_t>(pieces, dda::common::kDdaA2ATdmRingPieces) * slotBytes;
+    if (!ring || ringBytes > comm->ddaScratchBytes) return ncclSuccess;
+  }
 
   INFO(NCCL_COLL,
        "DDA fabric AllToAll: launching TDM peer-major push kernel: nRanks=%d count=%zu tile=%d x%d grid=%u (%u per "
-       "peer) block=%u part=%zu B lds=%zu pieces=%d",
+       "peer) block=%u part=%zu B lds=%zu pieces=%d%s",
        comm->nRanks, bytesPerRank, TileBytes, kUnrollTiles, grid.x, grid.x / comm->nRanks, block.x,
-       partTiles * TileBytes, dynSmem, pieces);
+       partTiles * TileBytes, dynSmem, pieces, ring ? " ring" : "");
 
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
   hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricTdmPushPeer<TileBytes, kUnrollTiles>), grid, block, dynSmem,
                         stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0,
                         reinterpret_cast<uint8_t* const*>(comm->ddaPeerPtrsDev), static_cast<uint8_t*>(recvbuff),
                         static_cast<const uint8_t*>(sendbuff), bytesPerRank, comm->rank, comm->nRanks, barrierHost,
-                        partTiles, pieces);
+                        partTiles, pieces, ring);
   *launched = true;
   return ncclSuccess;
 }
@@ -235,7 +278,9 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
 
   const int nRanks = comm->nRanks;
   const size_t totalBytes = count * nRanks;
-  if (totalBytes > comm->ddaScratchBytes) {
+  // An alltoall larger than the scratch runs only as a pipelined vector peer-major push with a ring.
+  const bool fitsWhole = totalBytes <= comm->ddaScratchBytes;
+  if (!fitsWhole && !(sendbuff != recvbuff && ddaAllToAllFabricPushPeerRingFits(comm, count))) {
     WARN("DDA fabric alltoall: total %zu bytes exceeds comm scratch %zu bytes", totalBytes,
          comm->ddaScratchBytes);
     return ncclInvalidArgument;
@@ -271,17 +316,28 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
   dim3 peerGrid, peerBlock;
   if (peerPush && ddaAllToAllFabricPushPeerGeom(comm, count, &peerGrid, &peerBlock)) {
     const size_t pieceLines = ddaAllToAllFabricPushPeerPieceLines(count, peerGrid, peerBlock, nRanks);
+    const bool ring = ddaAllToAllFabricPushPeerRing(comm, count, pieceLines);
+    if (!fitsWhole && !ring) {
+      WARN("DDA fabric alltoall: total %zu bytes exceeds comm scratch %zu bytes", totalBytes, comm->ddaScratchBytes);
+      return ncclInvalidArgument;
+    }
     INFO(NCCL_COLL,
          "DDA fabric AllToAll: launching peer-major push kernel: nRanks=%d count=%zu grid=%u (%u per peer) block=%u "
-         "piece=%zu B",
-         nRanks, count, peerGrid.x, peerGrid.x / nRanks, peerBlock.x, pieceLines * sizeof(uint4));
+         "piece=%zu B%s",
+         nRanks, count, peerGrid.x, peerGrid.x / nRanks, peerBlock.x, pieceLines * sizeof(uint4), ring ? " ring" : "");
 
     const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
     hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPushPeer<T>), peerGrid, peerBlock, 0, stream,
                           /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<T*>(recvbuff), count,
-                          static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost, pieceLines);
+                          static_cast<const T*>(sendbuff), comm->rank, nRanks, barrierHost, pieceLines, ring);
     CUDACHECK(cudaGetLastError());
     return ncclSuccess;
+  }
+
+  // The kernels below need the whole alltoall in the scratch.
+  if (!fitsWhole) {
+    WARN("DDA fabric alltoall: total %zu bytes exceeds comm scratch %zu bytes", totalBytes, comm->ddaScratchBytes);
+    return ncclInvalidArgument;
   }
 
   if (rcclParamDdaA2APush()) {
@@ -346,8 +402,6 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
 
 bool ncclAllToAllDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
                                    ncclDataType_t datatype) {
-  (void)sendbuff;
-  (void)recvbuff;
   if (comm == nullptr || comm->bootstrap == nullptr) {
     return false;
   }
@@ -371,7 +425,9 @@ bool ncclAllToAllDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* r
 
   size_t totalCount = count * comm->nRanks;
   size_t need = totalCount * ncclTypeSize(datatype);
-  if (need > comm->ddaScratchBytes) {
+  // Larger than the scratch: only the pipelined vector peer-major push with a ring (out of place) can run it.
+  if (need > comm->ddaScratchBytes &&
+      !(sendbuff != recvbuff && ddaAllToAllFabricPushPeerRingFits(comm, count * ncclTypeSize(datatype)))) {
     return false;
   }
 
