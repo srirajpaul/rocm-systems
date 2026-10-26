@@ -179,9 +179,16 @@ __launch_bounds__(512)
   const T* const src = sendbuff + static_cast<size_t>(peer) * count;
   const size_t slot = static_cast<size_t>(srcRank) * count;
 
-  // Entry handshake instead of a full barrier: only peer reads the slot this block writes, so wait for peer alone.
   const uint32_t epoch = barrier.epochBegin();
-  if (k != 0) barrier.epochSignalWait(srcRank, peer, epoch);
+  if (k == 0) {
+    // Own chunk: copy sendbuff -> recvbuff directly. Nothing goes through scratch, so there is no flag to wait on or post.
+    // System-scope loads and stores: with plain stores the copy was 3-8% slower overall.
+    ddaA2APeerCopy<true, true>(recvbuff + slot, src, begin, nLines, stride);
+    barrier.epochEnd(epoch, pieces);
+    return;
+  }
+  // Entry handshake instead of a full barrier: only peer reads the slot this block writes, so wait for peer alone.
+  barrier.epochSignalWait(srcRank, peer, epoch);
 
   {
     // The host never passes pieces == 0, so the kernel does not guard it. Adding a check inside the kernel (for example
