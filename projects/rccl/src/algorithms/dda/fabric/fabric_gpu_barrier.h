@@ -137,7 +137,7 @@ public:
   }
 
   // Epoch flags of the peer-major push alltoall (own region; the toggle flags are untouched): a post stores a growing
-  // value and never waits, a wait polls for at least a value, so every wave can poll one slot. A block's launch uses
+  // value and never waits, a wait polls for at least a value, so several blocks can poll one slot. A block's launch uses
   // epoch .. epoch + pieces + 1 (entry posts epoch, piece p posts epoch + 2 + p); epoch is the block's cell, advanced by
   // epochEnd, so it survives CUDA graph replays. Scratch accesses are system-scope: no fence besides orderDestWrites().
   __device__ __forceinline__ FlagType epochBegin() const { return epochCell()[blockIdx.x] + 1; }
@@ -175,18 +175,20 @@ public:
                               __MEMORY_SCOPE_SYSTEM);
     }
   }
-  // Piece `piece` of a launch is posted as epoch + 2 + piece. Every thread calls epochWaitPiece and polls the slot
-  // itself (`ready` is epochFlagFrom(source)), so a wave continues as soon as the piece is there, with no block-wide sync.
+  // Piece `piece` of a launch is posted as epoch + 2 + piece. Every thread of the block must call epochWaitPiece: only
+  // thread 0 polls the slot (`ready` is epochFlagFrom(source)), since system-scope polls from every wave slow the data.
   __device__ __forceinline__ void epochPostPiece(int to, FlagType epoch, unsigned piece) {
     epochPost(to, epoch + 2 + piece);
   }
   __device__ __forceinline__ void epochWaitPiece(const FlagType* ready, FlagType epoch, unsigned piece) {
     const FlagType want = epoch + 2 + piece;
-    while (static_cast<int32_t>(__scoped_atomic_load_n(ready, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - want) < 0) {
+    if (threadIdx.x == 0) {
+      while (static_cast<int32_t>(__scoped_atomic_load_n(ready, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - want) < 0) {
+      }
     }
-    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    __syncthreads();
   }
-  // The slot rank `from` posts to from this block index, in this rank's buffer. Every wave polls it.
+  // The slot rank `from` posts to from this block index, in this rank's buffer.
   __device__ __forceinline__ const FlagType* epochFlagFrom(int from) const { return epochFlagFrom(from, blockIdx.x); }
   // The slot rank `from` posts to from its block `fromBlock`.
   __device__ __forceinline__ const FlagType* epochFlagFrom(int from, int fromBlock) const {
