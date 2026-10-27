@@ -163,8 +163,6 @@ __device__ __forceinline__ void ddaA2APeerCopy(T* dst, const T* src, size_t begi
 // drain > 0: drain * (nRanks - 1) drain blocks follow the nRanks * blocksPerPeer push blocks, drain of them per source
 // offset r = 1 .. nRanks - 1; drain block d of offset r drains slices d, d + drain, ... of every piece of rank
 // (self - r) % nRanks. The host then passes keep == 0 and group 0 only copies, so push blocks only push and post.
-// The slots start scratchOff elements into every rank's scratch; entry == false skips the entry handshake when the host
-// alternates scratch halves between consecutive calls (RCCL_DDA_A2A_PUSH_PEER_DBUF).
 // Flags are epoch flags (see FabricGpuBarrier); scratch accesses are system-scope, so posts and waits need no fence.
 template <typename T>
 #if defined(USE_ROCM)
@@ -173,12 +171,11 @@ __launch_bounds__(512)
   __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                             const T* __restrict__ sendbuff, int selfRank, int nRanks,
                                             int blocksPerPeer, unsigned pieces, unsigned keep, unsigned drain,
-                                            size_t scratchOff, bool entry, FabricGpuBarrier barrier) {
+                                            FabricGpuBarrier barrier) {
   constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
   const size_t nLines = count / countPerThread;
   const size_t stride = static_cast<size_t>(blocksPerPeer) * blockDim.x;
   const unsigned pushBlocks = static_cast<unsigned>(nRanks * blocksPerPeer);
-  const T* const selfScratch = ipcbuffs[selfRank] + scratchOff;
 
   // The host never passes pieces == 0, so the kernel does not guard it. Adding a check inside the kernel (for example
   // `pieces ? pieces : 1` in the divisions below) lowers the kernel from 80 to 64 VGPRs; neither version spills and
@@ -206,7 +203,7 @@ __launch_bounds__(512)
         barrier.epochWaitPiece(barrier.epochFlagFrom(from, r * blocksPerPeer + static_cast<int>(j)), epoch,
                                static_cast<unsigned>(p));
         auto [lo, hi] = pieceOf(static_cast<size_t>(j) * blockDim.x + threadIdx.x, p);
-        ddaA2APeerCopy<true, false>(recvbuff + fromSlot, selfScratch + fromSlot, lo, hi, stride);
+        ddaA2APeerCopy<true, false>(recvbuff + fromSlot, ipcbuffs[selfRank] + fromSlot, lo, hi, stride);
       }
     }
     barrier.epochEnd(epoch, pieces);
@@ -219,12 +216,12 @@ __launch_bounds__(512)
   const int peer = (selfRank + k) % nRanks;
   const int srcRank = (selfRank - k + nRanks) % nRanks;
 
-  T* const dst = ipcbuffs[peer] + scratchOff + static_cast<size_t>(selfRank) * count;
+  T* const dst = ipcbuffs[peer] + static_cast<size_t>(selfRank) * count;
   const T* const src = sendbuff + static_cast<size_t>(peer) * count;
   const size_t slot = static_cast<size_t>(srcRank) * count;
 
   // Entry handshake instead of a full barrier: only peer reads the slot this block writes, so wait for peer alone.
-  if (k != 0 && entry) barrier.epochSignalWait(srcRank, peer, epoch);
+  if (k != 0) barrier.epochSignalWait(srcRank, peer, epoch);
 
   {
     // The push blocks (k != 0) drain only the last `keep` pieces of their slot; block group 0 drains pieces 0 .. moved - 1.
@@ -244,7 +241,7 @@ __launch_bounds__(512)
       if (p > moved) {
         barrier.epochWaitPiece(ready, epoch, static_cast<unsigned>(p - 1));
         auto [lo, hi] = piece(p - 1);
-        ddaA2APeerCopy<true, false>(recvbuff + slot, selfScratch + slot, lo, hi, stride);
+        ddaA2APeerCopy<true, false>(recvbuff + slot, ipcbuffs[selfRank] + slot, lo, hi, stride);
       }
       if (p < nPieces) barrier.epochPostPiece(peer, epoch, static_cast<unsigned>(p));
     }
@@ -259,7 +256,7 @@ __launch_bounds__(512)
           const int from = (selfRank - r + nRanks) % nRanks;
           barrier.epochWaitPiece(barrier.epochFlagFrom(from, r * blocksPerPeer + part), epoch, static_cast<unsigned>(p));
           const size_t fromSlot = static_cast<size_t>(from) * count;
-          ddaA2APeerCopy<true, false>(recvbuff + fromSlot, selfScratch + fromSlot, lo, hi, stride);
+          ddaA2APeerCopy<true, false>(recvbuff + fromSlot, ipcbuffs[selfRank] + fromSlot, lo, hi, stride);
         }
       }
     }

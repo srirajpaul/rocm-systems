@@ -193,7 +193,6 @@ ncclResult_t ncclAllToAllDdaFabricLL128(const void* sendbuff, void* recvbuff, si
   if (!rcclDdaDatatypeSupported(comm, datatype)) {
     return ncclInvalidArgument;
   }
-  ncclAllToAllDdaFabricDbufRestart(comm);
   const int typeSize = ncclTypeSize(datatype);
   return ncclAllToAllDdaFabricLL128Typed<int8_t>(sendbuff, recvbuff, count * typeSize, comm, stream);
 }
