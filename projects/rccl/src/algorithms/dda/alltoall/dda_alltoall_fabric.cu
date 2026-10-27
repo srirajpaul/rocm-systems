@@ -33,6 +33,10 @@
 RCCL_PARAM(DdaA2APush, "DDA_A2A_PUSH", 0);
 RCCL_PARAM(DdaA2ATdm, "DDA_A2A_TDM", 0);
 RCCL_PARAM(DdaA2ATdmTileKB, "DDA_A2A_TDM_TILE_KB", 8);
+// Tuning notes for the peer-major TDM push (not defaults; re-check on each machine): the best TransferBench TDM all-to-all
+// settings were about 32 thread blocks per peer transfer, 256 to 1024 threads per block and the device maximum of dynamic
+// LDS per block, i.e. a large staging window per wave. Here that means fewer blocks per peer than the block cap allows
+// (see ddaAllToAllFabricPeerGeom), fewer waves per block, and a larger tile (window) per wave; see the kernel comment.
 // RCCL_DDA_A2A_PUSH_PEER=1 (with RCCL_DDA_A2A_PUSH=1): peer-major vector push. Each block works on a single peer
 // and the grid is nRanks * blocksPerPeer. Out of place only.
 RCCL_PARAM(DdaA2APushPeer, "DDA_A2A_PUSH_PEER", 0);
@@ -42,8 +46,8 @@ RCCL_PARAM(DdaA2APushPeerPipe, "DDA_A2A_PUSH_PEER_PIPE", 1);
 // RCCL_DDA_A2A_PUSH_PEER_PIECES > 0 forces the piece count of the peer-major pushes; 0 (default) = automatic.
 RCCL_PARAM(DdaA2APushPeerPieces, "DDA_A2A_PUSH_PEER_PIECES", 0);
 // RCCL_DDA_A2A_PUSH_PEER_KEEP: number of trailing pieces each push block of the peer-major vector kernel drains itself;
-// the earlier pieces are drained by the local-copy blocks (group 0). 0 moves every drain to group 0. Default -1 = auto:
-// every drain stays in the push blocks when the chunk per peer is below 8 MiB (the move loses there), 0 otherwise.
+// the earlier pieces are drained by the local-copy blocks (group 0). 0 moves every drain to group 0. Default -1 = auto,
+// see ddaAllToAllFabricPeerKeep.
 RCCL_PARAM(DdaA2APushPeerKeep, "DDA_A2A_PUSH_PEER_KEEP", -1);
 
 namespace {
@@ -63,6 +67,17 @@ static inline unsigned ddaAllToAllFabricPeerPieces(size_t chunkBytes, unsigned m
   const int64_t forced = rcclParamDdaA2APushPeerPieces();
   if (forced > 0) return static_cast<unsigned>(std::min<int64_t>(forced, 64));
   return static_cast<unsigned>(std::clamp<size_t>(chunkBytes >> 20, 1, maxPieces));
+}
+
+// Trailing pieces each push block of a peer-major kernel drains itself (RCCL_DDA_A2A_PUSH_PEER_KEEP); the earlier pieces
+// are drained by the local-copy blocks. Auto (-1): none (every drain moves to the local-copy blocks) for a chunk per peer in
+// [autoMinBytes, autoMaxBytes), all of them outside it: the move loses below autoMinBytes, where the transfer is
+// latency-bound, and above autoMaxBytes the local-copy blocks become the bottleneck.
+static inline unsigned ddaAllToAllFabricPeerKeep(size_t chunkBytes, unsigned pieces, size_t autoMinBytes,
+                                                  size_t autoMaxBytes) {
+  const int64_t keep = rcclParamDdaA2APushPeerKeep();
+  if (keep >= 0) return static_cast<unsigned>(std::min<int64_t>(keep, 64));
+  return chunkBytes >= autoMinBytes && chunkBytes < autoMaxBytes ? 0u : pieces;
 }
 
 struct DdaA2APeerGeom {
@@ -199,27 +214,28 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
       }
       if (prep == ncclSuccess) {
         const unsigned pieces = ddaAllToAllFabricPeerPieces(count, 32);
+        const unsigned keep = ddaAllToAllFabricPeerKeep(count, pieces, size_t{64} << 20, size_t{256} << 20);
         INFO(NCCL_COLL,
              "DDA fabric AllToAll: launching peer-major TDM push kernel: nRanks=%d count=%zu tile=%d grid=%u "
-             "block=%u blocksPerPeer=%d smem=%d pieces=%u",
-             nRanks, count, tileBytes, pg.grid.x, pg.block.x, pg.blocksPerPeer, smemBytes, pieces);
+             "block=%u blocksPerPeer=%d smem=%d pieces=%u keep=%u",
+             nRanks, count, tileBytes, pg.grid.x, pg.block.x, pg.blocksPerPeer, smemBytes, pieces, keep);
         const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
         switch (tileBytes) {
         case 4 << 10:
           hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricTdmPushPeer<4 << 10, 4>), pg.grid, pg.block, smemBytes,
                                 stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0, scratch, recvBytes,
-                                sendBytes, count, comm->rank, nRanks, pg.blocksPerPeer, pieces, barrierHost);
+                                sendBytes, count, comm->rank, nRanks, pg.blocksPerPeer, pieces, keep, barrierHost);
           break;
         case 16 << 10:
           hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricTdmPushPeer<16 << 10, 1>), pg.grid, pg.block,
                                 smemBytes, stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0, scratch,
-                                recvBytes, sendBytes, count, comm->rank, nRanks, pg.blocksPerPeer, pieces,
+                                recvBytes, sendBytes, count, comm->rank, nRanks, pg.blocksPerPeer, pieces, keep,
                                 barrierHost);
           break;
         default:
           hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricTdmPushPeer<8 << 10, 2>), pg.grid, pg.block, smemBytes,
                                 stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0, scratch, recvBytes,
-                                sendBytes, count, comm->rank, nRanks, pg.blocksPerPeer, pieces, barrierHost);
+                                sendBytes, count, comm->rank, nRanks, pg.blocksPerPeer, pieces, keep, barrierHost);
           break;
         }
         CUDACHECK(cudaGetLastError());
@@ -285,9 +301,7 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
     const DdaA2APeerGeom pg = ddaAllToAllFabricPeerGeom(comm, vecWaves, 8);
     if (pg.blocksPerPeer > 0) {
       const unsigned pieces = ddaAllToAllFabricPeerPieces(count * sizeof(T), 16);
-      const int64_t keepParam = rcclParamDdaA2APushPeerKeep();
-      const unsigned keep = keepParam >= 0 ? static_cast<unsigned>(keepParam)
-                                           : (count * sizeof(T) < (8u << 20) ? pieces : 0u);
+      const unsigned keep = ddaAllToAllFabricPeerKeep(count * sizeof(T), pieces, size_t{8} << 20, SIZE_MAX);
       INFO(NCCL_COLL,
            "DDA fabric AllToAll: launching peer-major push kernel: nRanks=%d count=%zu grid=%u block=%u "
            "blocksPerPeer=%d pieces=%u keep=%u",
