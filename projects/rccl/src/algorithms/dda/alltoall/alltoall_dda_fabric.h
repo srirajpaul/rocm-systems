@@ -158,6 +158,8 @@ __device__ __forceinline__ void ddaA2APeerCopy(T* dst, const T* src, size_t begi
 // Peer-major push alltoall, out of place: block b pushes its slice of the chunk to peer (self + k) % nRanks, with
 // k = b / blocksPerPeer, and drains the slot of rank (self - k) % nRanks (written by that rank's block b).
 // The share is cut into `pieces` runs of rows: step p pushes piece p, drains the source's piece p - 1, then posts p.
+// The push blocks (k != 0) drain only the last `keep` pieces; block group 0 (k == 0) drains the earlier ones once its own
+// chunk is done, so the push blocks keep pushing. keep == 0 moves every drain to group 0.
 // Flags are epoch flags (see FabricGpuBarrier); scratch accesses are system-scope, so posts and waits need no fence.
 template <typename T>
 #if defined(USE_ROCM)
@@ -165,7 +167,8 @@ __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                             const T* __restrict__ sendbuff, int selfRank, int nRanks,
-                                            int blocksPerPeer, unsigned pieces, FabricGpuBarrier barrier) {
+                                            int blocksPerPeer, unsigned pieces, unsigned keep,
+                                            FabricGpuBarrier barrier) {
   constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
   const size_t nLines = count / countPerThread;
   const int k = blockIdx.x / blocksPerPeer;
@@ -179,16 +182,9 @@ __launch_bounds__(512)
   const T* const src = sendbuff + static_cast<size_t>(peer) * count;
   const size_t slot = static_cast<size_t>(srcRank) * count;
 
-  const uint32_t epoch = barrier.epochBegin();
-  if (k == 0) {
-    // Own chunk: copy sendbuff -> recvbuff directly. Nothing goes through scratch, so there is no flag to wait on or post.
-    // System-scope loads and stores: with plain stores the copy was 3-8% slower overall.
-    ddaA2APeerCopy<true, true>(recvbuff + slot, src, begin, nLines, stride);
-    barrier.epochEnd(epoch, pieces);
-    return;
-  }
   // Entry handshake instead of a full barrier: only peer reads the slot this block writes, so wait for peer alone.
-  barrier.epochSignalWait(srcRank, peer, epoch);
+  const uint32_t epoch = barrier.epochBegin();
+  if (k != 0) barrier.epochSignalWait(srcRank, peer, epoch);
 
   {
     // The host never passes pieces == 0, so the kernel does not guard it. Adding a check inside the kernel (for example
@@ -199,6 +195,8 @@ __launch_bounds__(512)
     const size_t nRows = (nLines + stride - 1) / stride;
     const size_t perPiece = ((nRows + pieces - 1) / pieces + kDdaA2APeerUnroll - 1) / kDdaA2APeerUnroll * kDdaA2APeerUnroll;
     const size_t nPieces = (nRows + perPiece - 1) / perPiece;
+    // The push blocks (k != 0) drain only the last `keep` pieces of their slot; block group 0 drains pieces 0 .. moved - 1.
+    const size_t moved = nPieces > keep ? nPieces - keep : 0;
     // This thread's line range [lo, hi) of piece p: rows [p * perPiece, (p + 1) * perPiece).
     auto piece = [&](size_t p) -> std::pair<size_t, size_t> {
       const size_t lo = begin + p * perPiece * stride;
@@ -207,17 +205,36 @@ __launch_bounds__(512)
     };
 
     const FabricGpuBarrier::FlagType* const ready = barrier.epochFlagFrom(srcRank);
-    for (size_t p = 0; p <= nPieces; ++p) {
+    // Group 0 copies its own chunk directly sendbuff -> recvbuff (no scratch, no flags), with system-scope loads and stores
+    // (plain stores made it slower); only push blocks run the loop.
+    if (k == 0) ddaA2APeerCopy<true, true>(recvbuff + slot, src, begin, nLines, stride);
+    for (size_t p = 0; p <= nPieces && k != 0; ++p) {
       if (p < nPieces) {
          auto [lo, hi] = piece(p);
          ddaA2APeerCopy<false, true>(dst, src, lo, hi, stride);
       }
-      if (p > 0) {
+      // Piece p - 1 is drained here only if it is one of the last `keep` pieces; group 0 drains the others.
+      if (p > moved) {
         barrier.epochWaitPiece(ready, epoch, static_cast<unsigned>(p - 1));
         auto [lo, hi] = piece(p - 1);
         ddaA2APeerCopy<true, false>(recvbuff + slot, ipcbuffs[selfRank] + slot, lo, hi, stride);
       }
       if (p < nPieces) barrier.epochPostPiece(peer, epoch, static_cast<unsigned>(p));
+    }
+
+    // Block group 0 (the local-copy blocks) is done with its own chunk early: it now drains pieces 0 .. moved - 1 of
+    // every other source's slot. Block j of group 0 and block k * blocksPerPeer + j of group k cover the same rows.
+    if (k == 0) {
+      const int part = blockIdx.x;
+      for (size_t p = 0; p < moved; ++p) {
+        auto [lo, hi] = piece(p);
+        for (int r = 1; r < nRanks; ++r) {
+          const int from = (selfRank - r + nRanks) % nRanks;
+          barrier.epochWaitPiece(barrier.epochFlagFrom(from, r * blocksPerPeer + part), epoch, static_cast<unsigned>(p));
+          const size_t fromSlot = static_cast<size_t>(from) * count;
+          ddaA2APeerCopy<true, false>(recvbuff + fromSlot, ipcbuffs[selfRank] + fromSlot, lo, hi, stride);
+        }
+      }
     }
   }
   barrier.epochEnd(epoch, pieces);

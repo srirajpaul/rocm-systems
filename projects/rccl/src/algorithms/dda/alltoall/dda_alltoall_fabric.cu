@@ -41,6 +41,9 @@ RCCL_PARAM(DdaA2APushPeer, "DDA_A2A_PUSH_PEER", 0);
 RCCL_PARAM(DdaA2APushPeerPipe, "DDA_A2A_PUSH_PEER_PIPE", 1);
 // RCCL_DDA_A2A_PUSH_PEER_PIECES > 0 forces the piece count of the peer-major pushes; 0 (default) = automatic.
 RCCL_PARAM(DdaA2APushPeerPieces, "DDA_A2A_PUSH_PEER_PIECES", 0);
+// RCCL_DDA_A2A_PUSH_PEER_KEEP: number of trailing pieces each push block of the peer-major vector kernel drains itself;
+// the earlier pieces are drained by the local-copy blocks (group 0). 0 (default) moves every drain to group 0.
+RCCL_PARAM(DdaA2APushPeerKeep, "DDA_A2A_PUSH_PEER_KEEP", 0);
 
 namespace {
 
@@ -289,7 +292,7 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
       hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPushPeer<T>), pg.grid, pg.block, 0, stream,
                             /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<T*>(recvbuff),
                             count, static_cast<const T*>(sendbuff), comm->rank, nRanks, pg.blocksPerPeer, pieces,
-                            barrierHost);
+                            static_cast<unsigned>(std::max<int64_t>(0, rcclParamDdaA2APushPeerKeep())), barrierHost);
       CUDACHECK(cudaGetLastError());
       return ncclSuccess;
     }
