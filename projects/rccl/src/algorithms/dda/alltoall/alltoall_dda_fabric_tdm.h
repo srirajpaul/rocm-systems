@@ -133,11 +133,23 @@ ddaAllToAllFabricTdmPush(uint8_t* const* __restrict__ peerScratch, uint8_t* __re
 // The flags are the barrier's epoch flags (see FabricGpuBarrier): a post never waits for the previous piece to be
 // consumed, and every wave polls the flag itself. The pieces land at their place in the chunk, so the scratch needed is
 // unchanged. One piece pushes the whole share, posts, waits and drains: no overlap.
+// Block group 0 (k == 0) copies its own chunk straight from sendbuff to recvbuff (no scratch, no flags). It then drains
+// the pieces 0 .. moved - 1 of every other source's slot, where moved = nPieces - keep: the push blocks (k != 0) drain only
+// the last keep pieces themselves, so they keep pushing. Block j of group 0 and block k * blocksPerPeer + j of group k
+// cover the same tiles. keep == 0 moves every drain to group 0.
+//
+// Tuning notes (these are not the defaults; re-check them on each machine). TransferBench's TDM all-to-all, a useful
+// reference for the push rate the fabric can sustain, did best with about 32 thread blocks (sub-executors) per peer
+// transfer, 256 to 1024 threads per block, and the device maximum of dynamic LDS per block (TDM_LDS_BYTES=0, split evenly
+// over the waves, so every wave stages a large window). A small LDS budget per wave was much slower. The matching knobs
+// here are the blocks per peer picked by the host (ddaAllToAllFabricPeerGeom, bounded by the block cap), the waves per
+// block, and the wave window (TileBytes * UnrollPeers, at most the device's LDS limit divided by the waves). About 32
+// blocks per peer, fewer waves per block and a larger window per wave raised the alltoall rate on one machine.
 template <int TileBytes, int UnrollPeers>
 __global__ void __launch_bounds__(kDdaA2ATdmMaxWarpsPerBlock* kDdaA2ATdmWave)
 ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* __restrict__ recvbuff,
                               const uint8_t* __restrict__ sendbuff, size_t bytesPerRank, int selfRank, int nRanks,
-                              int blocksPerPeer, unsigned pieces, FabricGpuBarrier barrier) {
+                              int blocksPerPeer, unsigned pieces, unsigned keep, FabricGpuBarrier barrier) {
   static_assert(TileBytes * UnrollPeers == kDdaA2ATdmWindowBytes, "tiles must fill one wave window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
@@ -200,16 +212,35 @@ ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* 
   const uint8_t* const src = sendbuff + static_cast<size_t>(peer) * bytesPerRank;
   const uint8_t* const slot = peerScratch[selfRank] + static_cast<size_t>(from) * bytesPerRank;
   uint8_t* const out = recvbuff + static_cast<size_t>(from) * bytesPerRank;
-  // Every TDM store of a piece has drained (tdmWait) before epochPostPiece, which also waits for the wave's stores and
-  // syncs the block before thread 0 posts. Every wave polls the source's flag itself.
-  const FabricGpuBarrier::FlagType* const ready = barrier.epochFlagFrom(from);
-  for (size_t p = 0; p <= nPieces; ++p) {
-    if (p < nPieces) pass(src, dst, p);
-    if (p > 0) {
-      barrier.epochWaitPiece(ready, epoch, static_cast<unsigned>(p - 1));
-      pass(slot, out, p - 1);
+  // Pieces 0 .. moved - 1 of the slots are drained by group 0, the last `keep` by the push blocks.
+  const size_t moved = nPieces > keep ? nPieces - keep : 0;
+  if (k == 0) {
+    // Own chunk: peer == from == selfRank, so this is sendbuff -> recvbuff through the LDS window. No scratch, no flags.
+    for (size_t p = 0; p < nPieces; ++p) pass(src, out, p);
+    // Then drain what the push blocks leave: piece p of rank (selfRank - r)'s slot, once that rank's block
+    // r * blocksPerPeer + slice has posted it. Every wave polls the flag itself.
+    for (size_t p = 0; p < moved; ++p) {
+      for (int r = 1; r < nRanks; ++r) {
+        const int rank = (selfRank - r + nRanks) % nRanks;
+        barrier.epochWaitPiece(barrier.epochFlagFrom(rank, r * blocksPerPeer + static_cast<int>(slice)), epoch,
+                               static_cast<unsigned>(p));
+        pass(peerScratch[selfRank] + static_cast<size_t>(rank) * bytesPerRank,
+             recvbuff + static_cast<size_t>(rank) * bytesPerRank, p);
+      }
     }
-    if (p < nPieces) barrier.epochPostPiece(peer, epoch, static_cast<unsigned>(p));
+  } else {
+    // Every TDM store of a piece has drained (tdmWait) before epochPostPiece, which also waits for the wave's stores and
+    // syncs the block before thread 0 posts. Every wave polls the source's flag itself.
+    const FabricGpuBarrier::FlagType* const ready = barrier.epochFlagFrom(from);
+    for (size_t p = 0; p <= nPieces; ++p) {
+      if (p < nPieces) pass(src, dst, p);
+      // Piece p - 1 is drained here only if it is one of the last `keep` pieces.
+      if (p > moved) {
+        barrier.epochWaitPiece(ready, epoch, static_cast<unsigned>(p - 1));
+        pass(slot, out, p - 1);
+      }
+      if (p < nPieces) barrier.epochPostPiece(peer, epoch, static_cast<unsigned>(p));
+    }
   }
   barrier.epochEnd(epoch, pieces);
 #else
@@ -222,6 +253,7 @@ ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* 
   (void)nRanks;
   (void)blocksPerPeer;
   (void)pieces;
+  (void)keep;
   (void)barrier;
   __builtin_trap();
 #endif
