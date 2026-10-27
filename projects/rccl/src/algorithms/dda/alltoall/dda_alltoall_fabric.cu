@@ -33,15 +33,10 @@
 RCCL_PARAM(DdaA2APush, "DDA_A2A_PUSH", 0);
 RCCL_PARAM(DdaA2ATdm, "DDA_A2A_TDM", 0);
 RCCL_PARAM(DdaA2ATdmTileKB, "DDA_A2A_TDM_TILE_KB", 8);
-// Peer-major TDM push knobs. RCCL_DDA_A2A_TDM_TILE_KB is the tile each wave stages: 4, 8 or 16 KiB (a 16 KiB window of
-// several tiles), or 20 or 40 KiB (a single tile that is the window; peer-major kernel only). RCCL_DDA_A2A_TDM_WARPS is the
-// number of waves per block (default and maximum 16; also bounded by the device's dynamic LDS limit divided by the window).
-// RCCL_DDA_A2A_TDM_BPP forces the blocks per peer (0 = automatic; at most the block cap divided by the rank count).
-// Tuning notes (not defaults; re-check on each machine): the best TransferBench TDM all-to-all settings were about 32 thread
-// blocks per peer transfer, 256 to 1024 threads per block and the device maximum of dynamic LDS per block, i.e. a large
-// staging window per wave. Here that is BPP=32, a smaller WARPS and a larger TILE_KB (for example 40 KiB with 8 waves).
-RCCL_PARAM(DdaA2ATdmWarps, "DDA_A2A_TDM_WARPS", 16);
-RCCL_PARAM(DdaA2ATdmBpp, "DDA_A2A_TDM_BPP", 0);
+// Tuning notes for the peer-major TDM push (not defaults; re-check on each machine): the best TransferBench TDM all-to-all
+// settings were about 32 thread blocks per peer transfer, 256 to 1024 threads per block and the device maximum of dynamic
+// LDS per block, i.e. a large staging window per wave. Here that means fewer blocks per peer than the block cap allows
+// (see ddaAllToAllFabricPeerGeom), fewer waves per block, and a larger tile (window) per wave; see the kernel comment.
 // RCCL_DDA_A2A_PUSH_PEER=1 (with RCCL_DDA_A2A_PUSH=1): peer-major vector push. Each block works on a single peer
 // and the grid is nRanks * blocksPerPeer. Out of place only.
 RCCL_PARAM(DdaA2APushPeer, "DDA_A2A_PUSH_PEER", 0);
@@ -129,14 +124,13 @@ static inline std::pair<dim3, dim3> ddaAllToAllFabricTdmGeom(ncclComm* comm, siz
 }
 
 static bool ddaAllToAllFabricTdmEligible(ncclComm* comm, const void* sendbuff, const void* recvbuff,
-                                         size_t bytesPerRank, bool peerKernel = false) {
+                                         size_t bytesPerRank) {
   if (!rcclParamDdaA2ATdm() || !TDM_TOOLCHAIN_AVAILABLE || comm->archName == nullptr ||
       !IsArchMatch(comm->archName, "gfx1250")) {
     return false;
   }
   const int tileKB = rcclParamDdaA2ATdmTileKB();
-  const bool bigTile = tileKB == 20 || tileKB == 40;
-  if (tileKB != 4 && tileKB != 8 && tileKB != 16 && !(bigTile && peerKernel)) return false;
+  if (tileKB != 4 && tileKB != 8 && tileKB != 16) return false;
   if ((bytesPerRank % dda::common::kDdaA2ATdmAlign) != 0) return false;
   auto aligned = [](const void* p) {
     return (reinterpret_cast<uintptr_t>(p) % dda::common::kDdaA2ATdmAlign) == 0;
@@ -144,7 +138,7 @@ static bool ddaAllToAllFabricTdmEligible(ncclComm* comm, const void* sendbuff, c
   return aligned(sendbuff) && aligned(recvbuff) && aligned(comm->ddaScratch);
 }
 
-// Opt this instantiation into the device's full dynamic LDS once; each launch then asks for only what it needs.
+// Opt this instantiation into the full dynamic LDS once; each launch then asks for only what it needs.
 // The static is per template instantiation, so each tile shape is set up independently.
 template <auto Kernel>
 static ncclResult_t ddaAllToAllFabricTdmPrepare() {
@@ -155,7 +149,8 @@ static ncclResult_t ddaAllToAllFabricTdmPrepare() {
   CUDACHECK(cudaGetDevice(&dev));
   CUDACHECK(cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
   if (dda::common::kDdaA2ATdmMaxSmemBytes > maxSmem) return ncclInvalidUsage;
-  CUDACHECK(cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, maxSmem));
+  CUDACHECK(cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 dda::common::kDdaA2ATdmMaxSmemBytes));
   done.store(true, std::memory_order_release);
   return ncclSuccess;
 }
@@ -193,35 +188,15 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
   // Out of place only, like the vector peer-major push. Falls through to the all-peer TDM push when there are more
   // peers than blocks.
   if (rcclParamDdaA2APush() && rcclParamDdaA2APushPeer() && sendbuff != recvbuff &&
-      ddaAllToAllFabricTdmEligible(comm, sendbuff, recvbuff, count, /*peerKernel=*/true)) {
+      ddaAllToAllFabricTdmEligible(comm, sendbuff, recvbuff, count)) {
     const int tileBytes = rcclParamDdaA2ATdmTileKB() << 10;
-    // The wave window is one tile for the 20 and 40 KiB tiles, and kDdaA2ATdmWindowBytes worth of tiles otherwise.
-    const size_t tilesPerWave = std::max<size_t>(1, dda::common::kDdaA2ATdmWindowBytes / tileBytes);
-    const size_t windowBytes = tilesPerWave * tileBytes;
-    int devMaxSmem = 0;
-    {
-      int dev = 0;
-      CUDACHECK(cudaGetDevice(&dev));
-      CUDACHECK(cudaDeviceGetAttribute(&devMaxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
-    }
-    const size_t maxWaves = std::max<size_t>(
-        1, std::min<size_t>(static_cast<size_t>(std::clamp<int64_t>(rcclParamDdaA2ATdmWarps(), 1,
-                                                                    dda::common::kDdaA2ATdmMaxWarpsPerBlock)),
-                            static_cast<size_t>(devMaxSmem) / windowBytes));
+    const size_t tilesPerWave = dda::common::kDdaA2ATdmWindowBytes / tileBytes;
     const size_t tiles = (count + tileBytes - 1) / tileBytes;
-    DdaA2APeerGeom pg = ddaAllToAllFabricPeerGeom(comm, (tiles + tilesPerWave - 1) / tilesPerWave, maxWaves,
-                                                  /*balanceRounds=*/true);
-    if (rcclParamDdaA2ATdmBpp() > 0 && pg.blocksPerPeer > 0) {
-      // Forced blocks per peer, at most the cap the barrier's flag buffer was sized for.
-      const size_t cap = static_cast<size_t>(comm->ddaFabricMaxBlocks) / static_cast<size_t>(nRanks);
-      const size_t bpp = std::min<size_t>(static_cast<size_t>(rcclParamDdaA2ATdmBpp()), cap);
-      pg.blocksPerPeer = static_cast<int>(bpp);
-      pg.grid = dim3(static_cast<unsigned>(bpp * nRanks));
-      pg.block = dim3(static_cast<unsigned>(maxWaves * dda::common::kDdaA2ATdmWave));
-    }
+    const DdaA2APeerGeom pg = ddaAllToAllFabricPeerGeom(comm, (tiles + tilesPerWave - 1) / tilesPerWave,
+                                                        dda::common::kDdaA2ATdmMaxWarpsPerBlock,
+                                                        /*balanceRounds=*/true);
     if (pg.blocksPerPeer > 0) {
-      const int smemBytes = static_cast<int>((pg.block.x / dda::common::kDdaA2ATdmWave) * windowBytes);
-
+      const int smemBytes = (pg.block.x / dda::common::kDdaA2ATdmWave) * dda::common::kDdaA2ATdmWindowBytes;
       const uint8_t* sendBytes = static_cast<const uint8_t*>(sendbuff);
       uint8_t* recvBytes = static_cast<uint8_t*>(recvbuff);
       uint8_t* const* scratch = reinterpret_cast<uint8_t* const*>(d_ipcbuffs);
@@ -232,12 +207,6 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
         break;
       case 16 << 10:
         prep = ddaAllToAllFabricTdmPrepare<dda::common::ddaAllToAllFabricTdmPushPeer<16 << 10, 1>>();
-        break;
-      case 20 << 10:
-        prep = ddaAllToAllFabricTdmPrepare<dda::common::ddaAllToAllFabricTdmPushPeer<20 << 10, 1>>();
-        break;
-      case 40 << 10:
-        prep = ddaAllToAllFabricTdmPrepare<dda::common::ddaAllToAllFabricTdmPushPeer<40 << 10, 1>>();
         break;
       default:
         prep = ddaAllToAllFabricTdmPrepare<dda::common::ddaAllToAllFabricTdmPushPeer<8 << 10, 2>>();
@@ -259,18 +228,6 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
           break;
         case 16 << 10:
           hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricTdmPushPeer<16 << 10, 1>), pg.grid, pg.block,
-                                smemBytes, stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0, scratch,
-                                recvBytes, sendBytes, count, comm->rank, nRanks, pg.blocksPerPeer, pieces, keep,
-                                barrierHost);
-          break;
-        case 20 << 10:
-          hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricTdmPushPeer<20 << 10, 1>), pg.grid, pg.block,
-                                smemBytes, stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0, scratch,
-                                recvBytes, sendBytes, count, comm->rank, nRanks, pg.blocksPerPeer, pieces, keep,
-                                barrierHost);
-          break;
-        case 40 << 10:
-          hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricTdmPushPeer<40 << 10, 1>), pg.grid, pg.block,
                                 smemBytes, stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0, scratch,
                                 recvBytes, sendBytes, count, comm->rank, nRanks, pg.blocksPerPeer, pieces, keep,
                                 barrierHost);

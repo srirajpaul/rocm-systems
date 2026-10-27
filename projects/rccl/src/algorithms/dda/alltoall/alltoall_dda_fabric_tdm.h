@@ -138,28 +138,26 @@ ddaAllToAllFabricTdmPush(uint8_t* const* __restrict__ peerScratch, uint8_t* __re
 // the last keep pieces themselves, so they keep pushing. Block j of group 0 and block k * blocksPerPeer + j of group k
 // cover the same tiles. keep == 0 moves every drain to group 0.
 //
-// The wave window is TileBytes * UnrollPeers, not necessarily kDdaA2ATdmWindowBytes: the host may pick a single larger
-// tile and fewer waves per block, as long as waves * window fits the device's dynamic LDS limit.
-//
 // Tuning notes (these are not the defaults; re-check them on each machine). TransferBench's TDM all-to-all, a useful
 // reference for the push rate the fabric can sustain, did best with about 32 thread blocks (sub-executors) per peer
 // transfer, 256 to 1024 threads per block, and the device maximum of dynamic LDS per block (TDM_LDS_BYTES=0, split evenly
 // over the waves, so every wave stages a large window). A small LDS budget per wave was much slower. The matching knobs
-// here are RCCL_DDA_A2A_TDM_BPP (blocks per peer), RCCL_DDA_A2A_TDM_WARPS (waves per block) and RCCL_DDA_A2A_TDM_TILE_KB
-// (window per wave); see the host code. About 32 blocks per peer, fewer waves per block and a larger window per wave
-// raised the alltoall rate on one machine.
+// here are the blocks per peer picked by the host (ddaAllToAllFabricPeerGeom, bounded by the block cap), the waves per
+// block, and the wave window (TileBytes * UnrollPeers, at most the device's LDS limit divided by the waves). About 32
+// blocks per peer, fewer waves per block and a larger window per wave raised the alltoall rate on one machine.
 template <int TileBytes, int UnrollPeers>
 __global__ void __launch_bounds__(kDdaA2ATdmMaxWarpsPerBlock* kDdaA2ATdmWave)
 ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* __restrict__ recvbuff,
                               const uint8_t* __restrict__ sendbuff, size_t bytesPerRank, int selfRank, int nRanks,
                               int blocksPerPeer, unsigned pieces, unsigned keep, FabricGpuBarrier barrier) {
+  static_assert(TileBytes * UnrollPeers == kDdaA2ATdmWindowBytes, "tiles must fill one wave window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
   extern __shared__ __attribute__((aligned(128))) uint8_t ddaA2ATdmSmem[];
   // TDM descriptors live in SGPRs, so the wave id that selects the LDS window must be wave-uniform.
   const int warp = __builtin_amdgcn_readfirstlane(static_cast<int>(threadIdx.x / warpSize));
   const size_t warps = blockDim.x / warpSize;
-  uint8_t* window = ddaA2ATdmSmem + static_cast<size_t>(warp) * (TileBytes * UnrollPeers);
+  uint8_t* window = ddaA2ATdmSmem + static_cast<size_t>(warp) * kDdaA2ATdmWindowBytes;
 
   const int k = static_cast<int>(blockIdx.x) / blocksPerPeer;
   const size_t slice = static_cast<size_t>(blockIdx.x) % blocksPerPeer;
