@@ -42,8 +42,9 @@ RCCL_PARAM(DdaA2APushPeerPipe, "DDA_A2A_PUSH_PEER_PIPE", 1);
 // RCCL_DDA_A2A_PUSH_PEER_PIECES > 0 forces the piece count of the peer-major pushes; 0 (default) = automatic.
 RCCL_PARAM(DdaA2APushPeerPieces, "DDA_A2A_PUSH_PEER_PIECES", 0);
 // RCCL_DDA_A2A_PUSH_PEER_KEEP: number of trailing pieces each push block of the peer-major vector kernel drains itself;
-// the earlier pieces are drained by the local-copy blocks (group 0). 0 (default) moves every drain to group 0.
-RCCL_PARAM(DdaA2APushPeerKeep, "DDA_A2A_PUSH_PEER_KEEP", 0);
+// the earlier pieces are drained by the local-copy blocks (group 0). 0 moves every drain to group 0. Default -1 = auto:
+// every drain stays in the push blocks when the chunk per peer is below 8 MiB (the move loses there), 0 otherwise.
+RCCL_PARAM(DdaA2APushPeerKeep, "DDA_A2A_PUSH_PEER_KEEP", -1);
 
 namespace {
 
@@ -284,15 +285,18 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
     const DdaA2APeerGeom pg = ddaAllToAllFabricPeerGeom(comm, vecWaves, 8);
     if (pg.blocksPerPeer > 0) {
       const unsigned pieces = ddaAllToAllFabricPeerPieces(count * sizeof(T), 16);
+      const int64_t keepParam = rcclParamDdaA2APushPeerKeep();
+      const unsigned keep = keepParam >= 0 ? static_cast<unsigned>(keepParam)
+                                           : (count * sizeof(T) < (8u << 20) ? pieces : 0u);
       INFO(NCCL_COLL,
            "DDA fabric AllToAll: launching peer-major push kernel: nRanks=%d count=%zu grid=%u block=%u "
-           "blocksPerPeer=%d pieces=%u",
-           nRanks, count, pg.grid.x, pg.block.x, pg.blocksPerPeer, pieces);
+           "blocksPerPeer=%d pieces=%u keep=%u",
+           nRanks, count, pg.grid.x, pg.block.x, pg.blocksPerPeer, pieces, keep);
       const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
       hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPushPeer<T>), pg.grid, pg.block, 0, stream,
                             /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<T*>(recvbuff),
                             count, static_cast<const T*>(sendbuff), comm->rank, nRanks, pg.blocksPerPeer, pieces,
-                            static_cast<unsigned>(std::max<int64_t>(0, rcclParamDdaA2APushPeerKeep())), barrierHost);
+                            keep, barrierHost);
       CUDACHECK(cudaGetLastError());
       return ncclSuccess;
     }
