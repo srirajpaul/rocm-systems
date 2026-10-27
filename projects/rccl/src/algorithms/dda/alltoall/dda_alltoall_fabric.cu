@@ -49,6 +49,9 @@ RCCL_PARAM(DdaA2APushPeerPieces, "DDA_A2A_PUSH_PEER_PIECES", 0);
 // the earlier pieces are drained by the local-copy blocks (group 0). 0 moves every drain to group 0. Default -1 = auto,
 // see ddaAllToAllFabricPeerKeep.
 RCCL_PARAM(DdaA2APushPeerKeep, "DDA_A2A_PUSH_PEER_KEEP", -1);
+// RCCL_DDA_A2A_PUSH_PEER_DRAIN > 0: that many dedicated drain blocks per source rank for the peer-major vector push,
+// taken from the block cap; the push blocks then only push and the local-copy blocks only copy. 0 (default) = off.
+RCCL_PARAM(DdaA2APushPeerDrain, "DDA_A2A_PUSH_PEER_DRAIN", 0);
 
 namespace {
 
@@ -92,10 +95,12 @@ struct DdaA2APeerGeom {
 // depends only on that, nRanks and the init-time cap, so every rank gets the same grid. Returns blocksPerPeer == 0
 // when there are more peers than blocks. balanceRounds (TDM): a wave does `rounds` rounds of work, so take the fewest
 // blocks that still need only as many rounds as the cap would, instead of a last round that few blocks share.
+// `reserved` blocks of the cap are left out of the groups, for blocks the caller appends to the grid.
 static inline DdaA2APeerGeom ddaAllToAllFabricPeerGeom(ncclComm* comm, size_t waves, size_t kMaxWaves,
-                                                       bool balanceRounds = false) {
+                                                       bool balanceRounds = false, size_t reserved = 0) {
   constexpr size_t kWave = 32;
-  const size_t cap = static_cast<size_t>(comm->ddaFabricMaxBlocks) / static_cast<size_t>(comm->nRanks);
+  const size_t maxBlocks = static_cast<size_t>(comm->ddaFabricMaxBlocks);
+  const size_t cap = (maxBlocks > reserved ? maxBlocks - reserved : 0) / static_cast<size_t>(comm->nRanks);
   if (cap == 0) return {dim3(1), dim3(1), 0};
   waves = std::max<size_t>(1, waves);
   size_t bpp = (waves + kMaxWaves - 1) / kMaxWaves;
@@ -298,19 +303,24 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
   // that other blocks of this rank may still be reading from sendbuff, so in-place calls take the all-peer push.
   if (rcclParamDdaA2APush() && rcclParamDdaA2APushPeer() && sendbuff != recvbuff) {
     const size_t vecWaves = (count * sizeof(T) / sizeof(uint4) + 31) / 32;
-    const DdaA2APeerGeom pg = ddaAllToAllFabricPeerGeom(comm, vecWaves, 8);
+    unsigned drain = static_cast<unsigned>(std::clamp<int64_t>(rcclParamDdaA2APushPeerDrain(), 0, 64));
+    const DdaA2APeerGeom pg = ddaAllToAllFabricPeerGeom(comm, vecWaves, 8, /*balanceRounds=*/false,
+                                                        static_cast<size_t>(drain) * (nRanks - 1));
     if (pg.blocksPerPeer > 0) {
       const unsigned pieces = ddaAllToAllFabricPeerPieces(count * sizeof(T), 16);
-      const unsigned keep = ddaAllToAllFabricPeerKeep(count * sizeof(T), pieces, size_t{8} << 20, SIZE_MAX);
+      drain = std::min(drain, static_cast<unsigned>(pg.blocksPerPeer));
+      const unsigned keep =
+        drain > 0 ? 0u : ddaAllToAllFabricPeerKeep(count * sizeof(T), pieces, size_t{8} << 20, SIZE_MAX);
+      const dim3 peerGrid(pg.grid.x + drain * static_cast<unsigned>(nRanks - 1));
       INFO(NCCL_COLL,
            "DDA fabric AllToAll: launching peer-major push kernel: nRanks=%d count=%zu grid=%u block=%u "
-           "blocksPerPeer=%d pieces=%u keep=%u",
-           nRanks, count, pg.grid.x, pg.block.x, pg.blocksPerPeer, pieces, keep);
+           "blocksPerPeer=%d pieces=%u keep=%u drain=%u",
+           nRanks, count, peerGrid.x, pg.block.x, pg.blocksPerPeer, pieces, keep, drain);
       const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
-      hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPushPeer<T>), pg.grid, pg.block, 0, stream,
+      hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPushPeer<T>), peerGrid, pg.block, 0, stream,
                             /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<T*>(recvbuff),
                             count, static_cast<const T*>(sendbuff), comm->rank, nRanks, pg.blocksPerPeer, pieces,
-                            keep, barrierHost);
+                            keep, drain, barrierHost);
       CUDACHECK(cudaGetLastError());
       return ncclSuccess;
     }
