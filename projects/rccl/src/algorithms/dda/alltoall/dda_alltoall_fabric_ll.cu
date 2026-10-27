@@ -152,6 +152,7 @@ ncclResult_t ncclAllToAllDdaFabricLL(const void* sendbuff, void* recvbuff, size_
   if (!rcclDdaDatatypeSupported(comm, datatype)) {
     return ncclInvalidArgument;
   }
+  ncclAllToAllDdaFabricDbufRestart(comm);
   // All-to-all moves raw bytes, so instantiate once for int8_t and scale the
   // per-peer count, like ncclAllToAllDdaFabric.
   const int typeSize = ncclTypeSize(datatype);
