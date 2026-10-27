@@ -24,8 +24,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <mutex>
-#include <unordered_map>
 #include <utility>
 
 // Push model: each rank writes its chunks into peers' scratch instead of reading from them.
@@ -54,53 +52,10 @@ RCCL_PARAM(DdaA2APushPeerKeep, "DDA_A2A_PUSH_PEER_KEEP", -1);
 // RCCL_DDA_A2A_PUSH_PEER_DRAIN > 0: that many dedicated drain blocks per source rank for the peer-major vector and TDM
 // pushes, taken from the block cap; the push blocks then only push and the local-copy blocks only copy. 0 = off.
 RCCL_PARAM(DdaA2APushPeerDrain, "DDA_A2A_PUSH_PEER_DRAIN", 0);
-// RCCL_DDA_A2A_PUSH_PEER_SPLIT=1 (experiment, vector kernel only): each push block drains its own source with half of its threads
-// while the other half pushes the next piece.
-RCCL_PARAM(DdaA2APushPeerSplit, "DDA_A2A_PUSH_PEER_SPLIT", 0);
-// RCCL_DDA_A2A_PUSH_PEER_DBUF=1 (investigation only, default 0): consecutive peer-major pushes that fit half the
-// scratch alternate between its halves, and only the first of a run does the entry handshake. The run is tracked on
-// the host and only DDA alltoalls restart it, so this is unsafe with other DDA collectives on the comm or under graph
-// capture.
-RCCL_PARAM(DdaA2APushPeerDbuf, "DDA_A2A_PUSH_PEER_DBUF", 0);
 
 namespace {
 
 using nccl_dda_detail::DdaFabricBarrierState;
-
-struct DdaA2ADbufRun {
-  uint64_t commHash;
-  uint64_t next;
-};
-std::mutex ddaA2ADbufMutex;
-std::unordered_map<const ncclComm*, DdaA2ADbufRun> ddaA2ADbufRuns;
-
-// Index of this call in the comm's run of consecutive double-buffered peer-major pushes, or 0 after restarting the run
-// when `dbuf` is false.
-static uint64_t ddaAllToAllFabricDbufNext(ncclComm* comm, bool dbuf) {
-  std::lock_guard<std::mutex> lock(ddaA2ADbufMutex);
-  DdaA2ADbufRun& run = ddaA2ADbufRuns[comm];
-  if (run.commHash != comm->commHash) run = {comm->commHash, 0};
-  if (!dbuf) {
-    run.next = 0;
-    return 0;
-  }
-  return run.next++;
-}
-
-struct DdaA2ADbufSlot {
-  size_t scratchOff;
-  bool entry;
-};
-
-// Scratch byte offset and entry handshake of a peer-major push of totalBytes: call i of a run uses half i % 2 and
-// skips the handshake unless i == 0. A rank is at most one call ahead of its peers, so the half it writes was last
-// drained two calls ago, before every peer reached the previous call.
-static DdaA2ADbufSlot ddaAllToAllFabricDbufSlot(ncclComm* comm, size_t totalBytes) {
-  const size_t halfBytes = (comm->ddaScratchBytes / 2) & ~static_cast<size_t>(4095);
-  const bool dbuf = rcclParamDdaA2APushPeerDbuf() && totalBytes <= halfBytes;
-  const uint64_t i = ddaAllToAllFabricDbufNext(comm, dbuf);
-  return {dbuf ? static_cast<size_t>(i & 1) * halfBytes : 0, i == 0};
-}
 
 // Single source of the launch geometry: grid/block for a byte payload. The
 // kernel is instantiated for int8_t, so `bytes` is the per-block element count.
@@ -270,31 +225,29 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
         const unsigned pieces = ddaAllToAllFabricPeerPieces(count, 32);
         const unsigned keep =
           drain > 0 ? 0u : ddaAllToAllFabricPeerKeep(count, pieces, size_t{64} << 20, size_t{256} << 20);
-        const DdaA2ADbufSlot buf = ddaAllToAllFabricDbufSlot(comm, totalBytes);
         INFO(NCCL_COLL,
              "DDA fabric AllToAll: launching peer-major TDM push kernel: nRanks=%d count=%zu tile=%d grid=%u "
-             "block=%u blocksPerPeer=%d smem=%d pieces=%u keep=%u drain=%u scratchOff=%zu entry=%d",
-             nRanks, count, tileBytes, peerGrid.x, pg.block.x, pg.blocksPerPeer, smemBytes, pieces, keep, drain,
-             buf.scratchOff, buf.entry);
+             "block=%u blocksPerPeer=%d smem=%d pieces=%u keep=%u drain=%u",
+             nRanks, count, tileBytes, peerGrid.x, pg.block.x, pg.blocksPerPeer, smemBytes, pieces, keep, drain);
         const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
         switch (tileBytes) {
         case 4 << 10:
           hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricTdmPushPeer<4 << 10, 4>), peerGrid, pg.block, smemBytes,
                                 stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0, scratch, recvBytes,
                                 sendBytes, count, comm->rank, nRanks, pg.blocksPerPeer, pieces, keep, drain,
-                                buf.scratchOff, buf.entry, barrierHost);
+                                barrierHost);
           break;
         case 16 << 10:
           hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricTdmPushPeer<16 << 10, 1>), peerGrid, pg.block,
                                 smemBytes, stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0, scratch,
                                 recvBytes, sendBytes, count, comm->rank, nRanks, pg.blocksPerPeer, pieces, keep,
-                                drain, buf.scratchOff, buf.entry, barrierHost);
+                                drain, barrierHost);
           break;
         default:
           hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricTdmPushPeer<8 << 10, 2>), peerGrid, pg.block, smemBytes,
                                 stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0, scratch, recvBytes,
                                 sendBytes, count, comm->rank, nRanks, pg.blocksPerPeer, pieces, keep, drain,
-                                buf.scratchOff, buf.entry, barrierHost);
+                                barrierHost);
           break;
         }
         CUDACHECK(cudaGetLastError());
@@ -327,7 +280,6 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
       break;
     }
     if (prep == ncclSuccess) {
-      (void)ddaAllToAllFabricDbufNext(comm, /*dbuf=*/false);
       INFO(NCCL_COLL,
            "DDA fabric AllToAll: launching TDM push kernel: nRanks=%d count=%zu tile=%d grid=%u block=%u smem=%d",
            nRanks, count, tileBytes, tdmGrid.x, tdmBlock.x, smemBytes);
@@ -367,18 +319,15 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
       const unsigned keep =
         drain > 0 ? 0u : ddaAllToAllFabricPeerKeep(count * sizeof(T), pieces, size_t{8} << 20, SIZE_MAX);
       const dim3 peerGrid(pg.grid.x + drain * static_cast<unsigned>(nRanks - 1));
-      const DdaA2ADbufSlot buf = ddaAllToAllFabricDbufSlot(comm, totalBytes);
-      const unsigned split = (rcclParamDdaA2APushPeerSplit() && drain == 0 && pg.block.x >= 64) ? 1u : 0u;
       INFO(NCCL_COLL,
            "DDA fabric AllToAll: launching peer-major push kernel: nRanks=%d count=%zu grid=%u block=%u "
-           "blocksPerPeer=%d pieces=%u keep=%u drain=%u scratchOff=%zu entry=%d split=%u",
-           nRanks, count, peerGrid.x, pg.block.x, pg.blocksPerPeer, pieces, keep, drain, buf.scratchOff, buf.entry,
-           split);
+           "blocksPerPeer=%d pieces=%u keep=%u drain=%u",
+           nRanks, count, peerGrid.x, pg.block.x, pg.blocksPerPeer, pieces, keep, drain);
       const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
       hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPushPeer<T>), peerGrid, pg.block, 0, stream,
                             /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs, static_cast<T*>(recvbuff),
                             count, static_cast<const T*>(sendbuff), comm->rank, nRanks, pg.blocksPerPeer, pieces,
-                            keep, drain, buf.scratchOff / sizeof(T), buf.entry, split, barrierHost);
+                            keep, drain, barrierHost);
       CUDACHECK(cudaGetLastError());
       return ncclSuccess;
     }
@@ -386,7 +335,6 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
          nRanks, static_cast<size_t>(comm->ddaFabricMaxBlocks));
   }
 
-  (void)ddaAllToAllFabricDbufNext(comm, /*dbuf=*/false);
   if (rcclParamDdaA2APush()) {
     INFO(NCCL_COLL, "DDA fabric AllToAll: launching push kernel: nRanks=%d count=%zu grid=%u block=%u%s", nRanks,
          count, grid.x, block.x, unroll);
@@ -491,10 +439,6 @@ bool ncclAllToAllDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* r
 uint32_t ncclAllToAllDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_t datatype) {
   const auto grid = ddaAllToAllFabricGeom(comm, count * ncclTypeSize(datatype)).first;
   return grid.x * grid.y;
-}
-
-void ncclAllToAllDdaFabricDbufRestart(ncclComm* comm) {
-  (void)ddaAllToAllFabricDbufNext(comm, /*dbuf=*/false);
 }
 
 ncclResult_t ncclAllToAllDdaFabric(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,

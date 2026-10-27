@@ -47,10 +47,6 @@ bool ncclAllToAllDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* r
 ncclResult_t ncclAllToAllDdaFabric(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                    ncclComm* comm, cudaStream_t stream);
 
-// Restarts the run of double-buffered peer-major pushes (RCCL_DDA_A2A_PUSH_PEER_DBUF); every other DDA alltoall path
-// that uses the scratch calls it, so the next peer-major push does the entry handshake.
-void ncclAllToAllDdaFabricDbufRestart(ncclComm* comm);
-
 // LL-protocol fabric path (small-chunk fast lane, 16B lines, no barrier).
 bool ncclAllToAllDdaFabricLLEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
                                      ncclDataType_t datatype);
