@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 
+#include "hip_compat.h"
 #include "algorithms/dda/device/device_buffer.h"
 #include "algorithms/dda/fabric/fabric_mem_handler.h"
 #include "algorithms/dda/ipc/ipc_gpu_barrier.h"
@@ -171,6 +172,7 @@ public:
     orderDestWrites();
     __syncthreads();
     if (threadIdx.x == 0) {
+      cuda::atomic_thread_fence(cuda::memory_order_release, cuda::thread_scope_system);
       __scoped_atomic_store_n(peerFlags_[to] + getEpochFlagIdx(selfRank_, blockIdx.x), value, __ATOMIC_RELAXED,
                               __MEMORY_SCOPE_SYSTEM);
     }
@@ -185,6 +187,7 @@ public:
     if (threadIdx.x == 0) {
       while (static_cast<int32_t>(__scoped_atomic_load_n(ready, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - want) < 0) {
       }
+      cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);
     }
     __syncthreads();
   }
