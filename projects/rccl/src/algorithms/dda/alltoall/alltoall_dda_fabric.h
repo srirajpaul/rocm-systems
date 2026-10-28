@@ -160,6 +160,9 @@ __device__ __forceinline__ void ddaA2APeerCopy(T* dst, const T* src, size_t begi
 // The share is cut into `pieces` runs of rows: step p pushes piece p, drains the source's piece p - 1, then posts p.
 // The push blocks (k != 0) drain only the last `keep` pieces; block group 0 (k == 0) drains the earlier ones once its own
 // chunk is done, so the push blocks keep pushing. keep == 0 moves every drain to group 0.
+// drain > 0: drain * (nRanks - 1) drain blocks follow the nRanks * blocksPerPeer push blocks, drain of them per source
+// offset r = 1 .. nRanks - 1; drain block d of offset r drains slices d, d + drain, ... of every piece of rank
+// (self - r) % nRanks. The host then passes keep == 0 and group 0 only copies, so push blocks only push and post.
 // Flags are epoch flags (see FabricGpuBarrier); scratch accesses are system-scope, so posts and waits need no fence.
 template <typename T>
 #if defined(USE_ROCM)
@@ -167,13 +170,48 @@ __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                             const T* __restrict__ sendbuff, int selfRank, int nRanks,
-                                            int blocksPerPeer, unsigned pieces, unsigned keep,
+                                            int blocksPerPeer, unsigned pieces, unsigned keep, unsigned drain,
                                             FabricGpuBarrier barrier) {
   constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
   const size_t nLines = count / countPerThread;
+  const size_t stride = static_cast<size_t>(blocksPerPeer) * blockDim.x;
+  const unsigned pushBlocks = static_cast<unsigned>(nRanks * blocksPerPeer);
+
+  // The host never passes pieces == 0, so the kernel does not guard it. Adding a check inside the kernel (for example
+  // `pieces ? pieces : 1` in the divisions below) lowers the kernel from 80 to 64 VGPRs; neither version spills and
+  // the speed is the same, so the simpler form is kept.
+  // Every thread has at most nRows rows; pieces are whole unroll groups of rows. All ranks derive the same piece
+  // count, since it depends only on count, blocksPerPeer and blockDim.
+  const size_t nRows = (nLines + stride - 1) / stride;
+  const size_t perPiece = ((nRows + pieces - 1) / pieces + kDdaA2APeerUnroll - 1) / kDdaA2APeerUnroll * kDdaA2APeerUnroll;
+  const size_t nPieces = (nRows + perPiece - 1) / perPiece;
+  // Line range [lo, hi) of piece p for the thread whose first line is `first`: rows [p * perPiece, (p + 1) * perPiece).
+  auto pieceOf = [&](size_t first, size_t p) -> std::pair<size_t, size_t> {
+    const size_t lo = first + p * perPiece * stride;
+    const size_t hi = first + (p + 1) * perPiece * stride;
+    return {lo, hi < nLines ? hi : nLines};
+  };
+
+  const uint32_t epoch = barrier.epochBegin();
+  if (blockIdx.x >= pushBlocks) {
+    const unsigned idx = blockIdx.x - pushBlocks;
+    const int r = 1 + static_cast<int>(idx / drain);
+    const int from = (selfRank - r + nRanks) % nRanks;
+    const size_t fromSlot = static_cast<size_t>(from) * count;
+    for (size_t p = 0; p < nPieces; ++p) {
+      for (unsigned j = idx % drain; j < static_cast<unsigned>(blocksPerPeer); j += drain) {
+        barrier.epochWaitPiece(barrier.epochFlagFrom(from, r * blocksPerPeer + static_cast<int>(j)), epoch,
+                               static_cast<unsigned>(p));
+        auto [lo, hi] = pieceOf(static_cast<size_t>(j) * blockDim.x + threadIdx.x, p);
+        ddaA2APeerCopy<true, false>(recvbuff + fromSlot, ipcbuffs[selfRank] + fromSlot, lo, hi, stride);
+      }
+    }
+    barrier.epochEnd(epoch, pieces);
+    return;
+  }
+
   const int k = blockIdx.x / blocksPerPeer;
   const size_t begin = (blockIdx.x % blocksPerPeer) * static_cast<size_t>(blockDim.x) + threadIdx.x;
-  const size_t stride = static_cast<size_t>(blocksPerPeer) * blockDim.x;
 
   const int peer = (selfRank + k) % nRanks;
   const int srcRank = (selfRank - k + nRanks) % nRanks;
@@ -183,26 +221,12 @@ __launch_bounds__(512)
   const size_t slot = static_cast<size_t>(srcRank) * count;
 
   // Entry handshake instead of a full barrier: only peer reads the slot this block writes, so wait for peer alone.
-  const uint32_t epoch = barrier.epochBegin();
   if (k != 0) barrier.epochSignalWait(srcRank, peer, epoch);
 
   {
-    // The host never passes pieces == 0, so the kernel does not guard it. Adding a check inside the kernel (for example
-    // `pieces ? pieces : 1` in the divisions below) lowers the kernel from 80 to 64 VGPRs; neither version spills and
-    // the speed is the same, so the simpler form is kept.
-    // Every thread has at most nRows rows; pieces are whole unroll groups of rows. All ranks derive the same piece
-    // count, since it depends only on count, blocksPerPeer and blockDim.
-    const size_t nRows = (nLines + stride - 1) / stride;
-    const size_t perPiece = ((nRows + pieces - 1) / pieces + kDdaA2APeerUnroll - 1) / kDdaA2APeerUnroll * kDdaA2APeerUnroll;
-    const size_t nPieces = (nRows + perPiece - 1) / perPiece;
     // The push blocks (k != 0) drain only the last `keep` pieces of their slot; block group 0 drains pieces 0 .. moved - 1.
     const size_t moved = nPieces > keep ? nPieces - keep : 0;
-    // This thread's line range [lo, hi) of piece p: rows [p * perPiece, (p + 1) * perPiece).
-    auto piece = [&](size_t p) -> std::pair<size_t, size_t> {
-      const size_t lo = begin + p * perPiece * stride;
-      const size_t hi = begin + (p + 1) * perPiece * stride;
-      return {lo, hi < nLines ? hi : nLines};
-    };
+    auto piece = [&](size_t p) { return pieceOf(begin, p); };
 
     const FabricGpuBarrier::FlagType* const ready = barrier.epochFlagFrom(srcRank);
     // Group 0 copies its own chunk directly sendbuff -> recvbuff (no scratch, no flags), with system-scope loads and stores
@@ -224,7 +248,7 @@ __launch_bounds__(512)
 
     // Block group 0 (the local-copy blocks) is done with its own chunk early: it now drains pieces 0 .. moved - 1 of
     // every other source's slot. Block j of group 0 and block k * blocksPerPeer + j of group k cover the same rows.
-    if (k == 0) {
+    if (k == 0 && drain == 0) {
       const int part = blockIdx.x;
       for (size_t p = 0; p < moved; ++p) {
         auto [lo, hi] = piece(p);
