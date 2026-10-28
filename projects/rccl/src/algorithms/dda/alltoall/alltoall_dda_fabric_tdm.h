@@ -152,7 +152,7 @@ template <int TileBytes, int UnrollPeers>
 __global__ void __launch_bounds__(kDdaA2ATdmMaxWarpsPerBlock* kDdaA2ATdmWave)
 ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* __restrict__ recvbuff,
                               const uint8_t* __restrict__ sendbuff, size_t bytesPerRank, int selfRank, int nRanks,
-                              int blocksPerPeer, unsigned pieces, unsigned keep, unsigned drain,
+                              int blocksPerPeer, unsigned pieces, unsigned keep, unsigned drain, unsigned split,
                               FabricGpuBarrier barrier) {
   static_assert(TileBytes * UnrollPeers == kDdaA2ATdmWindowBytes, "tiles must fill one wave window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
@@ -173,11 +173,11 @@ ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* 
   const size_t perPiece = (nRounds + pieces - 1) / pieces;
   const size_t nPieces = (nRounds + perPiece - 1) / perPiece;
 
-  // Copies the rounds [p * perPiece, (p + 1) * perPiece) of the wave whose first tile is `first` of a bytesPerRank
-  // chunk from src to dst through this wave's LDS window.
-  auto passFrom = [&](size_t first, const uint8_t* src, uint8_t* dst, size_t p) {
-    const size_t limit = first + (p + 1) * perPiece * stride;
-    for (size_t base = first + p * perPiece * stride; base < nTiles && base < limit; base += stride) {
+  // Copies rounds [r0, r1) of the wave whose first tile is `first`, `step` tiles apart, of a bytesPerRank chunk from
+  // src to dst through this wave's LDS window.
+  auto copyRounds = [&](size_t first, size_t step, size_t r0, size_t r1, const uint8_t* src, uint8_t* dst) {
+    const size_t limit = first + r1 * step;
+    for (size_t base = first + r0 * step; base < nTiles && base < limit; base += step) {
 #pragma unroll
       for (int u = 0; u < UnrollPeers; ++u) {
         const size_t t = base + u;
@@ -201,6 +201,10 @@ ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* 
       }
       tdm::tdmWait();
     }
+  };
+  // Copies the rounds [p * perPiece, (p + 1) * perPiece) of the wave whose first tile is `first`.
+  auto passFrom = [&](size_t first, const uint8_t* src, uint8_t* dst, size_t p) {
+    copyRounds(first, stride, p * perPiece, (p + 1) * perPiece, src, dst);
   };
 
   const uint32_t epoch = barrier.epochBegin();
@@ -236,6 +240,45 @@ ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* 
   const uint8_t* const src = sendbuff + static_cast<size_t>(peer) * bytesPerRank;
   const uint8_t* const slot = peerScratch[selfRank] + static_cast<size_t>(from) * bytesPerRank;
   uint8_t* const out = recvbuff + static_cast<size_t>(from) * bytesPerRank;
+  if (split) {
+    // Experiment (RCCL_DDA_A2A_PUSH_PEER_SPLIT), as in ddaAllToAllFabricPushPeer: the last `split` waves drain the slot
+    // of this block's source, piece p - 1 while the other waves push piece p. Drain wave d copies the rounds of push
+    // waves d, d + split, ... Group 0 only copies its own chunk. The host passes drain == 0 and fewer drain waves than
+    // the block has.
+    if (k == 0) {
+      for (size_t p = 0; p < nPieces; ++p) pass(src, out, p);
+      barrier.epochEnd(epoch, pieces);
+      return;
+    }
+    const size_t pushWaves = warps - split;
+    const size_t sStep = static_cast<size_t>(blocksPerPeer) * pushWaves * UnrollPeers;
+    const size_t sRounds = (nTiles + sStep - 1) / sStep;
+    const size_t sPerPiece = (sRounds + pieces - 1) / pieces;
+    const size_t sPieces = (sRounds + sPerPiece - 1) / sPerPiece;
+    auto sFirst = [&](size_t w) { return (slice * pushWaves + w) * UnrollPeers; };
+    const FabricGpuBarrier::FlagType* const sReady = barrier.epochFlagFrom(from);
+    for (size_t p = 0; p <= sPieces; ++p) {
+      if (static_cast<size_t>(warp) < pushWaves) {
+        if (p < sPieces) copyRounds(sFirst(warp), sStep, p * sPerPiece, (p + 1) * sPerPiece, src, dst);
+      } else if (p > 0) {
+        // Only the drain waves wait, so this cannot use epochWaitPiece (it syncs the whole block).
+        const FabricGpuBarrier::FlagType want = epoch + 2 + static_cast<unsigned>(p - 1);
+        auto arrived = [&] {
+          const auto seen = __scoped_atomic_load_n(sReady, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+          return static_cast<int32_t>(seen - want) >= 0;
+        };
+        while (!arrived()) {
+        }
+        cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);
+        for (size_t w = static_cast<size_t>(warp) - pushWaves; w < pushWaves; w += split) {
+          copyRounds(sFirst(w), sStep, (p - 1) * sPerPiece, p * sPerPiece, slot, out);
+        }
+      }
+      if (p < sPieces) barrier.epochPostPiece(peer, epoch, static_cast<unsigned>(p));
+    }
+    barrier.epochEnd(epoch, pieces);
+    return;
+  }
   // Pieces 0 .. moved - 1 of the slots are drained by group 0, the last `keep` by the push blocks.
   const size_t moved = nPieces > keep ? nPieces - keep : 0;
   if (k == 0) {
@@ -279,6 +322,7 @@ ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* 
   (void)pieces;
   (void)keep;
   (void)drain;
+  (void)split;
   (void)barrier;
   __builtin_trap();
 #endif

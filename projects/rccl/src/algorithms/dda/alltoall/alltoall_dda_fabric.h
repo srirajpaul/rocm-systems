@@ -171,11 +171,12 @@ __launch_bounds__(512)
   __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                             const T* __restrict__ sendbuff, int selfRank, int nRanks,
                                             int blocksPerPeer, unsigned pieces, unsigned keep, unsigned drain,
-                                            FabricGpuBarrier barrier) {
+                                            unsigned split, FabricGpuBarrier barrier) {
   constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
   const size_t nLines = count / countPerThread;
   const size_t stride = static_cast<size_t>(blocksPerPeer) * blockDim.x;
   const unsigned pushBlocks = static_cast<unsigned>(nRanks * blocksPerPeer);
+  const T* const selfScratch = ipcbuffs[selfRank];
 
   // The host never passes pieces == 0, so the kernel does not guard it.
   // Every thread has at most nRows rows; pieces are whole unroll groups of rows. All ranks derive the same piece
@@ -201,7 +202,7 @@ __launch_bounds__(512)
         barrier.epochWaitPiece(barrier.epochFlagFrom(from, r * blocksPerPeer + static_cast<int>(j)), epoch,
                                static_cast<unsigned>(p));
         auto [lo, hi] = pieceOf(static_cast<size_t>(j) * blockDim.x + threadIdx.x, p);
-        ddaA2APeerCopy<true, false>(recvbuff + fromSlot, ipcbuffs[selfRank] + fromSlot, lo, hi, stride);
+        ddaA2APeerCopy<true, false>(recvbuff + fromSlot, selfScratch + fromSlot, lo, hi, stride);
       }
     }
     barrier.epochEnd(epoch, pieces);
@@ -220,6 +221,59 @@ __launch_bounds__(512)
 
   // Entry handshake instead of a full barrier: only peer reads the slot this block writes, so wait for peer alone.
   if (k != 0) barrier.epochSignalWait(srcRank, peer, epoch);
+  if (split) {
+    // Experiment (RCCL_DDA_A2A_PUSH_PEER_SPLIT): every push block drains the slot of its own source, its last `split`
+    // waves draining piece p - 1 while the other waves push piece p. Drain thread r copies push lanes r, r + drain
+    // threads, ..., with the push lanes' rows, so each copy keeps the push stride. Group 0 only copies its own chunk.
+    // The host passes drain == 0 and fewer drain waves than the block has.
+    if (k == 0) {
+      ddaA2APeerCopy<true, true>(recvbuff + slot, src, begin, nLines, stride);
+      barrier.epochEnd(epoch, pieces);
+      return;
+    }
+    const size_t drainThreads = static_cast<size_t>(split) * warpSize;
+    const size_t pushThreads = blockDim.x - drainThreads;
+    const bool isPush = threadIdx.x < pushThreads;
+    const size_t sFirst = (blockIdx.x % blocksPerPeer) * pushThreads;
+    const size_t sStride = static_cast<size_t>(blocksPerPeer) * pushThreads;
+    const size_t sRows = (nLines + sStride - 1) / sStride;
+    const size_t sPerPiece =
+      ((sRows + pieces - 1) / pieces + kDdaA2APeerUnroll - 1) / kDdaA2APeerUnroll * kDdaA2APeerUnroll;
+    const size_t sPieces = (sRows + sPerPiece - 1) / sPerPiece;
+    // Line range [lo, hi) of piece p for push lane `lane`.
+    auto sPiece = [&](size_t lane, size_t p) -> std::pair<size_t, size_t> {
+      const size_t lo = sFirst + lane + p * sPerPiece * sStride;
+      const size_t hi = sFirst + lane + (p + 1) * sPerPiece * sStride;
+      return {lo, hi < nLines ? hi : nLines};
+    };
+    const FabricGpuBarrier::FlagType* const sReady = barrier.epochFlagFrom(srcRank);
+    for (size_t p = 0; p <= sPieces; ++p) {
+      if (isPush) {
+        if (p < sPieces) {
+          auto [lo, hi] = sPiece(threadIdx.x, p);
+          ddaA2APeerCopy<false, true>(dst, src, lo, hi, sStride);
+        }
+      } else if (p > 0) {
+        // Only the drain waves wait, so this cannot use epochWaitPiece (it syncs the whole block): every drain wave
+        // polls the flag itself.
+        const FabricGpuBarrier::FlagType want = epoch + 2 + static_cast<unsigned>(p - 1);
+        auto arrived = [&] {
+          const auto seen = __scoped_atomic_load_n(sReady, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+          return static_cast<int32_t>(seen - want) >= 0;
+        };
+        while (!arrived()) {
+        }
+        cuda::atomic_thread_fence(cuda::memory_order_acquire, cuda::thread_scope_system);
+        for (size_t lane = threadIdx.x - pushThreads; lane < pushThreads; lane += drainThreads) {
+          auto [lo, hi] = sPiece(lane, p - 1);
+          ddaA2APeerCopy<true, false>(recvbuff + slot, selfScratch + slot, lo, hi, sStride);
+        }
+      }
+      if (p < sPieces) barrier.epochPostPiece(peer, epoch, static_cast<unsigned>(p));
+    }
+    barrier.epochEnd(epoch, pieces);
+    return;
+  }
 
   {
     // The push blocks (k != 0) drain only the last `keep` pieces of their slot; block group 0 drains pieces 0 .. moved - 1.
@@ -239,7 +293,7 @@ __launch_bounds__(512)
       if (p > moved) {
         barrier.epochWaitPiece(ready, epoch, static_cast<unsigned>(p - 1));
         auto [lo, hi] = piece(p - 1);
-        ddaA2APeerCopy<true, false>(recvbuff + slot, ipcbuffs[selfRank] + slot, lo, hi, stride);
+        ddaA2APeerCopy<true, false>(recvbuff + slot, selfScratch + slot, lo, hi, stride);
       }
       if (p < nPieces) barrier.epochPostPiece(peer, epoch, static_cast<unsigned>(p));
     }
@@ -254,7 +308,7 @@ __launch_bounds__(512)
           const int from = (selfRank - r + nRanks) % nRanks;
           barrier.epochWaitPiece(barrier.epochFlagFrom(from, r * blocksPerPeer + part), epoch, static_cast<unsigned>(p));
           const size_t fromSlot = static_cast<size_t>(from) * count;
-          ddaA2APeerCopy<true, false>(recvbuff + fromSlot, ipcbuffs[selfRank] + fromSlot, lo, hi, stride);
+          ddaA2APeerCopy<true, false>(recvbuff + fromSlot, selfScratch + fromSlot, lo, hi, stride);
         }
       }
     }
