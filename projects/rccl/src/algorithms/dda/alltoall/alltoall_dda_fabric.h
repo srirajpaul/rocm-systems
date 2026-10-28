@@ -163,6 +163,9 @@ __device__ __forceinline__ void ddaA2APeerCopy(T* dst, const T* src, size_t begi
 // drain > 0: drain * (nRanks - 1) drain blocks follow the nRanks * blocksPerPeer push blocks, drain of them per source
 // offset r = 1 .. nRanks - 1; drain block d of offset r drains slices d, d + drain, ... of every piece of rank
 // (self - r) % nRanks. The host then passes keep == 0 and group 0 only copies, so push blocks only push and post.
+// copyBlocks >= 0: there is no group 0, the push grid starts at k = 1 and copyBlocks copy blocks follow the drain
+// blocks to copy this rank's own chunk; with copyBlocks == 0 the push blocks copy it after their last piece. The host
+// then passes split == 0, and keep >= pieces when drain == 0.
 // Flags are epoch flags (see FabricGpuBarrier); scratch accesses are system-scope, so posts and waits need no fence.
 template <typename T>
 #if defined(USE_ROCM)
@@ -171,11 +174,12 @@ __launch_bounds__(512)
   __global__ void ddaAllToAllFabricPushPeer(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                             const T* __restrict__ sendbuff, int selfRank, int nRanks,
                                             int blocksPerPeer, unsigned pieces, unsigned keep, unsigned drain,
-                                            unsigned split, FabricGpuBarrier barrier) {
+                                            unsigned split, int copyBlocks, FabricGpuBarrier barrier) {
   constexpr size_t countPerThread = sizeof(uint4) / sizeof(T);
   const size_t nLines = count / countPerThread;
   const size_t stride = static_cast<size_t>(blocksPerPeer) * blockDim.x;
-  const unsigned pushBlocks = static_cast<unsigned>(nRanks * blocksPerPeer);
+  const int kBase = copyBlocks >= 0 ? 1 : 0;
+  const unsigned pushBlocks = static_cast<unsigned>((nRanks - kBase) * blocksPerPeer);
   const T* const selfScratch = ipcbuffs[selfRank];
 
   // The host never passes pieces == 0, so the kernel does not guard it.
@@ -192,6 +196,15 @@ __launch_bounds__(512)
   };
 
   const uint32_t epoch = barrier.epochBegin();
+  const unsigned drainBlocks = drain * static_cast<unsigned>(nRanks - 1);
+  const size_t selfSlot = static_cast<size_t>(selfRank) * count;
+  if (copyBlocks > 0 && blockIdx.x >= pushBlocks + drainBlocks) {
+    const size_t c = blockIdx.x - pushBlocks - drainBlocks;
+    ddaA2APeerCopy<true, true>(recvbuff + selfSlot, sendbuff + selfSlot, c * blockDim.x + threadIdx.x, nLines,
+                               static_cast<size_t>(copyBlocks) * blockDim.x);
+    barrier.epochEnd(epoch, pieces);
+    return;
+  }
   if (blockIdx.x >= pushBlocks) {
     const unsigned idx = blockIdx.x - pushBlocks;
     const int r = 1 + static_cast<int>(idx / drain);
@@ -199,7 +212,7 @@ __launch_bounds__(512)
     const size_t fromSlot = static_cast<size_t>(from) * count;
     for (size_t p = 0; p < nPieces; ++p) {
       for (unsigned j = idx % drain; j < static_cast<unsigned>(blocksPerPeer); j += drain) {
-        barrier.epochWaitPiece(barrier.epochFlagFrom(from, r * blocksPerPeer + static_cast<int>(j)), epoch,
+        barrier.epochWaitPiece(barrier.epochFlagFrom(from, (r - kBase) * blocksPerPeer + static_cast<int>(j)), epoch,
                                static_cast<unsigned>(p));
         auto [lo, hi] = pieceOf(static_cast<size_t>(j) * blockDim.x + threadIdx.x, p);
         ddaA2APeerCopy<true, false>(recvbuff + fromSlot, selfScratch + fromSlot, lo, hi, stride);
@@ -209,7 +222,7 @@ __launch_bounds__(512)
     return;
   }
 
-  const int k = blockIdx.x / blocksPerPeer;
+  const int k = blockIdx.x / blocksPerPeer + kBase;
   const size_t begin = (blockIdx.x % blocksPerPeer) * static_cast<size_t>(blockDim.x) + threadIdx.x;
 
   const int peer = (selfRank + k) % nRanks;
@@ -296,6 +309,12 @@ __launch_bounds__(512)
         ddaA2APeerCopy<true, false>(recvbuff + slot, selfScratch + slot, lo, hi, stride);
       }
       if (p < nPieces) barrier.epochPostPiece(peer, epoch, static_cast<unsigned>(p));
+    }
+    if (copyBlocks == 0) {
+      // This rank's own chunk, spread over every push block after its last piece.
+      ddaA2APeerCopy<true, true>(recvbuff + selfSlot, sendbuff + selfSlot,
+                                 static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x, nLines,
+                                 static_cast<size_t>(pushBlocks) * blockDim.x);
     }
 
     // Block group 0 (the local-copy blocks) is done with its own chunk early: it now drains pieces 0 .. moved - 1 of

@@ -140,6 +140,8 @@ ddaAllToAllFabricTdmPush(uint8_t* const* __restrict__ peerScratch, uint8_t* __re
 // drain > 0: drain * (nRanks - 1) drain blocks follow the push blocks, as in ddaAllToAllFabricPushPeer; drain block d
 // of source offset r drains slices d, d + drain, ... of every piece of rank (self - r) % nRanks. The host then passes
 // keep == 0 and group 0 only copies, so the push blocks only push and post.
+// copyBlocks >= 0: no group 0; copyBlocks copy blocks (or, with 0, the push blocks after their last piece) copy this
+// rank's own chunk, as in ddaAllToAllFabricPushPeer.
 //
 // Tuning notes (these are not the defaults; re-check them on each machine). TransferBench's TDM all-to-all, a useful
 // reference for the push rate the fabric can sustain, did best with about 32 thread blocks (sub-executors) per peer
@@ -153,7 +155,7 @@ __global__ void __launch_bounds__(kDdaA2ATdmMaxWarpsPerBlock* kDdaA2ATdmWave)
 ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* __restrict__ recvbuff,
                               const uint8_t* __restrict__ sendbuff, size_t bytesPerRank, int selfRank, int nRanks,
                               int blocksPerPeer, unsigned pieces, unsigned keep, unsigned drain, unsigned split,
-                              FabricGpuBarrier barrier) {
+                              int copyBlocks, FabricGpuBarrier barrier) {
   static_assert(TileBytes * UnrollPeers == kDdaA2ATdmWindowBytes, "tiles must fill one wave window");
   static_assert(TileBytes % kDdaA2ATdmAlign == 0, "tiles must be whole 256 B rows");
 #if TDM_SUPPORTED
@@ -165,7 +167,8 @@ ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* 
 
   const size_t nTiles = (bytesPerRank + TileBytes - 1) / TileBytes;
   const size_t stride = static_cast<size_t>(blocksPerPeer) * warps * UnrollPeers;
-  const unsigned pushBlocks = static_cast<unsigned>(nRanks * blocksPerPeer);
+  const int kBase = copyBlocks >= 0 ? 1 : 0;
+  const unsigned pushBlocks = static_cast<unsigned>((nRanks - kBase) * blocksPerPeer);
 
   // Rounds a wave goes through and the pieces they are cut into. Every wave of every rank derives the same piece
   // count, since it depends only on bytesPerRank, blocksPerPeer and blockDim.
@@ -208,6 +211,16 @@ ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* 
   };
 
   const uint32_t epoch = barrier.epochBegin();
+  const unsigned drainBlocks = drain * static_cast<unsigned>(nRanks - 1);
+  const size_t selfOff = static_cast<size_t>(selfRank) * bytesPerRank;
+  if (copyBlocks > 0 && blockIdx.x >= pushBlocks + drainBlocks) {
+    const size_t c = blockIdx.x - pushBlocks - drainBlocks;
+    const size_t ownStep = static_cast<size_t>(copyBlocks) * warps * UnrollPeers;
+    copyRounds((c * warps + warp) * UnrollPeers, ownStep, 0, (nTiles + ownStep - 1) / ownStep, sendbuff + selfOff,
+               recvbuff + selfOff);
+    barrier.epochEnd(epoch, pieces);
+    return;
+  }
   if (blockIdx.x >= pushBlocks) {
     const unsigned idx = blockIdx.x - pushBlocks;
     const int r = 1 + static_cast<int>(idx / drain);
@@ -215,8 +228,8 @@ ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* 
     const size_t fromOff = static_cast<size_t>(fromRank) * bytesPerRank;
     for (size_t p = 0; p < nPieces; ++p) {
       for (unsigned j = idx % drain; j < static_cast<unsigned>(blocksPerPeer); j += drain) {
-        barrier.epochWaitPiece(barrier.epochFlagFrom(fromRank, r * blocksPerPeer + static_cast<int>(j)), epoch,
-                               static_cast<unsigned>(p));
+        const int fromBlock = (r - kBase) * blocksPerPeer + static_cast<int>(j);
+        barrier.epochWaitPiece(barrier.epochFlagFrom(fromRank, fromBlock), epoch, static_cast<unsigned>(p));
         passFrom((static_cast<size_t>(j) * warps + warp) * UnrollPeers, peerScratch[selfRank] + fromOff,
                  recvbuff + fromOff, p);
       }
@@ -225,7 +238,7 @@ ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* 
     return;
   }
 
-  const int k = static_cast<int>(blockIdx.x) / blocksPerPeer;
+  const int k = static_cast<int>(blockIdx.x) / blocksPerPeer + kBase;
   const size_t slice = static_cast<size_t>(blockIdx.x) % blocksPerPeer;
   const size_t first = (slice * warps + warp) * UnrollPeers;
   auto pass = [&](const uint8_t* s, uint8_t* d, size_t p) { passFrom(first, s, d, p); };
@@ -308,6 +321,12 @@ ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* 
       }
       if (p < nPieces) barrier.epochPostPiece(peer, epoch, static_cast<unsigned>(p));
     }
+    if (copyBlocks == 0) {
+      // This rank's own chunk, spread over every push block's waves after its last piece.
+      const size_t ownStep = static_cast<size_t>(pushBlocks) * warps * UnrollPeers;
+      copyRounds((static_cast<size_t>(blockIdx.x) * warps + warp) * UnrollPeers, ownStep, 0,
+                 (nTiles + ownStep - 1) / ownStep, sendbuff + selfOff, recvbuff + selfOff);
+    }
   }
   barrier.epochEnd(epoch, pieces);
 #else
@@ -323,6 +342,7 @@ ddaAllToAllFabricTdmPushPeer(uint8_t* const* __restrict__ peerScratch, uint8_t* 
   (void)keep;
   (void)drain;
   (void)split;
+  (void)copyBlocks;
   (void)barrier;
   __builtin_trap();
 #endif
