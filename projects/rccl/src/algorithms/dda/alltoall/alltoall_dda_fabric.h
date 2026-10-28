@@ -177,9 +177,7 @@ __launch_bounds__(512)
   const size_t stride = static_cast<size_t>(blocksPerPeer) * blockDim.x;
   const unsigned pushBlocks = static_cast<unsigned>(nRanks * blocksPerPeer);
 
-  // The host never passes pieces == 0, so the kernel does not guard it. Adding a check inside the kernel (for example
-  // `pieces ? pieces : 1` in the divisions below) lowers the kernel from 80 to 64 VGPRs; neither version spills and
-  // the speed is the same, so the simpler form is kept.
+  // The host never passes pieces == 0, so the kernel does not guard it.
   // Every thread has at most nRows rows; pieces are whole unroll groups of rows. All ranks derive the same piece
   // count, since it depends only on count, blocksPerPeer and blockDim.
   const size_t nRows = (nLines + stride - 1) / stride;

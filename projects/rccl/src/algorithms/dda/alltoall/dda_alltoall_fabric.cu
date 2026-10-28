@@ -45,13 +45,14 @@ RCCL_PARAM(DdaA2APushPeer, "DDA_A2A_PUSH_PEER", 0);
 RCCL_PARAM(DdaA2APushPeerPipe, "DDA_A2A_PUSH_PEER_PIPE", 1);
 // RCCL_DDA_A2A_PUSH_PEER_PIECES > 0 forces the piece count of the peer-major pushes; 0 (default) = automatic.
 RCCL_PARAM(DdaA2APushPeerPieces, "DDA_A2A_PUSH_PEER_PIECES", 0);
-// RCCL_DDA_A2A_PUSH_PEER_KEEP: number of trailing pieces each push block of the peer-major vector kernel drains itself;
-// the earlier pieces are drained by the local-copy blocks (group 0). 0 moves every drain to group 0. Default -1 = auto,
-// see ddaAllToAllFabricPeerKeep.
-RCCL_PARAM(DdaA2APushPeerKeep, "DDA_A2A_PUSH_PEER_KEEP", -1);
-// RCCL_DDA_A2A_PUSH_PEER_DRAIN > 0: that many dedicated drain blocks per source rank for the peer-major vector and TDM
-// pushes, taken from the block cap; the push blocks then only push and the local-copy blocks only copy. 0 = off.
-RCCL_PARAM(DdaA2APushPeerDrain, "DDA_A2A_PUSH_PEER_DRAIN", 0);
+// RCCL_DDA_A2A_PUSH_PEER_KEEP: number of trailing pieces each push block of the peer-major kernels drains itself;
+// the earlier pieces are drained by the local-copy blocks (group 0). Default 99 keeps every drain in the push
+// blocks, 0 moves every drain to group 0, -1 = auto (see ddaAllToAllFabricPeerKeep).
+RCCL_PARAM(DdaA2APushPeerKeep, "DDA_A2A_PUSH_PEER_KEEP", 99);
+// RCCL_DDA_A2A_PUSH_PEER_DRAIN >= 0: that many dedicated drain blocks per source rank for the peer-major vector and
+// TDM pushes, taken from the block cap; the push blocks then only push and the local-copy blocks only copy (0 = off).
+// Default -1: 6 for the TDM push, 0 for the vector push.
+RCCL_PARAM(DdaA2APushPeerDrain, "DDA_A2A_PUSH_PEER_DRAIN", -1);
 
 namespace {
 
@@ -81,6 +82,12 @@ static inline unsigned ddaAllToAllFabricPeerKeep(size_t chunkBytes, unsigned pie
   const int64_t keep = rcclParamDdaA2APushPeerKeep();
   if (keep >= 0) return static_cast<unsigned>(std::min<int64_t>(keep, 64));
   return chunkBytes >= autoMinBytes && chunkBytes < autoMaxBytes ? 0u : pieces;
+}
+
+// Drain blocks per source rank of a peer-major push: RCCL_DDA_A2A_PUSH_PEER_DRAIN, or autoDrain when it is negative.
+static inline unsigned ddaAllToAllFabricPeerDrain(int64_t autoDrain) {
+  const int64_t drain = rcclParamDdaA2APushPeerDrain();
+  return static_cast<unsigned>(std::clamp<int64_t>(drain < 0 ? autoDrain : drain, 0, 64));
 }
 
 struct DdaA2APeerGeom {
@@ -197,7 +204,7 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
     const int tileBytes = rcclParamDdaA2ATdmTileKB() << 10;
     const size_t tilesPerWave = dda::common::kDdaA2ATdmWindowBytes / tileBytes;
     const size_t tiles = (count + tileBytes - 1) / tileBytes;
-    unsigned drain = static_cast<unsigned>(std::clamp<int64_t>(rcclParamDdaA2APushPeerDrain(), 0, 64));
+    unsigned drain = ddaAllToAllFabricPeerDrain(6);
     const DdaA2APeerGeom pg = ddaAllToAllFabricPeerGeom(comm, (tiles + tilesPerWave - 1) / tilesPerWave,
                                                         dda::common::kDdaA2ATdmMaxWarpsPerBlock,
                                                         /*balanceRounds=*/true,
@@ -310,7 +317,7 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
   // that other blocks of this rank may still be reading from sendbuff, so in-place calls take the all-peer push.
   if (rcclParamDdaA2APush() && rcclParamDdaA2APushPeer() && sendbuff != recvbuff) {
     const size_t vecWaves = (count * sizeof(T) / sizeof(uint4) + 31) / 32;
-    unsigned drain = static_cast<unsigned>(std::clamp<int64_t>(rcclParamDdaA2APushPeerDrain(), 0, 64));
+    unsigned drain = ddaAllToAllFabricPeerDrain(0);
     const DdaA2APeerGeom pg = ddaAllToAllFabricPeerGeom(comm, vecWaves, 8, /*balanceRounds=*/false,
                                                         static_cast<size_t>(drain) * (nRanks - 1));
     if (pg.blocksPerPeer > 0) {
