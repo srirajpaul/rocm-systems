@@ -60,13 +60,16 @@ __launch_bounds__(512)
 // Push alltoall: each rank writes its send chunk for peer r into peer r's scratch at this rank's slot,
 // then drains its own scratch into recvbuff. The per-block barrier pairs those writes with the drain, so
 // every rank must launch the same grid. Scratch for peer r, slot s, holds the chunk rank s sends to r.
+// The chunk sent from rank s to rank d is walked from offset ((s + d) % nRanks) * skewElems (modulo count), in both
+// the push and the drain, so the per-peer streams do not hit the same addresses at the same time. A block's drain
+// touches exactly the offsets its own push read, which keeps in-place calls safe.
 template <typename T, int NRANKS_CT>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
   __global__ void ddaAllToAllFabricPush(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                         const T* __restrict__ sendbuff, int selfRank, int nRanks,
-                                        FabricGpuBarrier barrier) {
+                                        FabricGpuBarrier barrier, size_t skewElems) {
   // The previous collective's readers must be done with every scratch slot this block is about to overwrite.
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>();
 
@@ -83,22 +86,30 @@ __launch_bounds__(512)
   // sendbuff[r] is the chunk destined for rank r. Load a whole peer group into registers before issuing its
   // remote stores, so those loads can be in flight together. Block i on every rank owns the same idx set.
   const size_t destIdx = selfRank * idxEnd;
+  auto skewed = [&](size_t idx, int src, int dst) {
+    const size_t s = (static_cast<size_t>((src + dst) % nRanksEff) * skewElems) % idxEnd;
+    const size_t o = idx + s;
+    return o >= idxEnd ? o - idxEnd : o;
+  };
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
     int r0 = 0;
     for (; r0 + kUnroll <= nRanksEff; r0 += kUnroll) {
       uint4 v[kUnroll];
+      size_t o[kUnroll];
 #pragma unroll
       for (int u = 0; u < kUnroll; ++u) {
-        v[u] = reinterpret_cast<const uint4*>(&sendbuff[idx + (r0 + u) * idxEnd])[0];
+        o[u] = skewed(idx, selfRank, r0 + u);
+        v[u] = reinterpret_cast<const uint4*>(&sendbuff[o[u] + (r0 + u) * idxEnd])[0];
       }
 #pragma unroll
       for (int u = 0; u < kUnroll; ++u) {
-        *reinterpret_cast<uint4*>(&ipcbuffs[r0 + u][destIdx + idx]) = v[u];
+        *reinterpret_cast<uint4*>(&ipcbuffs[r0 + u][destIdx + o[u]]) = v[u];
       }
     }
     for (int r = r0; r < nRanksEff; ++r) {
-      *reinterpret_cast<uint4*>(&ipcbuffs[r][destIdx + idx]) =
-        reinterpret_cast<const uint4*>(&sendbuff[idx + r * idxEnd])[0];
+      const size_t o = skewed(idx, selfRank, r);
+      *reinterpret_cast<uint4*>(&ipcbuffs[r][destIdx + o]) =
+        reinterpret_cast<const uint4*>(&sendbuff[o + r * idxEnd])[0];
     }
   }
 
@@ -109,7 +120,7 @@ __launch_bounds__(512)
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
 #pragma unroll kUnroll
     for (int r = 0; r < nRanksEff; ++r) {
-      size_t slotIdx = idx + r * idxEnd;
+      size_t slotIdx = skewed(idx, r, selfRank) + r * idxEnd;
       *reinterpret_cast<uint4*>(&recvbuff[slotIdx]) = reinterpret_cast<const uint4*>(&selfScratch[slotIdx])[0];
     }
   }

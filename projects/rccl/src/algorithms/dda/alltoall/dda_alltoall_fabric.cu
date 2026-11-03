@@ -42,6 +42,10 @@ RCCL_PARAM(DdaA2APushPeerPieces, "DDA_A2A_PUSH_PEER_PIECES", 0);
 // 0 disables dedicated drains. -1 (default): TDM reserves about half the block budget for drains; vector uses 0.
 // Dedicated drains copy received data from local scratch to recvbuff. All ranks must use the same value.
 RCCL_PARAM(DdaA2APushPeerDrain, "DDA_A2A_PUSH_PEER_DRAIN", -1);
+// RCCL_DDA_A2A_PUSH_SKEW_KB: the all-peer vector push walks the chunk from rank s to rank d starting at
+// ((s + d) % nRanks) * skew KiB (modulo the chunk), so the per-peer streams do not alias. 4096 (default); 0 = off.
+// Rounded down to 16 B. All ranks must use the same value.
+RCCL_PARAM(DdaA2APushSkewKb, "DDA_A2A_PUSH_SKEW_KB", 4096);
 
 namespace {
 
@@ -278,8 +282,10 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
   }
 
   if (rcclParamDdaA2APush()) {
-    INFO(NCCL_COLL, "DDA fabric AllToAll: launching push kernel: nRanks=%d count=%zu grid=%u block=%u%s", nRanks,
-         count, grid.x, block.x, unroll);
+    const size_t skewElems = static_cast<size_t>(std::max<int64_t>(rcclParamDdaA2APushSkewKb(), 0)) * 1024 /
+                             sizeof(uint4) * (sizeof(uint4) / sizeof(T));
+    INFO(NCCL_COLL, "DDA fabric AllToAll: launching push kernel: nRanks=%d count=%zu grid=%u block=%u skew=%zu%s",
+         nRanks, count, grid.x, block.x, skewElems * sizeof(T), unroll);
 
     const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
     const T* sendPtr = static_cast<const T*>(sendbuff);
@@ -288,17 +294,17 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
     case 4:
       hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPush<T, 4>), grid, block, 0, stream, /*startEvent=*/nullptr,
                             stopEvent, /*flags=*/0, d_ipcbuffs, recvPtr, count, sendPtr, comm->rank, nRanks,
-                            barrierHost);
+                            barrierHost, skewElems);
       break;
     case 8:
       hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPush<T, 8>), grid, block, 0, stream, /*startEvent=*/nullptr,
                             stopEvent, /*flags=*/0, d_ipcbuffs, recvPtr, count, sendPtr, comm->rank, nRanks,
-                            barrierHost);
+                            barrierHost, skewElems);
       break;
     default:
       hipExtLaunchKernelGGL((dda::common::ddaAllToAllFabricPush<T, 0>), grid, block, 0, stream, /*startEvent=*/nullptr,
                             stopEvent, /*flags=*/0, d_ipcbuffs, recvPtr, count, sendPtr, comm->rank, nRanks,
-                            barrierHost);
+                            barrierHost, skewElems);
       break;
     }
     CUDACHECK(cudaGetLastError());
