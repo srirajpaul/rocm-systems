@@ -144,6 +144,14 @@ static ncclResult_t ncclAllReduceDdaFabricLLTyped(const void* sendbuff, void* re
     dda::common::ddaAllReduceFlatLL<T, 16><<<grid, block, 0, stream>>>(
       peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), count, comm->rank, nRanks, epochDev, epochLen);
     break;
+  case 24:
+    dda::common::ddaAllReduceFlatLL<T, 24><<<grid, block, 0, stream>>>(
+      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), count, comm->rank, nRanks, epochDev, epochLen);
+    break;
+  case 32:
+    dda::common::ddaAllReduceFlatLL<T, 32><<<grid, block, 0, stream>>>(
+      peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), count, comm->rank, nRanks, epochDev, epochLen);
+    break;
   default:
     dda::common::ddaAllReduceFlatLL<T, 0><<<grid, block, 0, stream>>>(
       peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), count, comm->rank, nRanks, epochDev, epochLen);
