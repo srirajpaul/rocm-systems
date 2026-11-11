@@ -33,6 +33,10 @@ namespace dda::common {
 // thread publishes to at most this many peers instead of all nRanks - 1.
 constexpr int kDdaLLArPeersPerBlockRow = 4;
 
+// Fixed-width peer staging keeps phase-2 payloads in registers, including for
+// runtime rank counts. Poll all peers in a batch before retrying any of them.
+constexpr int kDdaLLArOneShotPeerBatch = 16;
+
 // LL is for small-message, so the full payload is well under the staging cap.
 // each packet takes 16 bytes.
 constexpr size_t kDdaLLArSlotStridePkts = kDdaLLMaxBytes / sizeof(LLPacket16);
@@ -106,42 +110,42 @@ __launch_bounds__(512)
   //}
 
   if (blockIdx.y == 0) {
-  // Phase 2: poll my slots for the other ranks, reduce with my own data.
-  LLPacket16* myBase = reinterpret_cast<LLPacket16*>(peerScratch[selfRank]) + bankOffsetPkts;
-  for (size_t pk = gtid; pk < nPk; pk += stride) {
-    uint32_t acc0 = in[2 * pk];
-    uint32_t acc1 = in[2 * pk + 1];
-    //uint32_t d00[kDdaLLArPeersPerBlockRow], d11[kDdaLLArPeersPerBlockRow];
-    uint32_t d00[nRanks], d11[nRanks];
-    bool needReload;
-    do {
-        needReload = false;
+    // Phase 2: poll my slots in fixed-width batches, reduce with my own data.
+    LLPacket16* myBase = reinterpret_cast<LLPacket16*>(peerScratch[selfRank]) + bankOffsetPkts;
+    for (size_t pk = gtid; pk < nPk; pk += stride) {
+      uint32_t acc0 = in[2 * pk];
+      uint32_t acc1 = in[2 * pk + 1];
+#pragma unroll 1
+      for (int base = 1; base < nRanks; base += kDdaLLArOneShotPeerBatch) {
+        uint32_t d00[kDdaLLArOneShotPeerBatch], d11[kDdaLLArOneShotPeerBatch];
+        bool needReload;
+        do {
+          needReload = false;
+#pragma unroll
+          for (int i = 0; i < kDdaLLArOneShotPeerBatch; ++i) {
+            const int r = base + i;
+            if (r < nRanks) {
+              const int peer = (selfRank + r) % nRanks;
+              volatile LLPacket16* src = myBase + (size_t)peer * slot;
+              uint32_t f0, f1;
+              ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(const_cast<LLPacket16*>(&src[pk])),
+                                d00[i], f0, d11[i], f1);
+              needReload |= (f0 != flag || f1 != flag);
+            }
+          }
+        } while (needReload);
 
-    //for (int r = rStart; r < rEnd; ++r) {
-    for (int r = 1; r < nRanks; ++r) {
-      const int peer = (selfRank + r) % nRanks;
-      volatile LLPacket16* src = myBase + (size_t)peer * slot;
-      uint32_t d0, f0, d1, f1;
-      //do {
-        ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(const_cast<LLPacket16*>(&src[pk])), d00[r], f0, d11[r], f1);
-      //} while (f0 != flag || f1 != flag);
-      //acc0 = vecElementAdd<T>(acc0, d0);
-      //acc1 = vecElementAdd<T>(acc1, d1);
-
-      needReload |= (f0 != flag || f1 != flag);
+#pragma unroll
+        for (int i = 0; i < kDdaLLArOneShotPeerBatch; ++i) {
+          if (base + i < nRanks) {
+            acc0 = vecElementAdd<T>(acc0, d00[i]);
+            acc1 = vecElementAdd<T>(acc1, d11[i]);
+          }
+        }
+      }
+      out[2 * pk] = acc0;
+      out[2 * pk + 1] = acc1;
     }
-
-    } while (needReload);
-
-    //for (int r = rStart; r < rEnd; ++r) {
-    for (int r = 1; r < nRanks; ++r) {
-        acc0 = vecElementAdd<T>(acc0, d00[r]);
-        acc1 = vecElementAdd<T>(acc1, d11[r]);
-    }
-
-    out[2 * pk] = acc0;
-    out[2 * pk + 1] = acc1;
-  }
   }
 
   //ddaSetLLEpoch(epochDev, epochLen, blockIdx.x, gridDim.x, flag);
