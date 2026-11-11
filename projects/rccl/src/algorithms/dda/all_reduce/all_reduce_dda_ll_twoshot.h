@@ -46,6 +46,10 @@ constexpr size_t kDdaLLArTwoShotSlotStridePkts = kDdaLLArSlotStridePkts / 2;
 // TODO: should this be moved to common place so other kernels can do the same
 constexpr int kDdaLLArTwoShotPeerBatch = 8;
 
+// Read every peer in a fixed-width batch before retrying on epoch flags.
+// Keep polling payloads separate from the phase-1 publish staging factor.
+constexpr int kDdaLLArTwoShotPollPeerBatch = 8;
+
 // LL two-shot all-reduce kernel. 1D grid over one shard's packets (8B payload
 // each), so the launcher sizes the grid on count/nRanks, not on count.
 //
@@ -129,15 +133,32 @@ __launch_bounds__(1024)
   for (size_t pk = gtid; pk < nPk_rank; pk += stride) {
     uint32_t acc0 = in[2 * pk];
     uint32_t acc1 = in[2 * pk + 1];
-    for (int r = 1; r < nRanks; ++r) {
-      const int peer = (selfRank + r) % nRanks;
-      volatile LLPacket16* src = myBase + (size_t)peer * slot;
-      uint32_t d0, f0, d1, f1;
+#pragma unroll 1
+    for (int base = 1; base < nRanks; base += kDdaLLArTwoShotPollPeerBatch) {
+      uint32_t d0[kDdaLLArTwoShotPollPeerBatch], d1[kDdaLLArTwoShotPollPeerBatch];
+      bool needReload;
       do {
-        ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(const_cast<LLPacket16*>(&src[pk])), d0, f0, d1, f1);
-      } while (f0 != flag || f1 != flag);
-      acc0 = vecElementAdd<T>(acc0, d0);
-      acc1 = vecElementAdd<T>(acc1, d1);
+        needReload = false;
+#pragma unroll
+        for (int i = 0; i < kDdaLLArTwoShotPollPeerBatch; ++i) {
+          const int r = base + i;
+          if (r < nRanks) {
+            const int peer = (selfRank + r) % nRanks;
+            volatile LLPacket16* src = myBase + (size_t)peer * slot;
+            uint32_t f0, f1;
+            ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(const_cast<LLPacket16*>(&src[pk])),
+                              d0[i], f0, d1[i], f1);
+            needReload |= (f0 != flag || f1 != flag);
+          }
+        }
+      } while (needReload);
+#pragma unroll
+      for (int i = 0; i < kDdaLLArTwoShotPollPeerBatch; ++i) {
+        if (base + i < nRanks) {
+          acc0 = vecElementAdd<T>(acc0, d0[i]);
+          acc1 = vecElementAdd<T>(acc1, d1[i]);
+        }
+      }
     }
     out[2 * pk] = acc0;
     out[2 * pk + 1] = acc1;
