@@ -97,18 +97,40 @@ static inline unsigned ddaArLL128SliceThreads(const ncclComm* comm, bool peerPar
   return (unsigned)dda::common::ddaLL128ArPeerWarps(comm->nRanks, (int)warps) * kDdaLL128Warp;
 }
 
+// Block width of an LL128 launch over `slices`. Peer-parallel blocks start at one warp group (one slice) each, so the
+// slices spread over the most CUs and a barrier waits on one slice only; a block takes more groups, doubling up to
+// kDdaArLL128Threads, only while the group-per-block grid would pass the block cap.
+static inline unsigned ddaArLL128Threads(const ncclComm* comm, size_t slices, bool peerPar, rcclDdaLaunchCap cap) {
+  if (!peerPar) {
+    return kDdaArLL128Threads;
+  }
+  const unsigned maxThreads = dda::common::ddaCapThreads(kDdaArLL128Threads, cap.threads);
+  const unsigned groupThreads = ddaArLL128SliceThreads(comm, peerPar, cap);
+  const size_t nBlocksMax = dda::common::ddaCapBlocks((size_t)std::max(comm->ddaFabricMaxBlocks, 1), cap.blocks);
+  unsigned threads = groupThreads;
+  while (threads * 2 <= maxThreads) {
+    const size_t groups = threads / groupThreads;
+    if ((slices + groups - 1) / groups <= nBlocksMax) {
+      break;
+    }
+    threads *= 2;
+  }
+  return threads;
+}
+
 // LL128 one-shot: slices of the whole message.
 static inline std::pair<dim3, dim3> ddaArLL128OneShotGeom(const ncclComm* comm, size_t bytes, bool peerPar,
                                                           rcclDdaLaunchCap cap) {
-  return ddaArFabricLLGrid(comm, ddaLL128Slices(bytes), kDdaArLL128Threads, ddaArLL128SliceThreads(comm, peerPar, cap),
-                           cap);
+  const size_t slices = ddaLL128Slices(bytes);
+  return ddaArFabricLLGrid(comm, slices, ddaArLL128Threads(comm, slices, peerPar, cap),
+                           ddaArLL128SliceThreads(comm, peerPar, cap), cap);
 }
 
 // LL128 two-shot: slices of one shard.
 static inline std::pair<dim3, dim3> ddaArLL128TwoShotGeom(const ncclComm* comm, size_t bytes, bool peerPar,
                                                           rcclDdaLaunchCap cap) {
-  const size_t shardBytes = bytes / (size_t)std::max(comm->nRanks, 1);
-  return ddaArFabricLLGrid(comm, ddaLL128Slices(shardBytes), kDdaArLL128Threads,
+  const size_t slices = ddaLL128Slices(bytes / (size_t)std::max(comm->nRanks, 1));
+  return ddaArFabricLLGrid(comm, slices, ddaArLL128Threads(comm, slices, peerPar, cap),
                            ddaArLL128SliceThreads(comm, peerPar, cap), cap);
 }
 
