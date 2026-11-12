@@ -113,6 +113,9 @@ RCCL_PARAM(DdaLL128AsyncWire, "DDA_LL128_ASYNC_WIRE", 0);
 // LL128 one-shot and cooperative two-shot AllReduce spread each slice's peer loop over a warp group
 // (all_reduce_dda_ll128_peerpar.h); 0 keeps the one-warp-per-slice kernels.
 RCCL_PARAM(DdaLL128ArPeerParallel, "DDA_LL128_AR_PEER_PARALLEL", 1);
+// Split send for the peer-parallel LL128 one-shot AllReduce (out-of-place): -1 when its sender columns fit the
+// block cap, 1 always (shrinking to fit), 0 never. See ddaArLL128OneShotLaunch.
+RCCL_PARAM(DdaLL128ArSplitSend, "DDA_LL128_AR_SPLIT_SEND", -1);
 RCCL_PARAM(DdaLL128, "DDA_LL128", kDdaThresholdUnset);
 RCCL_PARAM(DdaLL128Threshold, "DDA_LL128_THRESHOLD", kDdaThresholdUnset);
 // When set, bypass the per-arch tuning table entirely and use base-commit
