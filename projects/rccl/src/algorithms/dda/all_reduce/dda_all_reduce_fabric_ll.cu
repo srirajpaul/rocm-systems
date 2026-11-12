@@ -44,10 +44,10 @@ RCCL_PARAM_DECLARE(DdaLLOneShotThreshold);
 RCCL_PARAM_DECLARE(DdaLL128OneShotThreshold);
 RCCL_PARAM_DECLARE(DdaLL128AsyncWire);
 RCCL_PARAM(DdaLL128ArPeerParallel, "DDA_LL128_AR_PEER_PARALLEL", 1);
-// -1: measured automatic policy (4/8 ranks); 0: legacy one-shot; 1: all supported ranks.
+// -1: measured automatic policy; 0: legacy one-shot; 1: peer-parallel at all supported sizes/ranks.
 RCCL_PARAM(DdaLL128ArOneShotPeerParallel, "DDA_LL128_AR_ONESHOT_PEER_PARALLEL", -1);
 // Transfer only the occupied LL128 lines for 32-rank shards up to 480 bytes.
-// Opt in with RCCL_DDA_LL128_AR_32_TINY=1; default uses the full-slice kernel.
+// Opt in with RCCL_DDA_LL128_AR_32_TINY=1; disabled by default.
 RCCL_PARAM(DdaLL128Ar32Tiny, "DDA_LL128_AR_32_TINY", 0);
 
 namespace {
@@ -92,10 +92,12 @@ static inline std::pair<dim3, dim3> ddaArLLTwoShotGeom(const ncclComm* comm, siz
 
 // One-shot uses one complete peer group per full-message slice. Its smaller
 // blocks at 4/8 ranks avoid reserving idle groups for tiny messages.
-static bool ddaArLL128OneShotPeerParallel(const ncclComm* comm, rcclDdaLaunchCap cap) {
+static bool ddaArLL128OneShotPeerParallel(const ncclComm* comm, size_t bytes, rcclDdaLaunchCap cap) {
   const int n = comm->nRanks;
   const int64_t mode = rcclParamDdaLL128ArOneShotPeerParallel();
-  return rcclParamDdaLL128ArPeerParallel() != 0 && mode != 0 && (mode > 0 || n == 4 || n == 8) &&
+  // At four ranks, the legacy one-shot is faster through 8 KiB on h13.
+  // An explicit positive mode still permits the peer-parallel kernel there.
+  return rcclParamDdaLL128ArPeerParallel() != 0 && mode != 0 && (mode > 0 || n != 4 || bytes > 8 * 1024) &&
          comm->archName != nullptr && IsArchMatch(comm->archName, "gfx1250") &&
          comm->WarpSize == kDdaLL128Warp && (n == 4 || n == 8 || n == 16 || n == 32) &&
          (cap.threads == 0 || cap.threads >= n * kDdaLL128Warp) && rcclParamDdaLL128AsyncWire() == 0;
@@ -103,7 +105,7 @@ static bool ddaArLL128OneShotPeerParallel(const ncclComm* comm, rcclDdaLaunchCap
 
 // LL128 one-shot: one block per slice with peer parallelism; otherwise one warp.
 static inline std::pair<dim3, dim3> ddaArLL128OneShotGeom(const ncclComm* comm, size_t bytes, rcclDdaLaunchCap cap) {
-  if (ddaArLL128OneShotPeerParallel(comm, cap)) {
+  if (ddaArLL128OneShotPeerParallel(comm, bytes, cap)) {
     const unsigned threads = comm->nRanks * kDdaLL128Warp;
     return ddaArFabricLLGrid(comm, ddaLL128Slices(bytes), threads, threads, cap);
   }
@@ -121,6 +123,12 @@ static bool ddaArLL128PeerParallel(const ncclComm* comm, rcclDdaLaunchCap cap) {
          rcclParamDdaLL128AsyncWire() == 0;
 }
 
+// At four ranks, the legacy two-shot sustains higher bandwidth from 64 MiB.
+// Share this choice between the geometry reporter and the actual launcher.
+static bool ddaArLL128TwoShotPeerParallel(const ncclComm* comm, size_t bytes, rcclDdaLaunchCap cap) {
+  return ddaArLL128PeerParallel(comm, cap) && !(comm->nRanks == 4 && bytes >= 64 * 1024 * 1024);
+}
+
 // Keep the existing architecture/resource eligibility; specialize only the
 // two-shot wire footprint. Explicit one-shot thresholds still take precedence.
 static unsigned ddaArLL128Tiny32Lanes(const ncclComm* comm, size_t bytes, rcclDdaLaunchCap cap) {
@@ -135,7 +143,7 @@ static inline std::pair<dim3, dim3> ddaArLL128TwoShotGeom(const ncclComm* comm, 
   const size_t shardBytes = bytes / (size_t)std::max(comm->nRanks, 1);
   const unsigned tinyLanes = ddaArLL128Tiny32Lanes(comm, bytes, cap);
   if (tinyLanes != 0) return std::make_pair(dim3(1), dim3(32 * tinyLanes));
-  if (ddaArLL128PeerParallel(comm, cap)) {
+  if (ddaArLL128TwoShotPeerParallel(comm, bytes, cap)) {
     const unsigned threads = comm->nRanks == 32 ? 1024 : 512;
     return ddaArFabricLLGrid(comm, ddaLL128Slices(shardBytes), threads,
                              (unsigned)comm->nRanks * kDdaLL128Warp, cap);
@@ -150,13 +158,18 @@ static bool ddaArLL128UseOneShot(ncclComm* comm, const void* sendbuff, void* rec
                                  ncclDataType_t datatype, ncclRedOp_t op, rcclDdaLaunchCap cap) {
   if (!ddaLL128ArOneShotEligible(comm, sendbuff, recvbuff, count, datatype, op)) return false;
   if (ncclGetEnv("RCCL_DDA_LL128_ONESHOT_THRESHOLD") != nullptr || !ddaArLL128PeerParallel(comm, cap)) return true;
-  // Peer-parallel one-shot wins through 256 KiB at 4/8 ranks; two-shot wins
-  // again at 512 KiB. Preserve the previous crossover when one-shot is disabled
-  // and retain the existing defaults at 16/32 ranks.
-  const size_t threshold = ddaArLL128OneShotPeerParallel(comm, cap) && (comm->nRanks == 4 || comm->nRanks == 8)
-                             ? 256 * 1024
+  const size_t bytes = count * ncclTypeSize(datatype);
+  // Keep the explicit Tiny32 opt-in effective even with the larger one-shot
+  // crossover. Explicit one-shot threshold overrides above retain precedence.
+  if (ddaArLL128Tiny32Lanes(comm, bytes, cap) != 0 &&
+      ddaLL128ArTwoShotEligible(comm, sendbuff, recvbuff, count, datatype, op)) return false;
+  // h13 measurements: one-shot wins through 512/256/128/128 KiB at 4/8/16/32
+  // ranks. The four-rank tiny legacy kernel shares this one-shot crossover.
+  // Preserve the previous crossover when peer-parallel one-shot is disabled.
+  const size_t threshold = rcclParamDdaLL128ArOneShotPeerParallel() != 0
+                             ? (comm->nRanks == 4 ? 512 * 1024 : comm->nRanks == 8 ? 256 * 1024 : 128 * 1024)
                              : comm->nRanks == 4 ? 2048 : comm->nRanks == 8 ? 512 : 256;
-  return count * ncclTypeSize(datatype) <= threshold ||
+  return bytes <= threshold ||
          !ddaLL128ArTwoShotEligible(comm, sendbuff, recvbuff, count, datatype, op);
 }
 
@@ -299,7 +312,7 @@ static ncclResult_t ncclAllReduceDdaFabricLL128OneShotTyped(const void* sendbuff
   uint32_t* epochDev = comm->ddaLLEpochDev;
   const int epochLen = comm->ddaLLEpochLen;
 
-  const bool peerParallel = ddaArLL128OneShotPeerParallel(comm, cap);
+  const bool peerParallel = ddaArLL128OneShotPeerParallel(comm, bytes, cap);
   INFO(NCCL_COLL,
        "DDA fabric AllReduce LL128 one-shot: nRanks=%d bytes=%zu slices=%zu grid=%u block=%u "
        "peerParallel=%d (bankSize=%zu)",
@@ -361,7 +374,7 @@ static ncclResult_t ncclAllReduceDdaFabricLL128TwoShotTyped(const void* sendbuff
 
   const int wire = ddaArLL128Wire(comm, bytes);
   const size_t lds = ddaArLL128SharedBytes(wire, block.x);
-  const bool peerParallel = ddaArLL128PeerParallel(comm, cap);
+  const bool peerParallel = ddaArLL128TwoShotPeerParallel(comm, bytes, cap);
   const unsigned tinyLanes = ddaArLL128Tiny32Lanes(comm, bytes, cap);
 
   INFO(NCCL_COLL,
