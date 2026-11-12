@@ -1337,9 +1337,9 @@ size_t rcclDdaLL128TwoShotThreshold(const ncclComm* comm) {
 }
 
 // One-shot moves (nRanks - 1) x the message per rank against two-shot's ~2x, so
-// with the peer-parallel two-shot its crossover falls as nRanks grows: 1M / 256K /
-// 64K at 4 / 8 / 16 ranks on gfx1250 fabric, i.e. this over nRanks squared.
-constexpr size_t kDdaLL128ArOneShotRanksSqBytes = (size_t)16 * 1024 * 1024;
+// with the peer-parallel two-shot its crossover falls as nRanks grows: 1M / 512K /
+// 256K at 4 / 8 / 16 ranks on gfx1250 fabric, i.e. this over nRanks.
+constexpr size_t kDdaLL128ArOneShotRankBytes = (size_t)4 * 1024 * 1024;
 
 size_t rcclDdaLL128OneShotThreshold(const ncclComm* comm) {
   static const bool envSet = rcclEnvIsSet("RCCL_DDA_LL128_ONESHOT_THRESHOLD");
@@ -1348,7 +1348,7 @@ size_t rcclDdaLL128OneShotThreshold(const ncclComm* comm) {
     return cap;
   }
   const size_t nRanks = (size_t)comm->nRanks;
-  return std::min(cap, kDdaLL128ArOneShotRanksSqBytes / (nRanks * nRanks));
+  return std::min(cap, kDdaLL128ArOneShotRankBytes / nRanks);
 }
 
 inline size_t rcclDdaVmmThresholdTab(const rcclArchThresholds* table, ncclFunc_t func, int nRanks) {
