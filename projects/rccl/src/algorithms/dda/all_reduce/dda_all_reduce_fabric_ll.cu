@@ -46,9 +46,6 @@ RCCL_PARAM_DECLARE(DdaLL128AsyncWire);
 RCCL_PARAM(DdaLL128ArPeerParallel, "DDA_LL128_AR_PEER_PARALLEL", 1);
 // -1: measured automatic policy; 0: legacy one-shot; 1: peer-parallel at all supported sizes/ranks.
 RCCL_PARAM(DdaLL128ArOneShotPeerParallel, "DDA_LL128_AR_ONESHOT_PEER_PARALLEL", -1);
-// Transfer only the occupied LL128 lines for 32-rank shards up to 480 bytes.
-// Opt in with RCCL_DDA_LL128_AR_32_TINY=1; disabled by default.
-RCCL_PARAM(DdaLL128Ar32Tiny, "DDA_LL128_AR_32_TINY", 0);
 
 namespace {
 
@@ -91,7 +88,7 @@ static inline std::pair<dim3, dim3> ddaArLLTwoShotGeom(const ncclComm* comm, siz
 }
 
 // One-shot uses one complete peer group per full-message slice. Its smaller
-// blocks at 4/8 ranks avoid reserving idle groups for tiny messages.
+// blocks at 4/8 ranks avoid reserving idle groups for small messages.
 static bool ddaArLL128OneShotPeerParallel(const ncclComm* comm, size_t bytes, rcclDdaLaunchCap cap) {
   const int n = comm->nRanks;
   const int64_t mode = rcclParamDdaLL128ArOneShotPeerParallel();
@@ -129,20 +126,9 @@ static bool ddaArLL128TwoShotPeerParallel(const ncclComm* comm, size_t bytes, rc
   return ddaArLL128PeerParallel(comm, cap) && !(comm->nRanks == 4 && bytes >= 64 * 1024 * 1024);
 }
 
-// Keep the existing architecture/resource eligibility; specialize only the
-// two-shot wire footprint. Explicit one-shot thresholds still take precedence.
-static unsigned ddaArLL128Tiny32Lanes(const ncclComm* comm, size_t bytes, rcclDdaLaunchCap cap) {
-  if (rcclParamDdaLL128Ar32Tiny() == 0 || comm->nRanks != 32 || !ddaArLL128PeerParallel(comm, cap) ||
-      bytes == 0 || bytes % (32 * sizeof(uint64_t)) != 0) return 0;
-  const size_t shard = bytes / 32;
-  return shard <= 120 ? 8 : shard <= 240 ? 16 : shard <= 480 ? 32 : 0;
-}
-
 // LL128 two-shot: complete peer-parallel slice groups per CTA, or the original warp per slice.
 static inline std::pair<dim3, dim3> ddaArLL128TwoShotGeom(const ncclComm* comm, size_t bytes, rcclDdaLaunchCap cap) {
   const size_t shardBytes = bytes / (size_t)std::max(comm->nRanks, 1);
-  const unsigned tinyLanes = ddaArLL128Tiny32Lanes(comm, bytes, cap);
-  if (tinyLanes != 0) return std::make_pair(dim3(1), dim3(32 * tinyLanes));
   if (ddaArLL128TwoShotPeerParallel(comm, bytes, cap)) {
     const unsigned threads = comm->nRanks == 32 ? 1024 : 512;
     return ddaArFabricLLGrid(comm, ddaLL128Slices(shardBytes), threads,
@@ -159,12 +145,8 @@ static bool ddaArLL128UseOneShot(ncclComm* comm, const void* sendbuff, void* rec
   if (!ddaLL128ArOneShotEligible(comm, sendbuff, recvbuff, count, datatype, op)) return false;
   if (ncclGetEnv("RCCL_DDA_LL128_ONESHOT_THRESHOLD") != nullptr || !ddaArLL128PeerParallel(comm, cap)) return true;
   const size_t bytes = count * ncclTypeSize(datatype);
-  // Keep the explicit Tiny32 opt-in effective even with the larger one-shot
-  // crossover. Explicit one-shot threshold overrides above retain precedence.
-  if (ddaArLL128Tiny32Lanes(comm, bytes, cap) != 0 &&
-      ddaLL128ArTwoShotEligible(comm, sendbuff, recvbuff, count, datatype, op)) return false;
   // h13 measurements: one-shot wins through 512/256/128/128 KiB at 4/8/16/32
-  // ranks. The four-rank tiny legacy kernel shares this one-shot crossover.
+  // ranks. The four-rank small-message legacy kernel shares this one-shot crossover.
   // Preserve the previous crossover when peer-parallel one-shot is disabled.
   const size_t threshold = rcclParamDdaLL128ArOneShotPeerParallel() != 0
                              ? (comm->nRanks == 4 ? 512 * 1024 : comm->nRanks == 8 ? 256 * 1024 : 128 * 1024)
@@ -375,19 +357,16 @@ static ncclResult_t ncclAllReduceDdaFabricLL128TwoShotTyped(const void* sendbuff
   const int wire = ddaArLL128Wire(comm, bytes);
   const size_t lds = ddaArLL128SharedBytes(wire, block.x);
   const bool peerParallel = ddaArLL128TwoShotPeerParallel(comm, bytes, cap);
-  const unsigned tinyLanes = ddaArLL128Tiny32Lanes(comm, bytes, cap);
 
   INFO(NCCL_COLL,
        "DDA fabric AllReduce LL128 two-shot: nRanks=%d bytes=%zu shardBytes=%zu slices=%zu grid=%u block=%u wire=%d "
-       "lds=%zu peerParallel=%d (bankSize=%zu) tinyLanes=%u",
-       nRanks, bytes, shardBytes, slices, grid.x, block.x, wire, lds, (int)peerParallel, bankSize, tinyLanes);
+       "lds=%zu peerParallel=%d (bankSize=%zu)",
+       nRanks, bytes, shardBytes, slices, grid.x, block.x, wire, lds, (int)peerParallel, bankSize);
 
   const dda::common::DdaKernelParams params{comm->abortFlagDev};
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
-  const auto kernel = tinyLanes == 8 ? dda::common::ddaAllReduceTwoShotLL128Tiny32<T, 8>
-                    : tinyLanes == 16 ? dda::common::ddaAllReduceTwoShotLL128Tiny32<T, 16>
-                    : tinyLanes == 32 ? dda::common::ddaAllReduceTwoShotLL128Tiny32<T, 32>
-                    : peerParallel ? ddaArLL128PeerParallelKernel<T>(nRanks) : ddaArLL128TwoShotKernel<T>(nRanks, wire);
+  const auto kernel = peerParallel ? ddaArLL128PeerParallelKernel<T>(nRanks)
+                                   : ddaArLL128TwoShotKernel<T>(nRanks, wire);
   hipExtLaunchKernelGGL(kernel, grid, block, lds, stream, /*startEvent=*/nullptr,
                         stopEvent, /*flags=*/0, peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
                         shardBytes, comm->rank, nRanks, epochDev, epochLen, slices, bankSize, params);
