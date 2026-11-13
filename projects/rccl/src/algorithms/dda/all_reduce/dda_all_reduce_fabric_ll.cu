@@ -225,21 +225,15 @@ template <typename T>
 using DdaArLL128Kernel = void (*)(T* const*, T*, const T*, size_t, int, int, uint32_t*, int, size_t, size_t,
                                   dda::common::DdaKernelParams);
 
-// Largest per-rank shard the peer-parallel two-shot takes. Past it every flat-kernel warp already carries several
-// slices, which hides its serial peer polls, and the flat kernel's lack of barriers wins (4 ranks from 64M, 8 from 128M).
-constexpr size_t kDdaArLL128PeerParMaxShardBytes = 8 * 1024 * 1024;
-
 // Whether the one-shot takes the peer-parallel kernel.
 static bool ddaArLL128OneShotPeerPar() {
   return rcclParamDdaLL128ArPeerParallel() != 0;
 }
 
-// Whether the two-shot takes the peer-parallel kernel: cooperative writer only (the staged writer keeps its kernel),
-// up to kDdaArLL128PeerParMaxShardBytes.
-static bool ddaArLL128TwoShotPeerPar(const ncclComm* comm, size_t bytes, int wire) {
-  const size_t shard = bytes / (size_t)std::max(comm->nRanks, 1);
-  return rcclParamDdaLL128ArPeerParallel() != 0 && wire == dda::common::kDdaLL128WireCoop &&
-         shard <= kDdaArLL128PeerParMaxShardBytes;
+// Whether the two-shot takes the peer-parallel kernel: cooperative writer only (the staged writer keeps its kernel).
+// At every shard size: on gfx1250 h13 it beats the flat two-shot past 8 MiB shards too (2-4% at 4 and 8 ranks).
+static bool ddaArLL128TwoShotPeerPar(int wire) {
+  return rcclParamDdaLL128ArPeerParallel() != 0 && wire == dda::common::kDdaLL128WireCoop;
 }
 
 template <typename T>
@@ -377,7 +371,7 @@ static ncclResult_t ncclAllReduceDdaFabricLL128TwoShotTyped(const void* sendbuff
   const size_t bankSize = ddaBankSize(comm->ddaScratchBytes);
 
   const int wire = ddaArLL128Wire(comm, bytes);
-  const bool peerPar = ddaArLL128TwoShotPeerPar(comm, bytes, wire);
+  const bool peerPar = ddaArLL128TwoShotPeerPar(wire);
   const auto geom = ddaArLL128TwoShotGeom(comm, bytes, peerPar, cap);
   const dim3 grid = geom.first;
   const dim3 block = geom.second;
@@ -801,7 +795,7 @@ uint32_t ncclAllReduceDdaFabricLL128Blocks(ncclComm* comm, size_t count, ncclDat
   // One-shot: the out-of-place launch, sender columns included when it splits.
   const dim3 grid =
       oneShot ? ddaArLL128OneShotLaunch(comm, bytes, ddaArLL128OneShotPeerPar(), /*outOfPlace=*/true, cap).grid
-              : ddaArLL128TwoShotGeom(comm, bytes, ddaArLL128TwoShotPeerPar(comm, bytes, ddaArLL128Wire(comm, bytes)),
+              : ddaArLL128TwoShotGeom(comm, bytes, ddaArLL128TwoShotPeerPar(ddaArLL128Wire(comm, bytes)),
                                       cap)
                   .first;
   return grid.x * grid.y;
