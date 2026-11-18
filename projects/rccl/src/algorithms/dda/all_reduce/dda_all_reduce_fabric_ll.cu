@@ -326,7 +326,7 @@ static DdaArLL128Kernel<T> ddaArLL128TwoShotKernel(int nRanks, int wire, bool pe
     }
     return wire == dda::common::kDdaLL128WireAsync
              ? &dda::common::ddaAllReduceTwoShotLL128<T, kN, dda::common::kDdaLL128WireAsync>
-             : &dda::common::ddaAllReduceTwoShotLL128<T, kN, dda::common::kDdaLL128WireCoop>;
+             : &dda::common::ddaAllReduceTwoShotLL128Coop<T, kN>;
   });
 }
 
