@@ -39,6 +39,21 @@ constexpr size_t ddaLL128ArSlotWords(size_t bankSize, int nRanks) {
 template <typename T>
 inline constexpr int kDdaLL128ArPollBatch = is_fp8_v<T> ? 4 : 8;
 
+// Fill a batch from walk index base; entries past nRanks repeat the next peer. Returns the next batch's first peer.
+template <int kBatch>
+__host__ __device__ __forceinline__ constexpr int ddaLL128ArBatchPeers(int peer, int base, int nRanks,
+                                                                       int (&peers)[kBatch], bool (&valid)[kBatch]) {
+#pragma unroll
+  for (int k = 0; k < kBatch; ++k) {
+    valid[k] = base + k < nRanks;
+    peers[k] = peer;
+    if (valid[k]) {
+      peer = (peer + 1) % nRanks;
+    }
+  }
+  return peer;
+}
+
 // Wait until every valid flag in the batch is current; vr then holds the landed payload. Returns false on abort.
 // Every line is read, and all the batch's loads issue before its first flag check.
 template <int kBatch>
