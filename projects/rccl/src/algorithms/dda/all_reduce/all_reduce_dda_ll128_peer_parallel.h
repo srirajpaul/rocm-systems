@@ -99,16 +99,17 @@ __global__ void ddaAllReduceOneShotLL128PeerParallel(
 }
 
 // Each group of N warps owns one slice across all shards, with a warp per
-// peer for transfers and polling. A 512-thread CTA has 16/N independent groups
-// for 4/8/16 ranks; 32 ranks use a 1024-thread CTA with one complete group.
+// peer for transfers and polling. THREADS sizes the complete groups in the
+// CTA, its slice stride, and its LDS allocation together. Defaults retain
+// 512 threads for 4/8/16 ranks and 1024 threads for 32 ranks.
 // Reduction words are distributed across the group and summed in register trees.
 //
 // A slice and all of its input reads/output writes belong to the same CTA.
 // This preserves in-place operation without a dependency on another local CTA.
 // All groups execute the same LDS barriers, including tail groups and aborts.
 // Gather warps converge at the final CTA barrier before advancing the epoch.
-template <typename T, int N>
-__launch_bounds__(N == 32 ? 1024 : 512)
+template <typename T, int N, int THREADS = (N == 32 ? 1024 : 512)>
+__launch_bounds__(THREADS)
 __global__ void ddaAllReduceTwoShotLL128PeerParallel(
     T* const* __restrict__ peerScratch, T* __restrict__ recvbuff,
     const T* __restrict__ sendbuff, size_t shardBytes, int selfRank, int nRanksRt,
@@ -121,7 +122,9 @@ __global__ void ddaAllReduceTwoShotLL128PeerParallel(
   const int group = warp / N;
   const int peerWarp = warp % N;
   const int peer = (selfRank + peerWarp) % N;
-  constexpr int groups = (N == 32 ? 32 : 16) / N;
+  static_assert(THREADS >= N * kDdaLL128Warp && THREADS % (N * kDdaLL128Warp) == 0,
+                "blocks contain complete peer groups");
+  constexpr int groups = THREADS / (N * kDdaLL128Warp);
   const size_t firstSlice = (size_t)blockIdx.x * groups;
   const size_t sliceStride = (size_t)gridDim.x * groups;
   const bool flagLane = ddaLL128IsFlagLane(lane);
