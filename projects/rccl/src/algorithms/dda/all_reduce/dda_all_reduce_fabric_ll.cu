@@ -46,6 +46,8 @@ RCCL_PARAM_DECLARE(DdaLL128AsyncWire);
 RCCL_PARAM(DdaLL128ArPeerParallel, "DDA_LL128_AR_PEER_PARALLEL", 1);
 // -1: measured automatic policy; 0: legacy one-shot; 1: peer-parallel at all supported sizes/ranks.
 RCCL_PARAM(DdaLL128ArOneShotPeerParallel, "DDA_LL128_AR_ONESHOT_PEER_PARALLEL", -1);
+// Experimental batching for the warp-per-slice kernels; does not override peer-parallel selection.
+RCCL_PARAM(DdaLL128ArPeerBatch, "DDA_LL128_AR_PEER_BATCH", 0);
 
 namespace {
 
@@ -160,6 +162,11 @@ static bool ddaArLL128StagedWireOk(const ncclComm* comm) {
   return comm->archName != nullptr && IsArchMatch(comm->archName, "gfx1250") && comm->WarpSize == kDdaLL128Warp;
 }
 
+static bool ddaArLL128PeerBatch(const ncclComm* comm) {
+  return rcclParamDdaLL128ArPeerBatch() == 1 && comm->archName != nullptr &&
+         IsArchMatch(comm->archName, "gfx1250") && comm->WarpSize == kDdaLL128Warp;
+}
+
 // Calls pick(std::integral_constant<int, N>{}): NRANKS_CT 4/8 unroll the peer loops, 0 is the runtime fallback.
 template <typename Pick>
 static auto ddaArPickRanksCt(int nRanks, Pick pick) {
@@ -255,6 +262,20 @@ static DdaArLL128Kernel<T> ddaArLL128TwoShotKernel(int nRanks, int wire) {
   });
 }
 
+template <typename T, bool Batched>
+static DdaArLL128Kernel<T> ddaArLL128FlatKernel(int nRanks) {
+  return ddaArPickRanksCt(nRanks, [](auto n) -> DdaArLL128Kernel<T> {
+    return &dda::common::ddaAllReduceFlatLL128<T, decltype(n)::value, Batched>;
+  });
+}
+
+template <typename T>
+static DdaArLL128Kernel<T> ddaArLL128TwoShotBatchedKernel(int nRanks) {
+  return ddaArPickRanksCt(nRanks, [](auto n) -> DdaArLL128Kernel<T> {
+    return &dda::common::ddaAllReduceTwoShotLL128<T, decltype(n)::value, dda::common::kDdaLL128WireCoop, true>;
+  });
+}
+
 template <typename T>
 static DdaArLL128Kernel<T> ddaArLL128PeerParallelKernel(int nRanks) {
   switch (nRanks) {
@@ -295,10 +316,11 @@ static ncclResult_t ncclAllReduceDdaFabricLL128OneShotTyped(const void* sendbuff
   const int epochLen = comm->ddaLLEpochLen;
 
   const bool peerParallel = ddaArLL128OneShotPeerParallel(comm, bytes, cap);
+  const bool peerBatch = !peerParallel && ddaArLL128PeerBatch(comm);
   INFO(NCCL_COLL,
        "DDA fabric AllReduce LL128 one-shot: nRanks=%d bytes=%zu slices=%zu grid=%u block=%u "
-       "peerParallel=%d (bankSize=%zu)",
-       nRanks, bytes, slices, grid.x, block.x, (int)peerParallel, bankSize);
+       "peerParallel=%d peerBatch=%d (bankSize=%zu)",
+       nRanks, bytes, slices, grid.x, block.x, (int)peerParallel, (int)peerBatch, bankSize);
 
   const dda::common::DdaKernelParams params{comm->abortFlagDev};
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
@@ -310,24 +332,11 @@ static ncclResult_t ncclAllReduceDdaFabricLL128OneShotTyped(const void* sendbuff
     CUDACHECK(cudaGetLastError());
     return ncclSuccess;
   }
-  // NRANKS_CT 4/8: unrolled reduce loop; 0: runtime fallback.
-  switch (nRanks) {
-  case 4:
-    hipExtLaunchKernelGGL((dda::common::ddaAllReduceFlatLL128<T, 4>), grid, block, 0, stream, /*startEvent=*/nullptr,
-                          stopEvent, /*flags=*/0, peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
-                          bytes, comm->rank, nRanks, epochDev, epochLen, slices, bankSize, params);
-    break;
-  case 8:
-    hipExtLaunchKernelGGL((dda::common::ddaAllReduceFlatLL128<T, 8>), grid, block, 0, stream, /*startEvent=*/nullptr,
-                          stopEvent, /*flags=*/0, peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
-                          bytes, comm->rank, nRanks, epochDev, epochLen, slices, bankSize, params);
-    break;
-  default:
-    hipExtLaunchKernelGGL((dda::common::ddaAllReduceFlatLL128<T, 0>), grid, block, 0, stream, /*startEvent=*/nullptr,
-                          stopEvent, /*flags=*/0, peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
-                          bytes, comm->rank, nRanks, epochDev, epochLen, slices, bankSize, params);
-    break;
-  }
+  const auto kernel = peerBatch ? ddaArLL128FlatKernel<T, true>(nRanks)
+                                : ddaArLL128FlatKernel<T, false>(nRanks);
+  hipExtLaunchKernelGGL(kernel, grid, block, 0, stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0,
+                        peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff), bytes,
+                        comm->rank, nRanks, epochDev, epochLen, slices, bankSize, params);
 
   CUDACHECK(cudaGetLastError());
 
@@ -357,16 +366,18 @@ static ncclResult_t ncclAllReduceDdaFabricLL128TwoShotTyped(const void* sendbuff
   const int wire = ddaArLL128Wire(comm, bytes);
   const size_t lds = ddaArLL128SharedBytes(wire, block.x);
   const bool peerParallel = ddaArLL128TwoShotPeerParallel(comm, bytes, cap);
+  const bool peerBatch = !peerParallel && wire == dda::common::kDdaLL128WireCoop && ddaArLL128PeerBatch(comm);
 
   INFO(NCCL_COLL,
        "DDA fabric AllReduce LL128 two-shot: nRanks=%d bytes=%zu shardBytes=%zu slices=%zu grid=%u block=%u wire=%d "
-       "lds=%zu peerParallel=%d (bankSize=%zu)",
-       nRanks, bytes, shardBytes, slices, grid.x, block.x, wire, lds, (int)peerParallel, bankSize);
+       "lds=%zu peerParallel=%d peerBatch=%d (bankSize=%zu)",
+       nRanks, bytes, shardBytes, slices, grid.x, block.x, wire, lds, (int)peerParallel, (int)peerBatch, bankSize);
 
   const dda::common::DdaKernelParams params{comm->abortFlagDev};
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
   const auto kernel = peerParallel ? ddaArLL128PeerParallelKernel<T>(nRanks)
-                                   : ddaArLL128TwoShotKernel<T>(nRanks, wire);
+                    : peerBatch ? ddaArLL128TwoShotBatchedKernel<T>(nRanks)
+                                : ddaArLL128TwoShotKernel<T>(nRanks, wire);
   hipExtLaunchKernelGGL(kernel, grid, block, lds, stream, /*startEvent=*/nullptr,
                         stopEvent, /*flags=*/0, peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
                         shardBytes, comm->rank, nRanks, epochDev, epochLen, slices, bankSize, params);
