@@ -62,7 +62,8 @@ __launch_bounds__(512)
 // every rank must launch the same grid. Scratch for peer r, slot s, holds the chunk rank s sends to r.
 // The chunk sent from rank s to rank d is walked from offset ((s + d) % nRanks) * skewElems (modulo count), in both
 // the push and the drain, so the per-peer streams do not hit the same addresses at the same time. A block's drain
-// touches exactly the offsets its own push read, which keeps in-place calls safe.
+// touches exactly the offsets its own push read, which keeps in-place calls safe. Every rank walks the peers starting
+// at itself, in the push and the drain, so the ranks do not all write to the same peers first.
 template <typename T, int NRANKS_CT>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
@@ -91,25 +92,32 @@ __launch_bounds__(512)
     const size_t o = idx + s;
     return o >= idxEnd ? o - idxEnd : o;
   };
+  auto peerAt = [&](int r) {
+    const int p = r + selfRank;
+    return p >= nRanksEff ? p - nRanksEff : p;
+  };
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
     int r0 = 0;
     for (; r0 + kUnroll <= nRanksEff; r0 += kUnroll) {
       uint4 v[kUnroll];
       size_t o[kUnroll];
+      int p[kUnroll];
 #pragma unroll
       for (int u = 0; u < kUnroll; ++u) {
-        o[u] = skewed(idx, selfRank, r0 + u);
-        v[u] = reinterpret_cast<const uint4*>(&sendbuff[o[u] + (r0 + u) * idxEnd])[0];
+        p[u] = peerAt(r0 + u);
+        o[u] = skewed(idx, selfRank, p[u]);
+        v[u] = reinterpret_cast<const uint4*>(&sendbuff[o[u] + p[u] * idxEnd])[0];
       }
 #pragma unroll
       for (int u = 0; u < kUnroll; ++u) {
-        *reinterpret_cast<uint4*>(&ipcbuffs[r0 + u][destIdx + o[u]]) = v[u];
+        *reinterpret_cast<uint4*>(&ipcbuffs[p[u]][destIdx + o[u]]) = v[u];
       }
     }
     for (int r = r0; r < nRanksEff; ++r) {
-      const size_t o = skewed(idx, selfRank, r);
-      *reinterpret_cast<uint4*>(&ipcbuffs[r][destIdx + o]) =
-        reinterpret_cast<const uint4*>(&sendbuff[o + r * idxEnd])[0];
+      const int p = peerAt(r);
+      const size_t o = skewed(idx, selfRank, p);
+      *reinterpret_cast<uint4*>(&ipcbuffs[p][destIdx + o]) =
+        reinterpret_cast<const uint4*>(&sendbuff[o + p * idxEnd])[0];
     }
   }
 
@@ -120,7 +128,8 @@ __launch_bounds__(512)
   for (size_t idx = idxStart; idx < idxEnd; idx += idxStride) {
 #pragma unroll kUnroll
     for (int r = 0; r < nRanksEff; ++r) {
-      size_t slotIdx = skewed(idx, r, selfRank) + r * idxEnd;
+      const int src = peerAt(r);
+      size_t slotIdx = skewed(idx, src, selfRank) + src * idxEnd;
       *reinterpret_cast<uint4*>(&recvbuff[slotIdx]) = reinterpret_cast<const uint4*>(&selfScratch[slotIdx])[0];
     }
   }
