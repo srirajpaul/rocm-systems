@@ -70,7 +70,7 @@ constexpr size_t ddaLL128ArTwoShotSlotWords(size_t bankSize, int nRanks) {
 // warp still has to read.
 //
 // WIRE (DdaLL128Wire) picks the phase-1 and phase-2 writer; staged, it takes ddaLL128StageBytes(blockDim.x) of LDS.
-template <typename T, int NRANKS_CT, int WIRE = kDdaLL128WireCoop>
+template <typename T, int NRANKS_CT, int WIRE = kDdaLL128WireCoop, bool SKIP_REDUCE = false>
 __launch_bounds__(512)
   __global__ void ddaAllReduceTwoShotLL128(T* const* __restrict__ peerScratch, // ddaPeerPtrsDev: nRanks scratch bases
                                            T* __restrict__ recvbuff, // local user output
@@ -189,22 +189,24 @@ __launch_bounds__(512)
     uint64_t acc[kDdaLL128WordsPerThread] = {};
     ddaLL128LoadRegs<int8_t>(acc, srcBytes + (size_t)selfRank * shardBytes + sliceByte, eltInSlice, lane, flagLane);
 
-    for (int r = 1; r < foldRanks; ++r) {
-      const int peer = (selfRank + r) % nRanks;
-      const uint64_t* gatherSlot = selfBase + bankWords + (uint64_t)peer * (uint64_t)slotWords;
-      uint64_t vr[kDdaLL128WordsPerThread];
-      if (!ddaLL128PollWire(gatherSlot + wireOff, vr, flag, lane, params)) {
-        ddaLL128StageDrain<WIRE>();
-        ddaSetLLEpoch(epochDev, epochLen, blockIdx.x, gridDim.x, flag32);
-        return;
-      }
-      // On a flag lane the odd words hold flags rather than payload, so the sums
-      // landing there are meaningless -- ddaLL128StoreRegs re-derives those slots
-      // from the even ones and never writes them out, so folding blind is cheaper
-      // than predicating the loop.
+    if constexpr (!SKIP_REDUCE) {
+      for (int r = 1; r < foldRanks; ++r) {
+        const int peer = (selfRank + r) % nRanks;
+        const uint64_t* gatherSlot = selfBase + bankWords + (uint64_t)peer * (uint64_t)slotWords;
+        uint64_t vr[kDdaLL128WordsPerThread];
+        if (!ddaLL128PollWire(gatherSlot + wireOff, vr, flag, lane, params)) {
+          ddaLL128StageDrain<WIRE>();
+          ddaSetLLEpoch(epochDev, epochLen, blockIdx.x, gridDim.x, flag32);
+          return;
+        }
+        // On a flag lane the odd words hold flags rather than payload, so the sums
+        // landing there are meaningless -- ddaLL128StoreRegs re-derives those slots
+        // from the even ones and never writes them out, so folding blind is cheaper
+        // than predicating the loop.
 #pragma unroll
-      for (int u = 0; u < kDdaLL128WordsPerThread; ++u) {
-        acc[u] = ddaLL128AddWord<T>(acc[u], vr[u]);
+        for (int u = 0; u < kDdaLL128WordsPerThread; ++u) {
+          acc[u] = ddaLL128AddWord<T>(acc[u], vr[u]);
+        }
       }
     }
 

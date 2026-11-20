@@ -22,6 +22,7 @@
 #include "algorithms/dda/all_reduce/all_reduce_dda_ll_twoshot.h"
 #include "algorithms/dda/all_reduce/all_reduce_dda_ll128.h"
 #include "algorithms/dda/all_reduce/all_reduce_dda_ll128_twoshot.h"
+#include "algorithms/dda/all_reduce/all_reduce_dda_ll128_warp.h"
 #include "archinfo.h"
 #include "checks.h"
 #include "comm.h"
@@ -43,6 +44,8 @@ RCCL_PARAM_DECLARE(DdaLL);
 RCCL_PARAM_DECLARE(DdaLLOneShotThreshold);
 RCCL_PARAM_DECLARE(DdaLL128OneShotThreshold);
 RCCL_PARAM_DECLARE(DdaLL128AsyncWire);
+RCCL_PARAM(DdaLL128TwoShotVersion, "DDA_LL128_TWOSHOT_VERSION", 0);
+RCCL_PARAM(DdaLL128SkipReduce, "DDA_LL128_SKIP_REDUCE", 0); // Benchmark only; output is not an allreduce.
 
 namespace {
 
@@ -89,9 +92,26 @@ static inline std::pair<dim3, dim3> ddaArLL128OneShotGeom(const ncclComm* comm, 
   return ddaArFabricLLGrid(comm, ddaLL128Slices(bytes), kDdaArLL128Threads, kDdaLL128Warp, cap);
 }
 
-// LL128 two-shot: slices of one shard, one warp each.
+// LL128 two-shot kernel selection and geometry.
+static int ddaArLL128WarpVersion(const ncclComm* comm, rcclDdaLaunchCap cap) {
+  const int version = (int)rcclParamDdaLL128TwoShotVersion();
+  const unsigned threads = dda::common::ddaCapThreads(dda::common::kDdaLL128WarpThreads, cap.threads);
+  const unsigned groups = (comm->nRanks + dda::common::kDdaLL128WarpPeers - 1) / dda::common::kDdaLL128WarpPeers;
+  return (version == 1) && comm->WarpSize == kDdaLL128Warp &&
+         groups <= threads / kDdaLL128Warp ? version : 0;
+}
+
 static inline std::pair<dim3, dim3> ddaArLL128TwoShotGeom(const ncclComm* comm, size_t bytes, rcclDdaLaunchCap cap) {
   const size_t shardBytes = bytes / (size_t)std::max(comm->nRanks, 1);
+  if (ddaArLL128WarpVersion(comm, cap)) {
+    const unsigned threads = dda::common::ddaCapThreads(dda::common::kDdaLL128WarpThreads, cap.threads);
+    const unsigned groups = (comm->nRanks + dda::common::kDdaLL128WarpPeers - 1) / dda::common::kDdaLL128WarpPeers;
+    const unsigned teams = (threads / kDdaLL128Warp) / groups;
+    const size_t maxBlocks = dda::common::ddaCapBlocks((size_t)std::max(comm->ddaFabricMaxBlocks, 1), cap.blocks);
+    const size_t blocks = std::min((ddaLL128Slices(shardBytes) + teams - 1) / teams,
+                                  std::min(maxBlocks, (size_t)comm->ddaLLEpochLen));
+    return {dim3((unsigned)std::max<size_t>(blocks, 1)), dim3(threads)};
+  }
   return ddaArFabricLLGrid(comm, ddaLL128Slices(shardBytes), kDdaArLL128Threads, kDdaLL128Warp, cap);
 }
 
@@ -251,13 +271,21 @@ template <typename T>
 using DdaArLL128Kernel = void (*)(T* const*, T*, const T*, size_t, int, int, uint32_t*, int, size_t, size_t,
                                   dda::common::DdaKernelParams);
 
-template <typename T>
+template <typename T, bool SKIP_REDUCE = false>
 static DdaArLL128Kernel<T> ddaArLL128TwoShotKernel(int nRanks, int wire) {
   return ddaArPickRanksCt(nRanks, [wire](auto n) -> DdaArLL128Kernel<T> {
     constexpr int kN = decltype(n)::value;
     return wire == dda::common::kDdaLL128WireAsync
-             ? &dda::common::ddaAllReduceTwoShotLL128<T, kN, dda::common::kDdaLL128WireAsync>
-             : &dda::common::ddaAllReduceTwoShotLL128<T, kN, dda::common::kDdaLL128WireCoop>;
+             ? &dda::common::ddaAllReduceTwoShotLL128<T, kN, dda::common::kDdaLL128WireAsync, SKIP_REDUCE>
+             : &dda::common::ddaAllReduceTwoShotLL128<T, kN, dda::common::kDdaLL128WireCoop, SKIP_REDUCE>;
+  });
+}
+
+template <typename T, bool SKIP_REDUCE = false>
+static DdaArLL128Kernel<T> ddaArLL128WarpKernel(int nRanks) {
+  return ddaArPickRanksCt(nRanks, [](auto n) -> DdaArLL128Kernel<T> {
+    constexpr int kN = decltype(n)::value;
+    return &dda::common::ddaAllReduceTwoShotLL128WarpV1<T, kN, SKIP_REDUCE>;
   });
 }
 
@@ -334,17 +362,25 @@ static ncclResult_t ncclAllReduceDdaFabricLL128TwoShotTyped(const void* sendbuff
   uint32_t* epochDev = comm->ddaLLEpochDev;
   const int epochLen = comm->ddaLLEpochLen;
 
-  const int wire = ddaArLL128Wire(comm, bytes);
-  const size_t lds = ddaArLL128SharedBytes(wire, block.x);
+  const int version = ddaArLL128WarpVersion(comm, cap);
+  const bool skipReduce = rcclParamDdaLL128SkipReduce() != 0;
+  const int wire = version ? dda::common::kDdaLL128WireCoop : ddaArLL128Wire(comm, bytes);
+  const unsigned groups = (nRanks + dda::common::kDdaLL128WarpPeers - 1) / dda::common::kDdaLL128WarpPeers;
+  const unsigned teams = (block.x / kDdaLL128Warp) / groups;
+  const size_t lds = version ? (groups == 1 || skipReduce ? 0 : 2 * (size_t)teams *
+                              dda::common::kDdaLL128WireBytesPerSlice) : ddaArLL128SharedBytes(wire, block.x);
 
   INFO(NCCL_COLL,
        "DDA fabric AllReduce LL128 two-shot: nRanks=%d bytes=%zu shardBytes=%zu slices=%zu grid=%u block=%u wire=%d "
-       "lds=%zu (warp-per-slice, bankSize=%zu)",
-       nRanks, bytes, shardBytes, slices, grid.x, block.x, wire, lds, bankSize);
+       "lds=%zu version=%d skip_reduce=%d bankSize=%zu",
+       nRanks, bytes, shardBytes, slices, grid.x, block.x, wire, lds, version, (int)skipReduce, bankSize);
 
   const dda::common::DdaKernelParams params{comm->abortFlagDev};
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
-  hipExtLaunchKernelGGL(ddaArLL128TwoShotKernel<T>(nRanks, wire), grid, block, lds, stream, /*startEvent=*/nullptr,
+  const auto kernel = skipReduce
+      ? (version ? ddaArLL128WarpKernel<T, true>(nRanks) : ddaArLL128TwoShotKernel<T, true>(nRanks, wire))
+      : (version ? ddaArLL128WarpKernel<T>(nRanks) : ddaArLL128TwoShotKernel<T>(nRanks, wire));
+  hipExtLaunchKernelGGL(kernel, grid, block, lds, stream, /*startEvent=*/nullptr,
                         stopEvent, /*flags=*/0, peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
                         shardBytes, comm->rank, nRanks, epochDev, epochLen, slices, bankSize, params);
 
