@@ -97,7 +97,7 @@ static int ddaArLL128WarpVersion(const ncclComm* comm, rcclDdaLaunchCap cap) {
   const int version = (int)rcclParamDdaLL128TwoShotVersion();
   const unsigned threads = dda::common::ddaCapThreads(dda::common::kDdaLL128WarpThreads, cap.threads);
   const unsigned groups = (comm->nRanks + dda::common::kDdaLL128WarpPeers - 1) / dda::common::kDdaLL128WarpPeers;
-  return (version == 1) && comm->WarpSize == kDdaLL128Warp &&
+  return (version == 1 || version == 2) && comm->WarpSize == kDdaLL128Warp &&
          groups <= threads / kDdaLL128Warp ? version : 0;
 }
 
@@ -282,10 +282,11 @@ static DdaArLL128Kernel<T> ddaArLL128TwoShotKernel(int nRanks, int wire) {
 }
 
 template <typename T, bool SKIP_REDUCE = false>
-static DdaArLL128Kernel<T> ddaArLL128WarpKernel(int nRanks) {
-  return ddaArPickRanksCt(nRanks, [](auto n) -> DdaArLL128Kernel<T> {
+static DdaArLL128Kernel<T> ddaArLL128WarpKernel(int nRanks, int version) {
+  return ddaArPickRanksCt(nRanks, [version](auto n) -> DdaArLL128Kernel<T> {
     constexpr int kN = decltype(n)::value;
-    return &dda::common::ddaAllReduceTwoShotLL128WarpV1<T, kN, SKIP_REDUCE>;
+    return version == 1 ? &dda::common::ddaAllReduceTwoShotLL128WarpV1<T, kN, SKIP_REDUCE>
+                        : &dda::common::ddaAllReduceTwoShotLL128WarpV2<T, kN, SKIP_REDUCE>;
   });
 }
 
@@ -367,7 +368,7 @@ static ncclResult_t ncclAllReduceDdaFabricLL128TwoShotTyped(const void* sendbuff
   const int wire = version ? dda::common::kDdaLL128WireCoop : ddaArLL128Wire(comm, bytes);
   const unsigned groups = (nRanks + dda::common::kDdaLL128WarpPeers - 1) / dda::common::kDdaLL128WarpPeers;
   const unsigned teams = (block.x / kDdaLL128Warp) / groups;
-  const size_t lds = version ? (groups == 1 || skipReduce ? 0 : 2 * (size_t)teams *
+  const size_t lds = version ? (groups == 1 || skipReduce ? 0 : 2 * (size_t)teams * (version == 1 ? 1 : groups) *
                               dda::common::kDdaLL128WireBytesPerSlice) : ddaArLL128SharedBytes(wire, block.x);
 
   INFO(NCCL_COLL,
@@ -378,8 +379,8 @@ static ncclResult_t ncclAllReduceDdaFabricLL128TwoShotTyped(const void* sendbuff
   const dda::common::DdaKernelParams params{comm->abortFlagDev};
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
   const auto kernel = skipReduce
-      ? (version ? ddaArLL128WarpKernel<T, true>(nRanks) : ddaArLL128TwoShotKernel<T, true>(nRanks, wire))
-      : (version ? ddaArLL128WarpKernel<T>(nRanks) : ddaArLL128TwoShotKernel<T>(nRanks, wire));
+      ? (version ? ddaArLL128WarpKernel<T, true>(nRanks, version) : ddaArLL128TwoShotKernel<T, true>(nRanks, wire))
+      : (version ? ddaArLL128WarpKernel<T>(nRanks, version) : ddaArLL128TwoShotKernel<T>(nRanks, wire));
   hipExtLaunchKernelGGL(kernel, grid, block, lds, stream, /*startEvent=*/nullptr,
                         stopEvent, /*flags=*/0, peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
                         shardBytes, comm->rank, nRanks, epochDev, epochLen, slices, bankSize, params);

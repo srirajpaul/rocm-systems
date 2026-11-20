@@ -12,7 +12,7 @@ namespace dda::common {
 constexpr int kDdaLL128WarpPeers = 4;
 constexpr int kDdaLL128WarpThreads = 512;
 
-template <typename T, int NRANKS_CT, bool SKIP_REDUCE>
+template <typename T, int NRANKS_CT, int VERSION, bool SKIP_REDUCE>
 __device__ __forceinline__ void ddaAllReduceTwoShotLL128Warp(
     T* const* __restrict__ peerScratch, T* recvbuff, const T* sendbuff, size_t shardBytes,
     int selfRank, int nRanksRt, uint32_t* epochDev, int epochLen,
@@ -28,7 +28,7 @@ __device__ __forceinline__ void ddaAllReduceTwoShotLL128Warp(
   const bool flagLane = ddaLL128IsFlagLane(lane);
   const size_t start = (size_t)blockIdx.x * teams;
   const size_t stride = (size_t)gridDim.x * teams;
-  const int ldsSlots = teams;
+  const int ldsSlots = VERSION == 1 ? teams : teams * groups;
 
   extern __shared__ uint64_t ddaLL128WarpLds[];
   __shared__ int blockAbort;
@@ -81,9 +81,12 @@ __device__ __forceinline__ void ddaAllReduceTwoShotLL128Warp(
       if (active)
         ddaLL128LoadRegs<int8_t>(sum, input + (size_t)selfRank * shardBytes + byte, bytes, lane, flagLane);
     } else {
-      if (active && group == 0) {
-        for (int r = 0; r < nRanks; ++r) {
-          const int peer = (selfRank + r) % nRanks;
+      if (active && (VERSION == 2 || group == 0)) {
+        const bool serial = VERSION == 1 || groups == 1;
+        const int begin = serial ? 0 : first;
+        const int end = serial ? nRanks : min(first + kDdaLL128WarpPeers, nRanks);
+        for (int r = begin; r < end; ++r) {
+          const int peer = (selfRank + r + (serial ? 0 : 1)) % nRanks;
           uint64_t data[kDdaLL128WordsPerThread] = {};
           if (peer == selfRank) {
             ddaLL128LoadRegs<int8_t>(data, input + (size_t)selfRank * shardBytes + byte, bytes, lane, flagLane);
@@ -93,14 +96,14 @@ __device__ __forceinline__ void ddaAllReduceTwoShotLL128Warp(
           }
 #pragma unroll
           for (int u = 0; u < kDdaLL128WordsPerThread; ++u)
-            sum[u] = r == 0 ? data[u] : ddaLL128AddWord<T>(sum[u], data[u]);
+            sum[u] = r == begin ? data[u] : ddaLL128AddWord<T>(sum[u], data[u]);
         }
       }
 
       if (groups > 1) {
         const size_t window = (size_t)(iteration & 1) * ldsSlots * kDdaLL128WireWordsPerSlice;
-        const int slot = team;
-        if (active && group == 0) {
+        const int slot = VERSION == 1 ? team : warp;
+        if (active && (VERSION == 2 || group == 0)) {
 #pragma unroll
           for (int u = 0; u < kDdaLL128WordsPerThread; ++u)
             ddaLL128WarpLds[window + (size_t)slot * kDdaLL128WireWordsPerSlice + u * kDdaLL128Warp + lane] = sum[u];
@@ -110,9 +113,13 @@ __device__ __forceinline__ void ddaAllReduceTwoShotLL128Warp(
         if (active) {
 #pragma unroll
           for (int u = 0; u < kDdaLL128WordsPerThread; ++u) {
-            const size_t index = window + (size_t)team * kDdaLL128WireWordsPerSlice
+            const size_t index = window + (size_t)(VERSION == 1 ? team : team * groups) * kDdaLL128WireWordsPerSlice
                                  + u * kDdaLL128Warp + lane;
             sum[u] = ddaLL128WarpLds[index];
+            if constexpr (VERSION == 2) {
+              for (int g = 1; g < groups; ++g)
+                sum[u] = ddaLL128AddWord<T>(sum[u], ddaLL128WarpLds[index + (size_t)g * kDdaLL128WireWordsPerSlice]);
+            }
           }
         }
       }
@@ -167,7 +174,17 @@ __global__ void ddaAllReduceTwoShotLL128WarpV1(
     T* const* __restrict__ peerScratch, T* recvbuff, const T* sendbuff, size_t shardBytes,
     int selfRank, int nRanksRt, uint32_t* epochDev, int epochLen,
     size_t slicesTotal, size_t bankSize, DdaKernelParams params) {
-  ddaAllReduceTwoShotLL128Warp<T, NRANKS_CT, SKIP_REDUCE>(peerScratch, recvbuff, sendbuff, shardBytes,
+  ddaAllReduceTwoShotLL128Warp<T, NRANKS_CT, 1, SKIP_REDUCE>(peerScratch, recvbuff, sendbuff, shardBytes,
+      selfRank, nRanksRt, epochDev, epochLen, slicesTotal, bankSize, params);
+}
+
+template <typename T, int NRANKS_CT, bool SKIP_REDUCE = false>
+__launch_bounds__(kDdaLL128WarpThreads)
+__global__ void ddaAllReduceTwoShotLL128WarpV2(
+    T* const* __restrict__ peerScratch, T* recvbuff, const T* sendbuff, size_t shardBytes,
+    int selfRank, int nRanksRt, uint32_t* epochDev, int epochLen,
+    size_t slicesTotal, size_t bankSize, DdaKernelParams params) {
+  ddaAllReduceTwoShotLL128Warp<T, NRANKS_CT, 2, SKIP_REDUCE>(peerScratch, recvbuff, sendbuff, shardBytes,
       selfRank, nRanksRt, epochDev, epochLen, slicesTotal, bankSize, params);
 }
 
