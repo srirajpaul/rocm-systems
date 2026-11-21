@@ -311,26 +311,35 @@ __launch_bounds__(512)
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
 }
 
-// Scale-in by loads, scale-up by stores. Rank r = pkg * S + tile (S = scaleIn); its scratch slots are:
-//   slot g * S + t, t != tile: this rank's staged shard g * S + t, which package peer t loads.
+// Scale-in by loads (or, with PUSH_IN, stores), scale-up by stores. Rank r = pkg * S + tile (S = scaleIn); its
+// scratch slots, from element scratchOff of every rank's buffer, are:
+//   slot g * S + t, t != tile: shard g * S + t of this rank, staged for package peer t to load; with PUSH_IN, shard
+//                              g * S + tile of package peer t, stored there by that peer.
 //   slot g * S + tile, g != pkg: package g's partial of shard r, stored by rank g * S + tile.
-// The slot sets are disjoint, so a partial can land while the package peer still loads the staged shards.
+// The slot sets are disjoint, so partials can land while the scale-in slots are still in use.
 //
-//   Stage:    copy the shards of the other tiles from sendbuff into scratch. Sync the package and this tile's ranks
-//             in one round: the package peers' staged shards are then readable, and every rank this one stores into
-//             is past its previous collective, which may still use the slots (the LL tiers have no closing barrier).
-//   Scale-in: for every shard of this tile, add the package peers' staged copies to sendbuff. Keep the own shard's
-//             partial in recvbuff; store the others into their owners' scratch. Sync this tile's ranks.
+//   Stage:    copy the shards of the other tiles from sendbuff into scratch (PUSH_IN: store them into the package
+//             peers' scratch instead). Sync the package; without PRIVATE also this tile's ranks in the same round, so
+//             every rank this one stores into is past its previous collective (the LL tiers have no closing barrier
+//             and share the scratch).
+//   Scale-in: for every shard of this tile, add the package peers' copies to sendbuff. Keep the own shard's partial
+//             in recvbuff; store the others into their owners' scratch. Sync this tile's ranks.
 //   Scale-up: add the partials of the other packages from this rank's scratch to recvbuff.
-//   End:      sync the comm, so no rank reuses scratch a peer still loads or stores into.
-template <typename T, int SCALE_IN_CT, int NGROUPS_CT>
+//   End:      without PRIVATE, sync the comm, so no rank reuses scratch a peer still loads or stores into.
+//
+// PRIVATE runs on the private region of RCCL_DDA_RS_HIER_PRIVATE, whose halves alternate per launch and which no
+// other collective uses: launch n + 2 touches launch n's half only after the writer has passed launch n + 1's syncs
+// with the receiver, so the receiver is done with it, and no closing sync or wider first sync is needed.
+template <typename T, int SCALE_IN_CT, int NGROUPS_CT, bool PRIVATE, bool PUSH_IN>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
-  __global__ void ddaReduceScatterFabricHierPushUp(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff,
-                                                   size_t count, const T* __restrict__ sendbuff, int selfRank,
-                                                   int nRanks, int scaleInRt, FabricGpuBarrier barrier) {
+  __global__
+  void ddaReduceScatterFabricHierPushUp(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
+                                        const T* __restrict__ sendbuff, int selfRank, int nRanks, int scaleInRt,
+                                        size_t scratchOff, FabricGpuBarrier barrier) {
   static_assert(is_supported_type_v<T>, "dda: unsupported element type");
+  static_assert(PRIVATE || !PUSH_IN, "push-in stores into the package peers before any sync: needs the private region");
   const int scaleIn = (SCALE_IN_CT > 0) ? SCALE_IN_CT : scaleInRt;
   const int nGroups = (NGROUPS_CT > 0) ? NGROUPS_CT : nRanks / scaleIn;
   constexpr int kScaleInUnroll = (SCALE_IN_CT > 0) ? SCALE_IN_CT : 2;
@@ -343,21 +352,72 @@ __launch_bounds__(512)
   const size_t idxStart = (static_cast<size_t>(blockDim.x) * blockIdx.x + threadIdx.x) * countPerThread;
   const size_t idxStride = static_cast<size_t>(gridDim.x) * blockDim.x * countPerThread;
 
-  T* const self = ipcbuffs[selfRank];
+  T* const self = ipcbuffs[selfRank] + scratchOff;
+  auto slot = [&](int g, int t, size_t idx) { return static_cast<size_t>(g * scaleIn + t) * count + idx; };
 
-  for (int g = 0; g < nGroups; ++g) {
+  if constexpr (PUSH_IN) {
+    if constexpr (SCALE_IN_CT > 0 && NGROUPS_CT > 0) {
+      for (size_t idx = idxStart; idx < count; idx += idxStride) {
+        uint4 v[NGROUPS_CT][SCALE_IN_CT];
+#pragma unroll
+        for (int g = 0; g < NGROUPS_CT; ++g) {
+#pragma unroll
+          for (int t = 0; t < SCALE_IN_CT; ++t) {
+            if (t != tile) {
+              v[g][t] = reinterpret_cast<const uint4*>(&sendbuff[slot(g, t, idx)])[0];
+            }
+          }
+        }
+#pragma unroll
+        for (int g = 0; g < NGROUPS_CT; ++g) {
+#pragma unroll
+          for (int t = 0; t < SCALE_IN_CT; ++t) {
+            if (t != tile) {
+              *reinterpret_cast<uint4*>(&ipcbuffs[pkgFirst + t][scratchOff + slot(g, tile, idx)]) = v[g][t];
+            }
+          }
+        }
+      }
+    } else {
+      for (size_t idx = idxStart; idx < count; idx += idxStride) {
+        for (int g = 0; g < nGroups; ++g) {
+          for (int t = 0; t < scaleIn; ++t) {
+            if (t != tile) {
+              *reinterpret_cast<uint4*>(&ipcbuffs[pkgFirst + t][scratchOff + slot(g, tile, idx)]) =
+                reinterpret_cast<const uint4*>(&sendbuff[slot(g, t, idx)])[0];
+            }
+          }
+        }
+      }
+    }
+  } else {
+    for (int g = 0; g < nGroups; ++g) {
 #pragma unroll kScaleInUnroll
-    for (int t = 0; t < scaleIn; ++t) {
-      if (t != tile) {
-        const size_t off = static_cast<size_t>(g * scaleIn + t) * count;
-        copyFromSrcToDest<T>(sendbuff + off, self + off, idxStart, count, idxStride);
+      for (int t = 0; t < scaleIn; ++t) {
+        if (t != tile) {
+          const size_t off = static_cast<size_t>(g * scaleIn + t) * count;
+          copyFromSrcToDest<T>(sendbuff + off, self + off, idxStart, count, idxStride);
+        }
       }
     }
   }
-  barrier.syncPeerSetOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>([&](int r) {
-    return r / scaleIn == pkg || r % scaleIn == tile;
-  });
+  if constexpr (PRIVATE) {
+    barrier.syncGroupOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(pkgFirst, 1,
+                                                                                                        scaleIn);
+  } else {
+    barrier.syncPeerSetOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>([&](int r) {
+      return r / scaleIn == pkg || r % scaleIn == tile;
+    });
+  }
 
+  // Package peer t's copy of this tile's shard g * S + tile: in its scratch (staged) or in this rank's (pushed).
+  auto loadPeerCopy = [&](int g, int t, size_t idx) {
+    if constexpr (PUSH_IN) {
+      return ddaHierLoadPushed(&self[slot(g, t, idx)]);
+    } else {
+      return reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][scratchOff + slot(g, tile, idx)])[0];
+    }
+  };
   auto ownerOf = [&](int k) {
     // Start each rank on a different owner, so this tile's ranks do not all store into one package at once.
     const int g = pkg + k;
@@ -368,7 +428,8 @@ __launch_bounds__(512)
       // recvbuff may alias shard selfRank of sendbuff, which this thread has already read at idx.
       *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
     } else {
-      *reinterpret_cast<uint4*>(&ipcbuffs[g * scaleIn + tile][static_cast<size_t>(selfRank) * count + idx]) = sum;
+      *reinterpret_cast<uint4*>(
+        &ipcbuffs[g * scaleIn + tile][scratchOff + static_cast<size_t>(selfRank) * count + idx]) = sum;
     }
   };
   if constexpr (SCALE_IN_CT > 0 && NGROUPS_CT > 0) {
@@ -378,12 +439,12 @@ __launch_bounds__(512)
       uint4 peer[NGROUPS_CT][SCALE_IN_CT];
 #pragma unroll
       for (int k = 0; k < NGROUPS_CT; ++k) {
-        const size_t off = static_cast<size_t>(ownerOf(k) * SCALE_IN_CT + tile) * count + idx;
-        sum[k] = reinterpret_cast<const uint4*>(&sendbuff[off])[0];
+        const int g = ownerOf(k);
+        sum[k] = reinterpret_cast<const uint4*>(&sendbuff[slot(g, tile, idx)])[0];
 #pragma unroll
         for (int t = 0; t < SCALE_IN_CT; ++t) {
           if (t != tile) {
-            peer[k][t] = reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][off])[0];
+            peer[k][t] = loadPeerCopy(g, t, idx);
           }
         }
       }
@@ -403,12 +464,11 @@ __launch_bounds__(512)
 #pragma unroll kGroupUnroll
       for (int k = 0; k < nGroups; ++k) {
         const int g = ownerOf(k);
-        const size_t off = static_cast<size_t>(g * scaleIn + tile) * count + idx;
-        uint4 sum = reinterpret_cast<const uint4*>(&sendbuff[off])[0];
+        uint4 sum = reinterpret_cast<const uint4*>(&sendbuff[slot(g, tile, idx)])[0];
 #pragma unroll kScaleInUnroll
         for (int t = 0; t < scaleIn; ++t) {
           if (t != tile) {
-            sum = vecElementAdd<T>(sum, reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][off])[0]);
+            sum = vecElementAdd<T>(sum, loadPeerCopy(g, t, idx));
           }
         }
         storePartial(g, idx, sum);
@@ -422,14 +482,14 @@ __launch_bounds__(512)
     uint4 sum = *reinterpret_cast<const uint4*>(&recvbuff[idx]);
 #pragma unroll kGroupUnroll
     for (int k = 1; k < nGroups; ++k) {
-      int g = pkg + k;
-      if (g >= nGroups) g -= nGroups;
-      sum = vecElementAdd<T>(sum, ddaHierLoadPushed(&self[static_cast<size_t>(g * scaleIn + tile) * count + idx]));
+      sum = vecElementAdd<T>(sum, ddaHierLoadPushed(&self[slot(ownerOf(k), tile, idx)]));
     }
     *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
   }
 
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
+  if constexpr (!PRIVATE) {
+    barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
+  }
 }
 
 // Pipelined form of ddaReduceScatterFabricHier, with the same scratch layout. A block's rows
