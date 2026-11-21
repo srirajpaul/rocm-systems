@@ -31,6 +31,7 @@ RCCL_PARAM(DdaSimpleArFused, "DDA_SIMPLE_AR_FUSED", 1);
 RCCL_PARAM(DdaSimpleArBatch, "DDA_SIMPLE_AR_BATCH", 1);
 RCCL_PARAM(DdaSimpleArThreads, "DDA_SIMPLE_AR_THREADS", 0);
 RCCL_PARAM(DdaSimpleArBlocks, "DDA_SIMPLE_AR_BLOCKS", 0);
+RCCL_PARAM(DdaSimpleArPeerGroup, "DDA_SIMPLE_AR_PEER_GROUP", 0);
 
 namespace {
 
@@ -50,6 +51,16 @@ static int ddaSimpleArBatch() {
   return value == 2 || value == 4 ? static_cast<int>(value) : 1;
 }
 
+
+// Four peers per warp is the initial grouped-reduction experiment. Other
+// requests, wider vector batches, and incomplete warp teams retain the tuned
+// kernel. Check the final block size after applying the caller's launch cap.
+static int ddaSimpleArPeerGroup(int nRanks, int batch, unsigned threads) {
+  if (rcclParamDdaSimpleArPeerGroup() != 4 || batch != 1 ||
+      (nRanks != 4 && nRanks != 8 && nRanks != 16)) return 0;
+  const unsigned teamThreads = (nRanks / 4) * 32;
+  return threads >= teamThreads && threads % teamThreads == 0 ? 4 : 0;
+}
 
 // Single source of the launch geometry: grid/block for `count` elements of
 // `typeSize` bytes, capped at rcclDdaFabricVmmBlocks() (at most the init-time block count) and at `cap`.
@@ -116,8 +127,13 @@ static ncclResult_t ncclAllReduceDdaFabricTyped(const void* sendbuff, void* recv
   if (treeOk && ddaSimpleArOpt(comm, sizeBytes)) {
     const bool fused = rcclParamDdaSimpleArFused() != 0;
     const int batch = ddaSimpleArBatch();
-    INFO(NCCL_COLL, "DDA Simple optimized: ranks=%d bytes=%zu fused=%d batch=%d grid=%u block=%u",
-         nRanks, sizeBytes, static_cast<int>(fused), batch, grid.x, block.x);
+    const int peerGroup = ddaSimpleArPeerGroup(nRanks, batch, block.x);
+    const int groups = peerGroup ? nRanks / peerGroup : 1;
+    // Only nonleader partials occupy LDS; alternate two windows for reuse.
+    const size_t sharedBytes = groups > 1 ?
+        2 * size_t(block.x / (groups * 32)) * (groups - 1) * 32 * sizeof(uint4) : 0;
+    INFO(NCCL_COLL, "DDA Simple optimized: ranks=%d bytes=%zu fused=%d batch=%d grid=%u block=%u peerGroup=%d sharedBytes=%zu",
+         nRanks, sizeBytes, static_cast<int>(fused), batch, grid.x, block.x, peerGroup, sharedBytes);
     if (!fused)
       CUDACHECK(cudaMemcpyAsync(comm->ddaScratch, sendbuff, sizeBytes, cudaMemcpyDeviceToDevice, stream));
 #define LAUNCH_SIMPLE_OPT(N, B, F) \
@@ -130,11 +146,27 @@ static ncclResult_t ncclAllReduceDdaFabricTyped(const void* sendbuff, void* recv
     do { if (batch == 4) LAUNCH_SIMPLE_OPT_F(N, 4); \
          else if (batch == 2) LAUNCH_SIMPLE_OPT_F(N, 2); \
          else LAUNCH_SIMPLE_OPT_F(N, 1); } while (0)
-    switch (nRanks) {
-    case 4: LAUNCH_SIMPLE_OPT_B(4); break;
-    case 8: LAUNCH_SIMPLE_OPT_B(8); break;
-    default: LAUNCH_SIMPLE_OPT_B(0); break;
+#define LAUNCH_SIMPLE_PEER_GROUP(N, F) \
+    hipExtLaunchKernelGGL((dda::common::ddaAllReduceSimplePeerGroups<T, N, F>), grid, block, sharedBytes, stream, \
+        nullptr, stopEvent, 0, d_ipcbuffs, static_cast<T*>(recvbuff), sendbuff == recvbuff ? nullptr : static_cast<const T*>(sendbuff), \
+        count, comm->rank, nRanks, barrierHost)
+#define LAUNCH_SIMPLE_PEER_GROUP_F(N) \
+    do { if (fused) LAUNCH_SIMPLE_PEER_GROUP(N, true); else LAUNCH_SIMPLE_PEER_GROUP(N, false); } while (0)
+    if (peerGroup) {
+      switch (nRanks) {
+      case 4: LAUNCH_SIMPLE_PEER_GROUP_F(4); break;
+      case 8: LAUNCH_SIMPLE_PEER_GROUP_F(8); break;
+      case 16: LAUNCH_SIMPLE_PEER_GROUP_F(16); break;
+      }
+    } else {
+      switch (nRanks) {
+      case 4: LAUNCH_SIMPLE_OPT_B(4); break;
+      case 8: LAUNCH_SIMPLE_OPT_B(8); break;
+      default: LAUNCH_SIMPLE_OPT_B(0); break;
+      }
     }
+#undef LAUNCH_SIMPLE_PEER_GROUP_F
+#undef LAUNCH_SIMPLE_PEER_GROUP
 #undef LAUNCH_SIMPLE_OPT_B
 #undef LAUNCH_SIMPLE_OPT_F
 #undef LAUNCH_SIMPLE_OPT
