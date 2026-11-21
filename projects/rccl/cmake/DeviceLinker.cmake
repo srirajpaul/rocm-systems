@@ -762,8 +762,13 @@ foreach(_coll all_reduce reduce_scatter all_gather alltoall)
 endforeach()
 foreach(_coll all_reduce reduce_scatter all_gather alltoall)
   foreach(_proto "" _ll _ll128)
+    set(_dda_simple_ar_deps "")
+    if(_coll STREQUAL "all_reduce" AND _proto STREQUAL "")
+      list(APPEND _dda_simple_ar_deps DEPFILE_TRACKING EXTRA_DEPENDS
+        ${_dda_dir}/all_reduce/all_reduce_dda_simple_opt.h)
+    endif()
     dl_add_fat_object(dda_${_coll}_fabric${_proto}
-      ${_dda_dir}/${_coll}/dda_${_coll}_fabric${_proto}.cu.cpp SUPPRESS_WARNINGS)
+      ${_dda_dir}/${_coll}/dda_${_coll}_fabric${_proto}.cu.cpp SUPPRESS_WARNINGS ${_dda_simple_ar_deps})
   endforeach()
 endforeach()
 
