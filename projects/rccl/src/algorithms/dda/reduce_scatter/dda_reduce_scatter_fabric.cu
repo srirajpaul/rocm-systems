@@ -23,7 +23,8 @@
 #include <cstdint>
 #include <algorithm>
 
-// Zero selects the tuned eight-rank width (1024), or 512 for the generic path.
+// Zero selects 1024 threads for fused staging, or 512 for small sixteen-rank
+// messages and the generic path.
 // Overrides must agree across ranks; block count cannot exceed allocated flags.
 RCCL_PARAM(DdaRsHierThreads, "DDA_RS_HIER_THREADS", 0);
 RCCL_PARAM(DdaRsHierBlocks, "DDA_RS_HIER_BLOCKS", 0);
@@ -62,14 +63,17 @@ static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* 
   void* peerPtrsDev = comm->ddaPeerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
 
-  const bool stageInKernel = nRanks == 8 && barrierState->rsHierarchy.nScaleUp == 4;
+  const bool stageEightRanks = nRanks == 8 && barrierState->rsHierarchy.nScaleUp == 4;
+  const bool stageSixteenRanks = nRanks == 16 && barrierState->rsHierarchy.nScaleUp == 8;
+  const bool stageInKernel = stageEightRanks || stageSixteenRanks;
   if (!stageInKernel) {
     CUDACHECK(cudaMemcpyAsync(comm->ddaScratch, sendbuff, totalCount * sizeof(T), cudaMemcpyDeviceToDevice, stream));
   }
 
   if (barrierState->rsHierarchy.nScaleUp != 0) {
+    const int tunedThreads = stageSixteenRanks && totalCount * sizeof(T) <= (size_t(8) << 20) ? 512 : 1024;
     const int64_t requestedThreads = rcclParamDdaRsHierThreads() > 0
-                                       ? rcclParamDdaRsHierThreads() : (stageInKernel ? 1024 : 512);
+                                       ? rcclParamDdaRsHierThreads() : (stageInKernel ? tunedThreads : 512);
     const unsigned threads = std::clamp<int64_t>(requestedThreads, 64, 1024) / 64 * 64;
     const size_t vectors = recvcount * sizeof(T) / 16;
     const unsigned cap = rcclParamDdaRsHierBlocks() > 0
@@ -85,8 +89,13 @@ static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* 
     INFO(NCCL_COLL, "DDA fabric ReduceScatter: launching kernel: hierarchical scale-in=2 scaleup=%d "
                    "nRanks=%d recvcount=%zu grid=%u block=%u",
          barrierState->rsHierarchy.nScaleUp, nRanks, recvcount, grid.x, block.x);
-    if (stageInKernel) {
+    if (stageEightRanks) {
       hipExtLaunchKernelGGL((dda::common::ddaReduceScatterFabricHierarchical<T, 4, true>), grid, block, 0, stream,
+                         /*startEvent=*/nullptr, rcclTakeAddonStopEvent(comm), /*flags=*/0, d_ipcbuffs,
+                         static_cast<T*>(recvbuff), recvcount, comm->rank, barrierState->rsHierarchy, barrierHost,
+                         static_cast<const T*>(sendbuff));
+    } else if (stageSixteenRanks) {
+      hipExtLaunchKernelGGL((dda::common::ddaReduceScatterFabricHierarchical<T, 8, true>), grid, block, 0, stream,
                          /*startEvent=*/nullptr, rcclTakeAddonStopEvent(comm), /*flags=*/0, d_ipcbuffs,
                          static_cast<T*>(recvbuff), recvcount, comm->rank, barrierState->rsHierarchy, barrierHost,
                          static_cast<const T*>(sendbuff));

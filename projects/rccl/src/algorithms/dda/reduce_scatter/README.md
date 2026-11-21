@@ -1,9 +1,9 @@
 # DPX hierarchical DDA ReduceScatter
 
 `RCCL_DDA_RS_HIERARCHICAL=1` enables an experimental hierarchy inside DDA's
-fabric/VMM (SIMPLE) ReduceScatter path. The default is `0`. Single-node tuning
-on eight gfx1250-strict DPX ranks improves large messages, while small messages
-still favor flat DDA. This switch does not
+fabric/VMM (SIMPLE) ReduceScatter path. The default is `0`. Eight- and sixteen-rank
+gfx1250-strict DPX communicators use specialized kernels with fused staging.
+Small messages can still favor flat DDA. This switch does not
 change the existing DDA size thresholds or the LL/LL128 selection priority.
 Set it consistently on all communicator ranks before communicator creation.
 
@@ -33,8 +33,8 @@ shards; each odd tile computes pair sums for odd destination shards. Stage 2
 reduces those partial sums within `(0,2,4,6)` or `(1,3,5,7)` and writes each rank's
 output shard. Reordered communicators use the actual destination rank offsets.
 
-For eight ranks, staging is fused into the hierarchical kernel: each tile copies
-only the four input shards needed by its sibling. It reads its own contributions
+For eight or sixteen ranks, staging is fused into the hierarchical kernel: each
+tile copies only the four or eight input shards needed by its sibling. It reads its own contributions
 directly from the send buffer and overwrites only its own rail's scratch shards
 with pair sums. This removes the separate full-input copy and retains the existing
 scratch footprint. Other eligible rank counts retain the stream-ordered copy.
@@ -47,8 +47,10 @@ The final barrier protects scratch reuse by subsequent collectives. Graph replay
 uses the existing device barrier protocol. Floating-point reduction order differs
 from flat DDA, so bitwise equality with the flat algorithm is not guaranteed.
 
-The eight-rank kernel specializes the four-peer scaleup loop, defaults to 1024
-threads per block, and balances short grid-stride loops to avoid idle blocks.
+The eight- and sixteen-rank kernels specialize the four- and eight-peer scaleup
+loops, issuing all peer loads before their dependent arithmetic. Both default to
+1024 threads per block, except sixteen-rank messages with total input at most
+8 MiB per rank use 512 threads. Both balance short grid-stride loops to avoid idle blocks.
 Large messages retain the full configured block cap. Small shards reduce the
 thread count automatically. Optional tuning controls, identical on every rank:
 
@@ -59,8 +61,10 @@ thread count automatically. Optional tuning controls, identical on every rank:
   positive override caps the hierarchical grid without enlarging barrier storage.
 
 These settings do not alter the flat kernel or the global DDA thresholds. The
-eight-rank tuning was measured on node 02; other nodes and multi-node performance
-have not been evaluated in this tuning pass. Build RCCL with
+eight-rank tuning was measured on node 02; the sixteen-rank extension was measured
+on nodes 13 and 14, with eight ranks per node. It retains the existing scale-in
+reduction followed by scaleup reads, scratch layout, and release/acquire barriers.
+Build RCCL with
 `bash install.sh --amdgpu_targets gfx1250-strict`. On this machine, `-l` detects
 `gfx1250` and produces a library that fails to launch with "device kernel image
 is invalid". Build rccl-tests for `gfx1250-strict` as well so its verification

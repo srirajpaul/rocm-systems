@@ -14,8 +14,8 @@
  *                      instantiation covers any other clique size up to
  *                      kDdaMaxNranks.
  *
- * The flat path copies sendbuff to scratch before launch. The eight-rank
- * hierarchy stages only the sibling's shards inside its kernel.
+ * The flat path copies sendbuff to scratch before launch. The eight- and
+ * sixteen-rank hierarchies stage only the sibling's shards inside the kernel.
  * See LICENSE.txt for license information.
  ************************************************************************/
 
@@ -60,13 +60,17 @@ __global__ void ddaReduceScatterFabricHierarchical(
   const size_t start = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * elements;
   const size_t stride = size_t(gridDim.x) * blockDim.x * elements;
   if constexpr (Stage) {
-    static_assert(ScaleUp == 4, "In-kernel staging is specialized for eight ranks");
-    // Publish only the four shards our sibling needs. Our own contributions
+    static_assert(ScaleUp == 4 || ScaleUp == 8, "In-kernel staging requires eight or sixteen ranks");
+    // Publish only the opposite rail's shards that our sibling needs. Our own contributions
     // are read directly from sendbuff during the pair reduction below.
 #pragma unroll
-    for (int d = 0; d < 8; ++d) {
+    for (int d = 0; d < 2 * ScaleUp; ++d) {
       if (d == hierarchy.scaleUpRanks[0] || d == hierarchy.scaleUpRanks[1] ||
           d == hierarchy.scaleUpRanks[2] || d == hierarchy.scaleUpRanks[3]) continue;
+      if constexpr (ScaleUp == 8) {
+        if (d == hierarchy.scaleUpRanks[4] || d == hierarchy.scaleUpRanks[5] ||
+            d == hierarchy.scaleUpRanks[6] || d == hierarchy.scaleUpRanks[7]) continue;
+      }
       const size_t shard = size_t(d) * count;
       for (size_t i = start; i < count; i += stride) {
         const uint4 value = *reinterpret_cast<const uint4*>(sendbuff + shard + i);
@@ -102,16 +106,16 @@ __global__ void ddaReduceScatterFabricHierarchical(
   for (size_t i = start; i < count; i += stride) {
     const size_t offset = size_t(self) * count + i;
     uint4 sum{0, 0, 0, 0};
-    if constexpr (ScaleUp == 4) {
-      // Issue all four peer loads before their dependent arithmetic.
-      uint4 values[4];
+    if constexpr (ScaleUp == 4 || ScaleUp == 8) {
+      // Issue every specialized peer load before its dependent arithmetic.
+      uint4 values[ScaleUp];
 #pragma unroll
-      for (int p = 0; p < 4; ++p) {
+      for (int p = 0; p < ScaleUp; ++p) {
         ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(scratch[hierarchy.scaleUpRanks[p]] + offset),
                          values[p].x, values[p].y, values[p].z, values[p].w);
       }
 #pragma unroll
-      for (int p = 0; p < 4; ++p) sum = vecElementAdd<T>(sum, values[p]);
+      for (int p = 0; p < ScaleUp; ++p) sum = vecElementAdd<T>(sum, values[p]);
     } else {
 #pragma unroll
       for (int p = 0; p < nScaleUp; ++p) {
