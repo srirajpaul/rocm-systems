@@ -62,6 +62,31 @@
 
 namespace dda::common {
 
+// Loads per thread in flight in ddaHierCopy.
+constexpr int kDdaHierCopyUnroll = 4;
+
+// copyFromSrcToDest with kDdaHierCopyUnroll lines of one shard loaded before any is stored. One line at a time keeps a
+// single 16 B load per thread in flight, so the staging copy runs at memory latency rather than bandwidth.
+template <typename T>
+__device__ __forceinline__ void ddaHierCopy(const T* __restrict__ src, T* __restrict__ dst, size_t idxStart,
+                                            size_t idxEnd, size_t idxStride) {
+  size_t idx = idxStart;
+  for (; idx + (kDdaHierCopyUnroll - 1) * idxStride < idxEnd; idx += kDdaHierCopyUnroll * idxStride) {
+    uint4 v[kDdaHierCopyUnroll];
+#pragma unroll
+    for (int u = 0; u < kDdaHierCopyUnroll; ++u) {
+      v[u] = reinterpret_cast<const uint4*>(&src[idx + u * idxStride])[0];
+    }
+#pragma unroll
+    for (int u = 0; u < kDdaHierCopyUnroll; ++u) {
+      *reinterpret_cast<uint4*>(&dst[idx + u * idxStride]) = v[u];
+    }
+  }
+  for (; idx < idxEnd; idx += idxStride) {
+    *reinterpret_cast<uint4*>(&dst[idx]) = reinterpret_cast<const uint4*>(&src[idx])[0];
+  }
+}
+
 template <typename T, int SCALE_IN_CT, int NGROUPS_CT, bool EPOCH_FLAGS, bool END_BARRIER>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
@@ -89,7 +114,7 @@ __launch_bounds__(512)
     for (int t = 0; t < scaleIn; ++t) {
       if (t != tile) {
         const size_t off = static_cast<size_t>(g * scaleIn + t) * count;
-        copyFromSrcToDest<T>(sendbuff + off, self + off, idxStart, count, idxStride);
+        ddaHierCopy<T>(sendbuff + off, self + off, idxStart, count, idxStride);
       }
     }
   }
@@ -330,16 +355,22 @@ __launch_bounds__(512)
 // PRIVATE runs on the private region of RCCL_DDA_RS_HIER_PRIVATE, whose halves alternate per launch and which no
 // other collective uses: launch n + 2 touches launch n's half only after the writer has passed launch n + 1's syncs
 // with the receiver, so the receiver is done with it, and no closing sync or wider first sync is needed.
-template <typename T, int SCALE_IN_CT, int NGROUPS_CT, bool PRIVATE, bool PUSH_IN>
+//
+// FAR_PULL stores a partial only for owners on this rank's host (hostSize consecutive ranks); the partial for an
+// owner on another host stays in this rank's slot of that owner's shard (g * S + tile), and the owner loads it in
+// scale-up. In this rank's scratch, near packages' slots then hold partials stored here and far packages' slots this
+// rank's partials for them, so the two never share a slot.
+template <typename T, int SCALE_IN_CT, int NGROUPS_CT, bool PRIVATE, bool PUSH_IN, bool FAR_PULL>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
   __global__
   void ddaReduceScatterFabricHierPushUp(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                         const T* __restrict__ sendbuff, int selfRank, int nRanks, int scaleInRt,
-                                        size_t scratchOff, FabricGpuBarrier barrier) {
+                                        size_t scratchOff, int hostSize, FabricGpuBarrier barrier) {
   static_assert(is_supported_type_v<T>, "dda: unsupported element type");
   static_assert(PRIVATE || !PUSH_IN, "push-in stores into the package peers before any sync: needs the private region");
+  static_assert(PRIVATE || !FAR_PULL, "far owners load after the last sync: needs the private region");
   const int scaleIn = (SCALE_IN_CT > 0) ? SCALE_IN_CT : scaleInRt;
   const int nGroups = (NGROUPS_CT > 0) ? NGROUPS_CT : nRanks / scaleIn;
   constexpr int kScaleInUnroll = (SCALE_IN_CT > 0) ? SCALE_IN_CT : 2;
@@ -396,7 +427,7 @@ __launch_bounds__(512)
       for (int t = 0; t < scaleIn; ++t) {
         if (t != tile) {
           const size_t off = static_cast<size_t>(g * scaleIn + t) * count;
-          copyFromSrcToDest<T>(sendbuff + off, self + off, idxStart, count, idxStride);
+          ddaHierCopy<T>(sendbuff + off, self + off, idxStart, count, idxStride);
         }
       }
     }
@@ -423,15 +454,33 @@ __launch_bounds__(512)
     const int g = pkg + k;
     return g >= nGroups ? g - nGroups : g;
   };
+  auto isNear = [&](int g) { return !FAR_PULL || (g * scaleIn) / hostSize == (pkg * scaleIn) / hostSize; };
   auto storePartial = [&](int g, size_t idx, const uint4& sum) {
     if (g == pkg) {
       // recvbuff may alias shard selfRank of sendbuff, which this thread has already read at idx.
       *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
+    } else if (!isNear(g)) {
+      *reinterpret_cast<uint4*>(&self[slot(g, tile, idx)]) = sum;
     } else {
       *reinterpret_cast<uint4*>(
         &ipcbuffs[g * scaleIn + tile][scratchOff + static_cast<size_t>(selfRank) * count + idx]) = sum;
     }
   };
+  // Per owner, fixed for the launch: where this rank's partial goes (recvbuff for its own shard, the owner's scratch
+  // when near, this rank's scratch when far) and where the owner's partial for this rank comes from in scale-up.
+  // Tables keep the near/far choice out of the row loops, where a branch per store stops the loads from batching.
+  [[maybe_unused]] T* dstOf[NGROUPS_CT > 0 ? NGROUPS_CT : 1];
+  [[maybe_unused]] const T* srcOf[NGROUPS_CT > 0 ? NGROUPS_CT : 1];
+  if constexpr (FAR_PULL && SCALE_IN_CT > 0 && NGROUPS_CT > 0) {
+#pragma unroll
+    for (int k = 0; k < NGROUPS_CT; ++k) {
+      const int g = ownerOf(k);
+      T* const owner = ipcbuffs[g * scaleIn + tile] + scratchOff;
+      dstOf[k] =
+        g == pkg ? recvbuff : (isNear(g) ? owner + static_cast<size_t>(selfRank) * count : self + slot(g, tile, 0));
+      srcOf[k] = isNear(g) ? self + slot(g, tile, 0) : owner + slot(pkg, tile, 0);
+    }
+  }
   if constexpr (SCALE_IN_CT > 0 && NGROUPS_CT > 0) {
     // A row loads every input before its first store, as in ddaReduceScatterFabricHier's scale-in.
     for (size_t idx = idxStart; idx < count; idx += idxStride) {
@@ -456,7 +505,13 @@ __launch_bounds__(512)
             sum[k] = vecElementAdd<T>(sum[k], peer[k][t]);
           }
         }
-        storePartial(ownerOf(k), idx, sum[k]);
+        if constexpr (FAR_PULL) {
+          // k = 0 is this rank's own shard, whose dstOf is recvbuff: it may alias that shard of sendbuff, which this
+          // thread has already read at idx.
+          *reinterpret_cast<uint4*>(&dstOf[k][idx]) = sum[k];
+        } else {
+          storePartial(ownerOf(k), idx, sum[k]);
+        }
       }
     }
   } else {
@@ -478,13 +533,36 @@ __launch_bounds__(512)
   barrier.syncGroupOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(tile, scaleIn,
                                                                                                       nGroups);
 
-  for (size_t idx = idxStart; idx < count; idx += idxStride) {
-    uint4 sum = *reinterpret_cast<const uint4*>(&recvbuff[idx]);
-#pragma unroll kGroupUnroll
-    for (int k = 1; k < nGroups; ++k) {
-      sum = vecElementAdd<T>(sum, ddaHierLoadPushed(&self[slot(ownerOf(k), tile, idx)]));
+  if constexpr (FAR_PULL && SCALE_IN_CT > 0 && NGROUPS_CT > 0) {
+    for (size_t idx = idxStart; idx < count; idx += idxStride) {
+      uint4 part[NGROUPS_CT];
+#pragma unroll
+      for (int k = 1; k < NGROUPS_CT; ++k) {
+        part[k] = ddaHierLoadPushed(&srcOf[k][idx]);
+      }
+      uint4 sum = *reinterpret_cast<const uint4*>(&recvbuff[idx]);
+#pragma unroll
+      for (int k = 1; k < NGROUPS_CT; ++k) {
+        sum = vecElementAdd<T>(sum, part[k]);
+      }
+      *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
     }
-    *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
+  } else {
+    for (size_t idx = idxStart; idx < count; idx += idxStride) {
+      uint4 sum = *reinterpret_cast<const uint4*>(&recvbuff[idx]);
+#pragma unroll kGroupUnroll
+      for (int k = 1; k < nGroups; ++k) {
+        const int g = ownerOf(k);
+        if (isNear(g)) {
+          sum = vecElementAdd<T>(sum, ddaHierLoadPushed(&self[slot(g, tile, idx)]));
+        } else {
+          const uint4 far =
+            reinterpret_cast<const uint4*>(&ipcbuffs[g * scaleIn + tile][scratchOff + slot(pkg, tile, idx)])[0];
+          sum = vecElementAdd<T>(sum, far);
+        }
+      }
+      *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
+    }
   }
 
   if constexpr (!PRIVATE) {
