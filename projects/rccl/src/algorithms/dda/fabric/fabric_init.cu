@@ -274,7 +274,16 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
   comm->ddaHierRsPrivOffset = privHalf > 0 ? privOffset : 0;
   comm->ddaHierRsPrivHalfBytes = privHalf;
   comm->ddaHierRsPrivCalls = 0;
+  comm->ddaHierRsArriveDev = nullptr;
   if (privHalf > 0) {
+    // 2 * kDdaHierMaxPieces cells; zero, and left zero by every launch.
+    constexpr size_t kArriveCells = 32;
+    if (cudaMalloc(&comm->ddaHierRsArriveDev, kArriveCells * sizeof(uint32_t)) != cudaSuccess ||
+        cudaMemset(comm->ddaHierRsArriveDev, 0, kArriveCells * sizeof(uint32_t)) != cudaSuccess) {
+      (void)cudaGetLastError();
+      if (comm->ddaHierRsArriveDev != nullptr) CUDACHECKIGNORE(cudaFree(comm->ddaHierRsArriveDev));
+      comm->ddaHierRsArriveDev = nullptr;
+    }
     INFO(NCCL_INIT, "ncclDdaFabricCommInit: hierarchical RS private scratch: 2 x %zu bytes at offset %zu", privHalf,
          privOffset);
   }
@@ -332,6 +341,8 @@ ncclResult_t ncclDdaFabricCommFini(ncclComm* comm) {
   comm->ddaHierScaleIn = 0;
   comm->ddaHierRsPrivOffset = 0;
   comm->ddaHierRsPrivHalfBytes = 0;
+  CUDACHECKIGNORE(cudaFree(comm->ddaHierRsArriveDev));
+  comm->ddaHierRsArriveDev = nullptr;
   free(comm->ddaPeerPtrsHost);
   comm->ddaPeerPtrsHost = nullptr;
   // Destroying the fabric handler unmaps/frees the imported peer scratch buffers.

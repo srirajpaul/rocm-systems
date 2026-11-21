@@ -673,4 +673,149 @@ __launch_bounds__(512)
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
 }
 
+// Pieces per block of ddaReduceScatterFabricHierPushUpPipe; its counter buffer holds 2 * kDdaHierMaxPieces cells.
+constexpr int kDdaHierMaxPieces = 16;
+
+// Mode 6 (pull-in/push-up on the private region) synced by rank-level flags (FabricGpuBarrier::rankArrive/rankWait)
+// instead of per-block barriers, and pipelined over pieces. A block's rows are cut into nPieces pieces; step k:
+//   scale-up piece k - 2: wait until every same-tile rank's grid has stored its partials of piece k - 2 here, then
+//                         add them from this rank's scratch to recvbuff.
+//   scale-in piece k - 1: wait until the package peers' grids have staged piece k - 1, then reduce this tile's
+//                         shards, keep the own partial in recvbuff, store the others into their owners, and arrive
+//                         on the partial count (the last block posts the same-tile ranks).
+//   stage piece k:        copy the other tiles' shards into scratch and arrive on the stage count (the last block
+//                         posts the package peers).
+// Waits only ever need an earlier step of a peer, so nothing deadlocks, provided the whole grid is resident. Slot 0
+// carries staging, slot 1 partials; piece p posts epoch + p. With one piece this is mode 6 with rank-level syncs.
+template <typename T, int SCALE_IN_CT, int NGROUPS_CT>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+  __global__ void ddaReduceScatterFabricHierPushUpPipe(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff,
+                                                       size_t count, const T* __restrict__ sendbuff, int selfRank,
+                                                       int nRanks, int scaleInRt, size_t scratchOff, unsigned pieces,
+                                                       uint32_t* counters, FabricGpuBarrier barrier) {
+  static_assert(is_supported_type_v<T>, "dda: unsupported element type");
+  const int scaleIn = (SCALE_IN_CT > 0) ? SCALE_IN_CT : scaleInRt;
+  const int nGroups = (NGROUPS_CT > 0) ? NGROUPS_CT : nRanks / scaleIn;
+  constexpr int kScaleInUnroll = (SCALE_IN_CT > 0) ? SCALE_IN_CT : 2;
+  constexpr int kGroupUnroll = (NGROUPS_CT > 0) ? NGROUPS_CT : 8;
+  const int tile = selfRank % scaleIn;
+  const int pkg = selfRank / scaleIn;
+  const int pkgFirst = selfRank - tile;
+
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const size_t idxStart = (static_cast<size_t>(blockDim.x) * blockIdx.x + threadIdx.x) * countPerThread;
+  const size_t idxStride = static_cast<size_t>(gridDim.x) * blockDim.x * countPerThread;
+
+  // Every rank derives the same piece split: it depends only on count and the launch shape.
+  const size_t nRows = (count + idxStride - 1) / idxStride;
+  const size_t nPiecesWanted = pieces < 1 ? 1 : (pieces > kDdaHierMaxPieces ? kDdaHierMaxPieces : pieces);
+  const size_t perPiece = (nRows + nPiecesWanted - 1) / nPiecesWanted;
+  const size_t nPieces = (nRows + perPiece - 1) / perPiece;
+  auto pieceBegin = [&](size_t p) { return idxStart + p * perPiece * idxStride; };
+  auto pieceEnd = [&](size_t p) {
+    const size_t end = idxStart + (p + 1) * perPiece * idxStride;
+    return end < count ? end : count;
+  };
+
+  T* const self = ipcbuffs[selfRank] + scratchOff;
+  auto slot = [&](int g, int t, size_t idx) { return static_cast<size_t>(g * scaleIn + t) * count + idx; };
+  auto pkgPeer = [&](int i) { return pkgFirst + (tile + 1 + i) % scaleIn; };
+  auto tilePeer = [&](int i) { return ((pkg + 1 + i) % nGroups) * scaleIn + tile; };
+  auto ownerOf = [&](int k) {
+    // Start each rank on a different owner, so this tile's ranks do not all store into one package at once.
+    const int g = pkg + k;
+    return g >= nGroups ? g - nGroups : g;
+  };
+  auto storePartial = [&](int g, size_t idx, const uint4& sum) {
+    if (g == pkg) {
+      // recvbuff may alias shard selfRank of sendbuff, which this thread has already read at idx.
+      *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
+    } else {
+      *reinterpret_cast<uint4*>(
+        &ipcbuffs[g * scaleIn + tile][scratchOff + static_cast<size_t>(selfRank) * count + idx]) = sum;
+    }
+  };
+
+  const FabricGpuBarrier::FlagType epoch = barrier.epochBegin();
+  for (size_t k = 0; k < nPieces + 2; ++k) {
+    if (k >= 2) {
+      const size_t p = k - 2;
+      barrier.rankWait(1, epoch + static_cast<FabricGpuBarrier::FlagType>(p), tilePeer, nGroups - 1);
+      for (size_t idx = pieceBegin(p); idx < pieceEnd(p); idx += idxStride) {
+        uint4 sum = *reinterpret_cast<const uint4*>(&recvbuff[idx]);
+#pragma unroll kGroupUnroll
+        for (int j = 1; j < nGroups; ++j) {
+          sum = vecElementAdd<T>(sum, ddaHierLoadPushed(&self[slot(ownerOf(j), tile, idx)]));
+        }
+        *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
+      }
+    }
+    if (k >= 1 && k <= nPieces) {
+      const size_t p = k - 1;
+      barrier.rankWait(0, epoch + static_cast<FabricGpuBarrier::FlagType>(p), pkgPeer, scaleIn - 1);
+      if constexpr (SCALE_IN_CT > 0 && NGROUPS_CT > 0) {
+        for (size_t idx = pieceBegin(p); idx < pieceEnd(p); idx += idxStride) {
+          uint4 sum[NGROUPS_CT];
+          uint4 peer[NGROUPS_CT][SCALE_IN_CT];
+#pragma unroll
+          for (int j = 0; j < NGROUPS_CT; ++j) {
+            const int g = ownerOf(j);
+            sum[j] = reinterpret_cast<const uint4*>(&sendbuff[slot(g, tile, idx)])[0];
+#pragma unroll
+            for (int t = 0; t < SCALE_IN_CT; ++t) {
+              if (t != tile) {
+                peer[j][t] =
+                  reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][scratchOff + slot(g, tile, idx)])[0];
+              }
+            }
+          }
+#pragma unroll
+          for (int j = 0; j < NGROUPS_CT; ++j) {
+#pragma unroll
+            for (int t = 0; t < SCALE_IN_CT; ++t) {
+              if (t != tile) {
+                sum[j] = vecElementAdd<T>(sum[j], peer[j][t]);
+              }
+            }
+            storePartial(ownerOf(j), idx, sum[j]);
+          }
+        }
+      } else {
+        for (size_t idx = pieceBegin(p); idx < pieceEnd(p); idx += idxStride) {
+#pragma unroll kGroupUnroll
+          for (int j = 0; j < nGroups; ++j) {
+            const int g = ownerOf(j);
+            uint4 sum = reinterpret_cast<const uint4*>(&sendbuff[slot(g, tile, idx)])[0];
+#pragma unroll kScaleInUnroll
+            for (int t = 0; t < scaleIn; ++t) {
+              if (t != tile) {
+                sum = vecElementAdd<T>(
+                  sum, reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][scratchOff + slot(g, tile, idx)])[0]);
+              }
+            }
+            storePartial(g, idx, sum);
+          }
+        }
+      }
+      barrier.rankArrive(&counters[2 * p + 1], 1, epoch + static_cast<FabricGpuBarrier::FlagType>(p), tilePeer,
+                         nGroups - 1);
+    }
+    if (k < nPieces) {
+      const size_t p = k;
+      for (int g = 0; g < nGroups; ++g) {
+        for (int t = 0; t < scaleIn; ++t) {
+          if (t != tile) {
+            const size_t off = static_cast<size_t>(g * scaleIn + t) * count;
+            ddaHierCopy<T>(sendbuff + off, self + off, pieceBegin(p), pieceEnd(p), idxStride);
+          }
+        }
+      }
+      barrier.rankArrive(&counters[2 * p], 0, epoch + static_cast<FabricGpuBarrier::FlagType>(p), pkgPeer, scaleIn - 1);
+    }
+  }
+  barrier.epochEnd(epoch, static_cast<unsigned>(nPieces));
+}
+
 } // namespace dda::common

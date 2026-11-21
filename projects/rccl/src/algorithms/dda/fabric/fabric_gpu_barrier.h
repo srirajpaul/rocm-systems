@@ -267,8 +267,10 @@ public:
       while (static_cast<int32_t>(__scoped_atomic_load_n(flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - value) < 0) {
         if (params_.abortSpinTick(spins)) break;
       }
+      // Only the polling threads acquire: a system-scope acquire invalidates caches, and one per wave of every
+      // block made a sync cost ~200 us at 96 blocks. The block sync hands the acquired view to the other waves.
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
     }
-    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
     __syncthreads();
   }
 
@@ -306,6 +308,49 @@ public:
   // The slot rank `from` posts to from its block `fromBlock`.
   __device__ __forceinline__ const FlagType* epochFlagFrom(int from, int fromBlock) const {
     return peerFlags_[selfRank_] + getEpochFlagIdx(from, fromBlock);
+  }
+
+  // ---- Rank-level epoch flags ---------------------------------------------------------------------------------------
+  // One flag per (sender, slot) for the whole grid instead of one per block: every block of the grid arrives on a
+  // local counter, and the last one posts to the peers, so a sync costs one remote flag per peer instead of one per
+  // block. Slot `slot` reuses the epoch-flag cells of block index `slot`; values come from epochBegin, so they grow
+  // across launches and kernels, and posts use atomic max, so a late post can never lower a slot. Every block of the
+  // grid must be resident at once: the last arrival waits on no one, but the waits of the others need it to run.
+
+  // Called by every thread of the block once its stores for this sync are issued. Returns after this block's arrival;
+  // the block that completes the count posts value to every rank peerOf(0) .. peerOf(nPeers - 1).
+  template <typename PeerOf>
+  __device__ __forceinline__ void rankArrive(uint32_t* counter, int slot, FlagType value, PeerOf peerOf, int nPeers) {
+    orderDestWrites();
+    if (threadIdx.x == 0) {
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      const uint32_t arrived = __scoped_atomic_fetch_add(counter, 1u, __ATOMIC_ACQ_REL, __MEMORY_SCOPE_DEVICE);
+      if (arrived == gridDim.x - 1) {
+        // Every block has arrived, so the counter is free for the next launch.
+        __scoped_atomic_store_n(counter, 0u, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+        for (int i = 0; i < nPeers; ++i) {
+          __scoped_atomic_fetch_max(peerFlags_[peerOf(i)] + getEpochFlagIdx(selfRank_, slot), value, __ATOMIC_RELEASE,
+                                    __MEMORY_SCOPE_SYSTEM);
+        }
+      }
+    }
+  }
+
+  // Waits until every rank peerOf(0) .. peerOf(nPeers - 1) has posted at least value to slot, then syncs the block.
+  template <typename PeerOf>
+  __device__ __forceinline__ void rankWait(int slot, FlagType value, PeerOf peerOf, int nPeers) {
+    for (int i = threadIdx.x; i < nPeers; i += blockDim.x) {
+      const FlagType* flag = epochFlagFrom(peerOf(i), slot);
+      int spins = 0;
+      while (static_cast<int32_t>(__scoped_atomic_load_n(flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - value) < 0) {
+        if (params_.abortSpinTick(spins)) break;
+      }
+      // Only the polling threads acquire: a system-scope acquire invalidates caches, and one per wave of every
+      // block made a sync cost ~200 us at 96 blocks. The block sync hands the acquired view to the other waves.
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    }
+    __syncthreads();
   }
 
   // ---- The flag calls of the peer-major pushes ----------------------------------------------------------------------
