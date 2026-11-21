@@ -2630,9 +2630,17 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
 
     // (2) DDA fast paths. Symmetric wins when buffers are registered (-R 2); DDA
     // enters only when symk is unavailable. No Blocks helpers -> nMaxChannels 0.
-    const size_t rsDdaVmmMax =
+    size_t rsDdaVmmMax =
       rcclDdaVmmThresholdCtxTab(archTable, ncclFuncReduceScatter, rsWinRegType, /*graphMode=*/false, comm->nRanks);
-    const size_t rsDdaEntryMax = rcclDdaEntryThresholdTab(archTable, ncclFuncReduceScatter, comm->nRanks);
+    size_t rsDdaEntryMax = rcclDdaEntryThresholdTab(archTable, ncclFuncReduceScatter, comm->nRanks);
+    // A partitioned comm runs the hierarchical fabric kernel on the VMM tier, which beats the ring well past the
+    // flat kernel's cap, so lift the tier to the hierarchical cap. RCCL_DDA_THRESHOLD still wins.
+    size_t rsEnvVmmMax;
+    if (!ddaThresholdFromEnv(rcclParamDdaThreshold(), &rsEnvVmmMax)) {
+      const size_t rsHierMax = ncclReduceScatterDdaFabricHierMaxBytes(comm);
+      rsDdaVmmMax = std::max(rsDdaVmmMax, rsHierMax);
+      rsDdaEntryMax = std::max(rsDdaEntryMax, rsHierMax);
+    }
     if (!symEligible && rcclDdaEnabled(comm, totalBytes, rsDdaEntryMax, query, "RS")) {
       const bool ddaFabricArch   = IsArchMatch(comm->archName, "gfx1250");
       if (ddaFabricArch) {

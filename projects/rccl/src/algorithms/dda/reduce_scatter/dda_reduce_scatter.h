@@ -37,6 +37,10 @@ bool ncclReduceScatterDdaFabricEligible(ncclComm* comm, const void* sendbuff, vo
 ncclResult_t ncclReduceScatterDdaFabric(const void* sendbuff, void* recvbuff, size_t recvcount, ncclDataType_t datatype,
                                         ncclRedOp_t op, ncclComm* comm, cudaStream_t stream);
 
+// Largest total message (bytes) the fabric path runs with the hierarchical kernel on this comm, or 0 when the comm
+// does not split into packages or RCCL_DDA_RS_HIER=0. The selector lifts the RS VMM tier to it.
+size_t ncclReduceScatterDdaFabricHierMaxBytes(const ncclComm* comm);
+
 // LL-protocol fabric path (small-shard fast lane, 16B lines, no barrier).
 bool ncclReduceScatterDdaFabricLLEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t recvcount,
                                           ncclDataType_t datatype, ncclRedOp_t op);

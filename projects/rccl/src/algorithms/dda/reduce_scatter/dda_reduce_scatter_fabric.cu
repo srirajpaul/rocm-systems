@@ -26,6 +26,12 @@
 // RCCL_DDA_RS_HIER: 1 (default) runs the hierarchical kernel when the comm splits into packages
 // (comm->ddaHierScaleIn, gfx1250 partition mode), 0 always runs the flat kernel. Must be the same on every rank.
 RCCL_PARAM(DdaRsHier, "DDA_RS_HIER", 1);
+// RCCL_DDA_RS_HIER_THRESHOLD: largest total ReduceScatter (bytes) sent to the hierarchical kernel; the selector lifts
+// the RS VMM tier to it on partitioned comms. 0 leaves the arch table's VMM cap.
+RCCL_PARAM(DdaRsHierThreshold, "DDA_RS_HIER_THRESHOLD", (int64_t)256 * 1024 * 1024);
+// RCCL_DDA_RS_HIER_MIN_BYTES: the hierarchical kernel runs only above this total size; at or below it the flat kernel
+// is faster (it reads every peer in one pass, the hierarchical kernel takes two passes and one more barrier).
+RCCL_PARAM(DdaRsHierMinBytes, "DDA_RS_HIER_MIN_BYTES", (int64_t)16 * 1024 * 1024);
 
 namespace {
 
@@ -82,7 +88,8 @@ static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* 
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
 
   // The hierarchical kernel stages its own input, so it skips the scratch pre-copy.
-  const int scaleIn = rcclParamDdaRsHier() ? comm->ddaHierScaleIn : 0;
+  const bool hier = rcclParamDdaRsHier() && totalCount * sizeof(T) > static_cast<size_t>(rcclParamDdaRsHierMinBytes());
+  const int scaleIn = hier ? comm->ddaHierScaleIn : 0;
   if (scaleIn > 0) {
     INFO(NCCL_COLL,
          "DDA fabric ReduceScatter: launching hierarchical kernel: nRanks=%d scaleIn=%d recvcount=%zu grid=%u block=%u",
@@ -123,6 +130,14 @@ static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* 
 }
 
 } // namespace
+
+size_t ncclReduceScatterDdaFabricHierMaxBytes(const ncclComm* comm) {
+  if (comm == nullptr || comm->ddaHierScaleIn <= 0 || !rcclParamDdaRsHier()) {
+    return 0;
+  }
+  const int64_t cap = rcclParamDdaRsHierThreshold();
+  return cap > 0 ? static_cast<size_t>(cap) : 0;
+}
 
 bool ncclReduceScatterDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t recvcount,
                                         ncclDataType_t datatype, ncclRedOp_t op) {
