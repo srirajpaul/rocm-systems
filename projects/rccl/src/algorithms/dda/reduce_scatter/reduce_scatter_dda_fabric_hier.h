@@ -40,6 +40,10 @@
  * pipelines them with per-peer tokens, so a piece's scale-up overlaps the next
  * pieces' scale-in and pushes instead of every rank waiting at group barriers.
  *
+ * ddaReduceScatterFabricHierPipe is the pull kernel cut into pieces and run as
+ * a software pipeline, so the staging copy, the scale-in loads and the
+ * scale-up loads of different pieces are in flight together.
+ *
  * ddaReduceScatterFabricHierPushUp loads at the scale-in level, like the pull
  * kernel, and stores at the scale-up level: each rank pushes every partial to
  * the rank that owns its shard, which then reduces from its own scratch.
@@ -352,6 +356,109 @@ __launch_bounds__(512)
       sum = vecElementAdd<T>(sum, ddaHierLoadPushed(&self[static_cast<size_t>(g * scaleIn + tile) * count + idx]));
     }
     *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
+  }
+
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
+}
+
+// Pipelined form of ddaReduceScatterFabricHier, with the same scratch layout. A block's rows
+// (idx = idxStart + row * idxStride) are cut into nPieces pieces of perPiece rows, and step k = 0 .. nPieces + 1 is one
+// fused pass over perPiece rows:
+//   stage piece k:        copy the shards of the other tiles from sendbuff into scratch,
+//   scale-in piece k - 1: add the package peers' staged copies to sendbuff, keep the partial in scratch,
+//   scale-up piece k - 2: add this rank's shard of every package's partial, write recvbuff,
+// then syncs the package and this tile's ranks in one round, which publishes piece k's staged copies and piece k - 1's
+// partials. The three parts load independent data, so the local copy, the package-link loads and the cross-package
+// loads of a step are in flight together, and they touch disjoint rows, so a store never hits what a peer loads in
+// the same step. recvbuff may alias shard selfRank of sendbuff: scale-in reads that shard's rows of piece k - 1 while
+// scale-up writes rows of piece k - 2.
+template <typename T, int SCALE_IN_CT, int NGROUPS_CT>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+  __global__ void ddaReduceScatterFabricHierPipe(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff,
+                                                 size_t count, const T* __restrict__ sendbuff, int selfRank, int nRanks,
+                                                 int scaleInRt, unsigned pieces, FabricGpuBarrier barrier) {
+  static_assert(is_supported_type_v<T>, "dda: unsupported element type");
+  const int scaleIn = (SCALE_IN_CT > 0) ? SCALE_IN_CT : scaleInRt;
+  const int nGroups = (NGROUPS_CT > 0) ? NGROUPS_CT : nRanks / scaleIn;
+  constexpr int kScaleInUnroll = (SCALE_IN_CT > 0) ? SCALE_IN_CT : 2;
+  constexpr int kGroupUnroll = (NGROUPS_CT > 0) ? NGROUPS_CT : 8;
+  const int tile = selfRank % scaleIn;
+  const int pkg = selfRank / scaleIn;
+  const int pkgFirst = selfRank - tile;
+
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const size_t idxStart = (static_cast<size_t>(blockDim.x) * blockIdx.x + threadIdx.x) * countPerThread;
+  const size_t idxStride = static_cast<size_t>(gridDim.x) * blockDim.x * countPerThread;
+
+  // Every rank derives the same piece split: it depends only on count and the launch shape.
+  const size_t nRows = (count + idxStride - 1) / idxStride;
+  const size_t nPiecesWanted = pieces > 0 ? pieces : 1;
+  const size_t perPiece = (nRows + nPiecesWanted - 1) / nPiecesWanted;
+  const size_t nPieces = (nRows + perPiece - 1) / perPiece;
+
+  T* const self = ipcbuffs[selfRank];
+  const size_t selfOff = static_cast<size_t>(selfRank) * count;
+
+  for (size_t k = 0; k < nPieces + 2; ++k) {
+    const bool doStage = k < nPieces;
+    const bool doScaleIn = k >= 1 && k <= nPieces;
+    const bool doScaleUp = k >= 2;
+    for (size_t row = 0; row < perPiece; ++row) {
+      if (doStage) {
+        const size_t idx = idxStart + (k * perPiece + row) * idxStride;
+        if (idx < count) {
+#pragma unroll kGroupUnroll
+          for (int g = 0; g < nGroups; ++g) {
+#pragma unroll kScaleInUnroll
+            for (int t = 0; t < scaleIn; ++t) {
+              if (t != tile) {
+                const size_t off = static_cast<size_t>(g * scaleIn + t) * count + idx;
+                *reinterpret_cast<uint4*>(&self[off]) = reinterpret_cast<const uint4*>(&sendbuff[off])[0];
+              }
+            }
+          }
+        }
+      }
+      if (doScaleIn) {
+        const size_t idx = idxStart + ((k - 1) * perPiece + row) * idxStride;
+        if (idx < count) {
+#pragma unroll kGroupUnroll
+          for (int g = 0; g < nGroups; ++g) {
+            const size_t off = static_cast<size_t>(g * scaleIn + tile) * count + idx;
+            uint4 sum = reinterpret_cast<const uint4*>(&sendbuff[off])[0];
+#pragma unroll kScaleInUnroll
+            for (int t = 0; t < scaleIn; ++t) {
+              if (t != tile) {
+                sum = vecElementAdd<T>(sum, reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][off])[0]);
+              }
+            }
+            *reinterpret_cast<uint4*>(&self[off]) = sum;
+          }
+        }
+      }
+      if (doScaleUp) {
+        const size_t idx = idxStart + ((k - 2) * perPiece + row) * idxStride;
+        if (idx < count) {
+          uint4 sum = reinterpret_cast<const uint4*>(&self[selfOff + idx])[0];
+#pragma unroll kGroupUnroll
+          for (int j = 1; j < nGroups; ++j) {
+            // Start each rank on a different package so the tile's ranks do not all load from one peer at once.
+            int g = pkg + j;
+            if (g >= nGroups) g -= nGroups;
+            sum =
+              vecElementAdd<T>(sum, reinterpret_cast<const uint4*>(&ipcbuffs[g * scaleIn + tile][selfOff + idx])[0]);
+          }
+          *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
+        }
+      }
+    }
+    if (k < nPieces + 1) {
+      barrier.syncPeerSetOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>([&](int r) {
+        return r / scaleIn == pkg || r % scaleIn == tile;
+      });
+    }
   }
 
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();

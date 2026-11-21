@@ -35,8 +35,8 @@ RCCL_PARAM(DdaRsHierThreshold, "DDA_RS_HIER_THRESHOLD", (int64_t)256 * 1024 * 10
 // is faster (it reads every peer in one pass, the hierarchical kernel takes two passes and one more barrier).
 RCCL_PARAM(DdaRsHierMinBytes, "DDA_RS_HIER_MIN_BYTES", (int64_t)16 * 1024 * 1024);
 // RCCL_DDA_RS_HIER_MODE: 0 (default) the pull kernel; 1 the push kernel (stores to peers, local reductions, pipelined
-// pieces); 2 loads at scale-in and stores at scale-up; 3 the pull kernel synced with epoch flags.
-// RCCL_DDA_RS_HIER_PIECES: pieces per block of mode 1.
+// pieces); 2 loads at scale-in and stores at scale-up; 3 the pull kernel synced with epoch flags; 4 the pull kernel
+// pipelined over pieces. RCCL_DDA_RS_HIER_PIECES: pieces per block of modes 1 and 4.
 // RCCL_DDA_RS_HIER_PUSH_SYS_STORE: 1 (default) mode 1 pushes with system-scope stores, 0 with plain ones. All must be
 // the same on every rank.
 RCCL_PARAM(DdaRsHierMode, "DDA_RS_HIER_MODE", 0);
@@ -47,7 +47,7 @@ namespace {
 
 using nccl_dda_detail::DdaFabricBarrierState;
 
-constexpr const char* kDdaRsHierModeName[] = {"pull", "push", "pushup", "pull-epoch"};
+constexpr const char* kDdaRsHierModeName[] = {"pull", "push", "pushup", "pull-epoch", "pull-pipe"};
 
 template <typename T>
 static void launchReduceScatterDdaFabricHier(T** d_ipcbuffs, void* recvbuff, size_t recvcount, const void* sendbuff,
@@ -92,6 +92,14 @@ static void launchReduceScatterDdaFabricHier(T** d_ipcbuffs, void* recvbuff, siz
     return;
   }
   const unsigned pieces = static_cast<unsigned>(std::max<int64_t>(rcclParamDdaRsHierPieces(), 1));
+  if (mode == 4) {
+    launchSized(
+      [](auto s, auto g) {
+        return dda::common::ddaReduceScatterFabricHierPipe<T, decltype(s)::value, decltype(g)::value>;
+      },
+      pieces);
+    return;
+  }
   if (rcclParamDdaRsHierPushSysStore()) {
     launchSized(
       [](auto s, auto g) {
@@ -145,7 +153,7 @@ static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* 
          "DDA fabric ReduceScatter: launching hierarchical kernel: nRanks=%d scaleIn=%d recvcount=%zu grid=%u block=%u "
          "%s pieces=%lld",
          nRanks, scaleIn, recvcount, grid.x, block.x,
-         kDdaRsHierModeName[std::clamp<int64_t>(rcclParamDdaRsHierMode(), 0, 3)],
+         kDdaRsHierModeName[std::clamp<int64_t>(rcclParamDdaRsHierMode(), 0, 4)],
          (long long)rcclParamDdaRsHierPieces());
     launchReduceScatterDdaFabricHier<T>(d_ipcbuffs, recvbuff, recvcount, sendbuff, comm, scaleIn, grid, block,
                                         barrierHost, rcclTakeAddonStopEvent(comm), stream);
