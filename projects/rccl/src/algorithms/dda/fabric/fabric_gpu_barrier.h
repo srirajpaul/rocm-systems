@@ -49,6 +49,14 @@ public:
 
   template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess>
   __device__ __forceinline__ void syncOnSameBlockIdx() {
+    syncGroupOnSameBlockIdx<hasPreviousMemAccess, hasSubsequentMemAccess>(0, 1, nRanks_);
+  }
+
+  // syncOnSameBlockIdx over the nGroupRanks ranks firstRank, firstRank + rankStride, ... only. The group must hold
+  // this rank and be the same set on every member, so a hierarchical kernel can sync one level of the topology
+  // (the ranks of a package, or one rank of every package) without waiting on the rest of the comm.
+  template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess>
+  __device__ __forceinline__ void syncGroupOnSameBlockIdx(int firstRank, int rankStride, int nGroupRanks) {
     enum class MemFenceType {
       RELEASE_ACQUIRE,
       RELEASE_ONLY,
@@ -73,7 +81,8 @@ public:
     // same increasing order, so the interleaved signal/wait cannot deadlock.
     FlagType* selfBuf = peerFlags_[selfRank_];
     bool gaveUp = false;
-    for (int peerRank = threadIdx.x; !aborted_ && peerRank < nRanks_; peerRank += blockDim.x) {
+    for (int i = threadIdx.x; !aborted_ && i < nGroupRanks; i += blockDim.x) {
+      const int peerRank = firstRank + i * rankStride;
       FlagType* peerBuf = peerFlags_[peerRank];
       bool signaled = false;
 
@@ -101,7 +110,9 @@ public:
       }
     }
     // With nRanks_ <= warpSize every signaling lane is in wave 0, so a wave vote
-    // suffices; larger cliques span waves and need the block-wide vote.
+    // suffices; larger cliques span waves and need the block-wide vote. Keyed on
+    // the comm, not the group, so every barrier of a kernel votes the same way and
+    // aborted_ stays uniform across the waves that later barriers signal from.
     const bool singleWave = nRanks_ <= warpSize;
     if (singleWave) {
       aborted_ = __any(aborted_ || gaveUp);

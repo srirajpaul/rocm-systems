@@ -742,6 +742,10 @@ struct ncclComm {
   // Device-resident per-block epoch cells for the LL-protocol DDA collectives,
   uint32_t* ddaLLEpochDev;
   int ddaLLEpochLen;
+  // Consecutive ranks sharing one physical device (gfx1250 partition mode, fabric path), or 0
+  // when the comm does not split into two or more such packages. Hierarchical DDA kernels
+  // reduce within a package (scale-in) before crossing packages (scale-up).
+  int ddaHierScaleIn;
   // [RCCL] Set by ncclCommShrink(NCCL_SHRINK_ABORT). An abort can leave ranks with
   // different LL epochs and unconsumed barrier mailbox slots, so DDA must not
   // run on this comm again until that state is resynchronized.

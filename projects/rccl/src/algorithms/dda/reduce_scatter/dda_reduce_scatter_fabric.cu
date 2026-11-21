@@ -8,11 +8,13 @@
 
 #include "algorithms/dda/device/CollCommon.h"
 #include "algorithms/dda/reduce_scatter/reduce_scatter_dda_fabric.h"
+#include "algorithms/dda/reduce_scatter/reduce_scatter_dda_fabric_hier.h"
 #include "checks.h"
 #include "comm.h"
 #include "debug.h"
 #include "algorithms/dda/dda_init_detail.h"
 #include "algorithms/dda/fabric/fabric_gpu_barrier.h"
+#include "param.h"
 #include "rccl_common.h"
 
 #include <cuda_runtime.h>
@@ -21,9 +23,33 @@
 #include <cstddef>
 #include <cstdint>
 
+// RCCL_DDA_RS_HIER: 1 (default) runs the hierarchical kernel when the comm splits into packages
+// (comm->ddaHierScaleIn, gfx1250 partition mode), 0 always runs the flat kernel. Must be the same on every rank.
+RCCL_PARAM(DdaRsHier, "DDA_RS_HIER", 1);
+
 namespace {
 
 using nccl_dda_detail::DdaFabricBarrierState;
+
+template <typename T>
+static void launchReduceScatterDdaFabricHier(T** d_ipcbuffs, void* recvbuff, size_t recvcount, const void* sendbuff,
+                                             ncclComm* comm, int scaleIn, dim3 grid, dim3 block,
+                                             const dda::common::FabricGpuBarrier& barrierHost, hipEvent_t stopEvent,
+                                             cudaStream_t stream) {
+  const int nRanks = comm->nRanks;
+  auto launch = [&](auto kernel) {
+    hipExtLaunchKernelGGL(kernel, grid, block, 0, stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0, d_ipcbuffs,
+                          static_cast<T*>(recvbuff), recvcount, static_cast<const T*>(sendbuff), comm->rank, nRanks,
+                          scaleIn, barrierHost);
+  };
+  if (scaleIn == 2 && nRanks == 8) {
+    launch(dda::common::ddaReduceScatterFabricHier<T, 2, 4>);
+  } else if (scaleIn == 2) {
+    launch(dda::common::ddaReduceScatterFabricHier<T, 2, 0>);
+  } else {
+    launch(dda::common::ddaReduceScatterFabricHier<T, 0, 0>);
+  }
+}
 
 template <typename T>
 static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* recvbuff, size_t recvcount,
@@ -54,6 +80,18 @@ static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* 
 
   void* peerPtrsDev = comm->ddaPeerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
+
+  // The hierarchical kernel stages its own input, so it skips the scratch pre-copy.
+  const int scaleIn = rcclParamDdaRsHier() ? comm->ddaHierScaleIn : 0;
+  if (scaleIn > 0) {
+    INFO(NCCL_COLL,
+         "DDA fabric ReduceScatter: launching hierarchical kernel: nRanks=%d scaleIn=%d recvcount=%zu grid=%u block=%u",
+         nRanks, scaleIn, recvcount, grid.x, block.x);
+    launchReduceScatterDdaFabricHier<T>(d_ipcbuffs, recvbuff, recvcount, sendbuff, comm, scaleIn, grid, block,
+                                        barrierHost, rcclTakeAddonStopEvent(comm), stream);
+    CUDACHECK(cudaGetLastError());
+    return ncclSuccess;
+  }
 
   CUDACHECK(cudaMemcpyAsync(comm->ddaScratch, sendbuff, totalCount * sizeof(T), cudaMemcpyDeviceToDevice, stream));
 

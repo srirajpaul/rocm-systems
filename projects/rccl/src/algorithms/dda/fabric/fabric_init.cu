@@ -43,6 +43,28 @@ bool ncclDdaUseFabricPath(ncclComm* comm) {
   return comm->MNNVL == 1 && IsArchMatch(comm->archName, "gfx1250");
 }
 
+// Partitions of one card share every busId bit but the function number.
+static bool ddaSameCard(const ncclPeerInfo& a, const ncclPeerInfo& b) {
+  return a.hostHash == b.hostHash && (a.busId & ~0xfLL) == (b.busId & ~0xfLL);
+}
+
+// Consecutive ranks per physical device in partition mode, or 0 unless every package holds the same
+// number of consecutive ranks and there are at least two packages to cross. Same rule as the
+// symmetric hierarchical AllGather's scale-in size.
+static int ddaHierScaleInSize(ncclComm* comm) {
+  const ncclPeerInfo* peerInfo = comm->peerInfo;
+  if (!comm->hasMloPart || peerInfo == nullptr || comm->nRanks < 4) return 0;
+
+  int size = 1;
+  while (size < comm->nRanks && ddaSameCard(peerInfo[size], peerInfo[0])) size++;
+  if (size < 2 || comm->nRanks % size != 0 || comm->nRanks / size < 2) return 0;
+
+  for (int r = 1; r < comm->nRanks; r++) {
+    if (ddaSameCard(peerInfo[r], peerInfo[r - 1]) != (r % size != 0)) return 0;
+  }
+  return size;
+}
+
 ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
   if (comm == nullptr) {
     return ncclSuccess;
@@ -233,6 +255,11 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
   comm->ddaFabricMaxBlocks = nBlocksMax;
   comm->ddaLLEpochDev = epochDev;
   comm->ddaLLEpochLen = (int)epochLen;
+  comm->ddaHierScaleIn = ddaHierScaleInSize(comm);
+  if (comm->ddaHierScaleIn > 0) {
+    INFO(NCCL_INIT, "ncclDdaFabricCommInit: hierarchical scale-in size %d (%d packages of nRanks %d)",
+         comm->ddaHierScaleIn, nRanks / comm->ddaHierScaleIn, nRanks);
+  }
   INFO(NCCL_INIT,
        "ncclDdaFabricCommInit: nRanks %d, scratch %zu bytes (vmm, gfx1250 fabric path; derived from RCCL DDA params; "
        "RCCL_DDA_FABRIC_BUFFER_SIZE=%lld), LL enabled=%lld threshold=%lld, "
@@ -279,6 +306,7 @@ ncclResult_t ncclDdaFabricCommFini(ncclComm* comm) {
   CUDACHECKIGNORE(cudaFree(comm->ddaLLEpochDev));
   comm->ddaLLEpochDev = nullptr;
   comm->ddaLLEpochLen = 0;
+  comm->ddaHierScaleIn = 0;
   free(comm->ddaPeerPtrsHost);
   comm->ddaPeerPtrsHost = nullptr;
   // Destroying the fabric handler unmaps/frees the imported peer scratch buffers.
