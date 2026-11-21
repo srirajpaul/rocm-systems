@@ -57,6 +57,17 @@ static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* 
 
   CUDACHECK(cudaMemcpyAsync(comm->ddaScratch, sendbuff, totalCount * sizeof(T), cudaMemcpyDeviceToDevice, stream));
 
+  if (barrierState->rsHierarchy.nScaleUp != 0) {
+    INFO(NCCL_COLL, "DDA fabric ReduceScatter: launching kernel: hierarchical scale-in=2 scaleup=%d "
+                   "nRanks=%d recvcount=%zu grid=%u block=%u",
+         barrierState->rsHierarchy.nScaleUp, nRanks, recvcount, grid.x, block.x);
+    hipExtLaunchKernelGGL((dda::common::ddaReduceScatterFabricHierarchical<T>), grid, block, 0, stream,
+                         /*startEvent=*/nullptr, rcclTakeAddonStopEvent(comm), /*flags=*/0, d_ipcbuffs,
+                         static_cast<T*>(recvbuff), recvcount, comm->rank, barrierState->rsHierarchy, barrierHost);
+    CUDACHECK(cudaGetLastError());
+    return ncclSuccess;
+  }
+
   INFO(NCCL_COLL, "DDA fabric ReduceScatter: launching kernel: nRanks=%d recvcount=%zu grid=%u block=%u%s", nRanks,
        recvcount, grid.x, block.x, (nRanks == 4 || nRanks == 8) ? " (unrolled)" : " (runtime)");
 

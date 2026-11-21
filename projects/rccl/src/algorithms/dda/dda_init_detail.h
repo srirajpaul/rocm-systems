@@ -10,6 +10,7 @@
 #include "algorithms/dda/device/CollCommon_ll128.h"
 #include "algorithms/dda/fabric/fabric_gpu_barrier.h"
 #include "algorithms/dda/ipc/ipc_gpu_barrier.h"
+#include "algorithms/dda/reduce_scatter/dda_rs_hierarchy.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -86,6 +87,7 @@ struct DdaIpcBarrierState {
 struct DdaFabricBarrierState {
   std::unique_ptr<dda::common::FabricGpuBarrierResources> resources;
   dda::common::FabricGpuBarrier barrierHost;
+  DdaRsHierarchy<dda::common::kDdaMaxNranks> rsHierarchy;
 };
 
 inline int ddaMaxNBlocksForScratch() {

@@ -35,6 +35,10 @@ RCCL_PARAM(DdaFabricBufferSizeForScratch, "DDA_FABRIC_BUFFER_SIZE", -1);
 // one-token CAS flags (see FabricGpuBarrier::signalWaitPeer / postPeer / waitPeer). Must be the same on every rank.
 // With 0 the pushes run without drain blocks (RCCL_DDA_A2A_PUSH_PEER_DRAIN is ignored).
 RCCL_PARAM(DdaA2APushPeerEpoch, "DDA_A2A_PUSH_PEER_EPOCH", 1);
+// Opt-in DPX scale-in followed by scaleup for VMM ReduceScatter. The extra
+// synchronization is not yet faster than the flat path on the measured sizes.
+// Like the other DDA protocol switches, this must agree across communicator ranks.
+RCCL_PARAM(DdaRsHierarchical, "DDA_RS_HIERARCHICAL", 0);
 
 bool ncclDdaUseFabricPath(ncclComm* comm) {
   if (comm == nullptr) {
@@ -195,6 +199,15 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
       barrierState->resources = std::move(barrierPair.first);
       barrierState->barrierHost = barrierPair.second;
       barrierState->barrierHost.setEpochFlags(rcclParamDdaA2APushPeerEpoch() != 0);
+      bool allDpx = comm->peerInfo != nullptr && rcclParamDdaRsHierarchical() != 0;
+      for (int r = 0; allDpx && r < nRanks; ++r)
+        allDpx = comm->peerInfo[r].tuningPartition == RCCL_TUNING_PARTITION_DPX;
+      if (allDpx) {
+        barrierState->rsHierarchy = nccl_dda_detail::ddaRsHierarchy<kDdaMaxNranks>(comm->peerInfo, nRanks, comm->rank);
+        if (barrierState->rsHierarchy.nScaleUp != 0)
+          INFO(NCCL_INIT, "DDA ReduceScatter hierarchy: rank=%d sibling=%d scale-in=2 scaleup=%d",
+               comm->rank, barrierState->rsHierarchy.sibling, barrierState->rsHierarchy.nScaleUp);
+      }
     }
 
     // Own stream: syncing the null stream would also consume async errors from the app's blocking streams.

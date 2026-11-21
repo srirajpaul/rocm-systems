@@ -538,6 +538,22 @@ TEST_F(DdaFabricSimple, RepeatedReduceScatter)
     runReduceScatter(false, kRepeatedIterations);
 }
 
+// Run with RCCL_DDA_LL=0 RCCL_DDA_LL128=0 RCCL_DDA_RS_HIERARCHICAL=1
+// RCCL_DDA_THRESHOLD=16777216. Check the launch marker as well as data so a
+// passing flat fallback cannot hide a hierarchy dispatch regression.
+TEST_F(DdaFabricSimple, HierarchicalReduceScatterDpx)
+{
+    auto* state = getActiveCommunicator()->ddaFabricBarrierState;
+    const auto reason = mpiCoordinatedSkipReason(state->rsHierarchy.nScaleUp == 0,
+                                                 "Requires complete DPX pairs and DDA_RS_HIERARCHICAL=1");
+    if (!reason.empty()) GTEST_SKIP() << reason;
+    if (rcclParamDdaLL() != 0)
+        GTEST_SKIP() << "Launch with RCCL_DDA_LL=0 to exercise the VMM hierarchy";
+    runReduceScatter(false, kRepeatedIterations);
+    runReduceScatter(true);
+    expectLog("DDA fabric ReduceScatter: launching kernel: hierarchical scale-in=2");
+}
+
 TEST_F(DdaFabricSimple, RepeatedAllToAll)
 {
     runLLAllToAll(kRepeatedIterations);

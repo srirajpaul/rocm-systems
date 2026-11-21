@@ -23,8 +23,57 @@
 
 #include "algorithms/dda/device/CollCommon.h"
 #include "algorithms/dda/fabric/fabric_gpu_barrier.h"
+#include "algorithms/dda/reduce_scatter/dda_rs_hierarchy.h"
 
 namespace dda::common {
+
+// Stage 1 reduces paired tiles for the destination shards on this tile's rail.
+// Those shards stay at their original offsets in our scratch. The sibling reads
+// and writes the OTHER rail's shards, so neither tile overwrites input still
+// needed by its sibling. No additional scratch allocation is required.
+//
+// Both stages assign the same offset within EVERY shard to the same block. The
+// intermediate per-block barrier therefore orders all producers of a scaleup
+// load without requiring a grid-wide barrier or a second kernel launch.
+template <typename T>
+__launch_bounds__(512)
+__global__ void ddaReduceScatterFabricHierarchical(
+    T* const* __restrict__ scratch, T* __restrict__ recvbuff, size_t count, int self,
+    nccl_dda_detail::DdaRsHierarchy<kDdaMaxNranks> hierarchy, FabricGpuBarrier barrier) {
+  barrier.syncOnSameBlockIdx<true, true>();
+
+  constexpr size_t elements = sizeof(uint4) / sizeof(T);
+  const size_t start = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * elements;
+  const size_t stride = size_t(gridDim.x) * blockDim.x * elements;
+  for (int d = 0; d < hierarchy.nScaleUp; ++d) {
+    const size_t shard = size_t(hierarchy.scaleUpRanks[d]) * count;
+    for (size_t i = start; i < count; i += stride) {
+      const size_t offset = shard + i;
+      uint4 a, b;
+      ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(scratch[self] + offset), a.x, a.y, a.z, a.w);
+      ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(scratch[hierarchy.sibling] + offset), b.x, b.y, b.z, b.w);
+      const uint4 sum = vecElementAdd<T>(a, b);
+      ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(scratch[self] + offset), sum.x, sum.y, sum.z, sum.w);
+    }
+  }
+  // Drain every wave's system-scope stores before publishing the partial sums.
+  barrier.orderDestWrites();
+  barrier.syncOnSameBlockIdx<true, true>();
+
+  for (size_t i = start; i < count; i += stride) {
+    const size_t offset = size_t(self) * count + i;
+    uint4 sum{0, 0, 0, 0};
+    for (int p = 0; p < hierarchy.nScaleUp; ++p) {
+      uint4 value;
+      ddaLLLoadLineB128(reinterpret_cast<const uint32_t*>(scratch[hierarchy.scaleUpRanks[p]] + offset),
+                       value.x, value.y, value.z, value.w);
+      sum = vecElementAdd<T>(sum, value);
+    }
+    *reinterpret_cast<uint4*>(recvbuff + i) = sum;
+  }
+  // Every peer must finish reading before a later collective reuses scratch.
+  barrier.syncOnSameBlockIdx<true, false>();
+}
 
 template <typename T, int NRANKS_CT, bool hasAcc>
 #if defined(USE_ROCM)

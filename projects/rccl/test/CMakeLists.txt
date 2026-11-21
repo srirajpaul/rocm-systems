@@ -68,6 +68,12 @@ if(BUILD_TESTS)
   add_test(NAME rccl-UnitTestsNetTelemetry COMMAND rccl-UnitTestsNetTelemetry)
   rocm_install(TARGETS rccl-UnitTestsNetTelemetry COMPONENT tests)
 
+  # The DPX DDA rank map is independent of HIP; test reordered and incomplete pairs on the CPU.
+  add_executable(rccl-UnitTestsDdaRsHierarchy ${PROJECT_SOURCE_DIR}/test/dda_rs_hierarchy_test.cpp)
+  target_include_directories(rccl-UnitTestsDdaRsHierarchy PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  add_test(NAME rccl-UnitTestsDdaRsHierarchy COMMAND rccl-UnitTestsDdaRsHierarchy)
+  rocm_install(TARGETS rccl-UnitTestsDdaRsHierarchy COMPONENT tests)
+
   if (ENABLE_CODE_COVERAGE)
     add_compile_options("SHELL:-Xarch_host -fprofile-instr-generate" "SHELL:-Xarch_host -fcoverage-mapping")
     add_link_options("SHELL:-Xarch_host -fprofile-instr-generate" "SHELL:-Xarch_host -fcoverage-mapping")
