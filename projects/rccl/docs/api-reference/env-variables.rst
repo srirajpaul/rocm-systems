@@ -1382,6 +1382,56 @@ threshold table introduced for gfx1250.
       - | ``0``: Cooperative writer for every launch, no dynamic LDS (default).
         | ``1``: Staged writer from 2 MiB shards on gfx1250 wave32 communicators.
 
+    * - | ``RCCL_DDA_LL128_AR_PARTIAL_REDUCE``
+        | Opts in to register partial sums in the DDA LL128 peer-parallel
+          two-shot ``ncclAllReduce`` kernel at 12, 16, and 32 ranks. A slice uses
+          eight warps; each warp accumulates its assigned peers before the
+          group combines the partials. A 512-thread block contains two
+          independent slice groups. At 32 ranks this replaces the default
+          1024-thread block and halves its shared-memory allocation.
+          Grouping additions can change floating-point rounding. Set the same
+          value on every rank. At 12 ranks, this opts in from the legacy
+          two-shot kernel; message sizes must be multiples of 192 bytes.
+          One-shot, other non-peer-parallel paths, 4/8-rank
+          launches, and tier thresholds retain their existing behavior.
+          Requires ``RCCL_DDA_LL128_AR_PEER_PARALLEL`` to be enabled and the
+          existing peer-parallel eligibility checks to pass.
+      - | ``0``: Existing two-shot selection (default).
+        | ``1``: Eight-warps-per-slice partial reduction at 12/16/32 ranks.
+
+    * - | ``RCCL_DDA_LL128_AR_PEERS_PER_WARP``
+        | Selects the number of rank contributions accumulated by each warp
+          for DDA LL128 peer-parallel two-shot ``ncclAllReduce`` at 4/8/16 ranks.
+          The count includes the local contribution, which is read directly;
+          remote contributions are polled sequentially and added in registers.
+          Each warp writes one partial to LDS, then the slice group combines
+          those partials. Blocks default to 512 threads. Higher factors reduce
+          warps per slice and increase independent slices per block.
+          A factor larger than the rank count is clamped to that count.
+          Nonzero valid values override ``RCCL_DDA_LL128_AR_PARTIAL_REDUCE``
+          and the four-rank legacy two-shot selection at 64 MiB and above,
+          permitting a comparison against factor 1 with the same algorithm.
+          Existing architecture, thread-cap, and cooperative-wire eligibility
+          still apply. One-shot and tier thresholds are unchanged.
+          Grouping additions can change floating-point rounding. Use the same
+          value on every rank. Unsupported rank counts or values use the
+          existing selection.
+      - | ``0``: Existing selection (default).
+        | ``1``, ``2``, ``4``, ``8``: Contributions per warp at 4/8/16 ranks.
+
+    * - | ``RCCL_DDA_LL128_AR_BLOCK_THREADS``
+        | Selects the block size for explicit DDA LL128 peer-parallel two-shot
+          AllReduce experiments at 4/8/16 ranks. Requires a valid positive
+          ``RCCL_DDA_LL128_AR_PEERS_PER_WARP``. Each block must contain at
+          least one complete slice group: ``(ranks / peers_per_warp) * 32``
+          threads. Unsupported values or blocks smaller than a group retain
+          512 threads. Smaller blocks reduce static LDS allocation and change
+          the grid size; the existing block cap still applies. Default
+          selection, one-shot, and tier thresholds are unchanged. Set the
+          same value on every rank.
+      - | ``0``: Existing block size (default).
+        | ``64``, ``128``, ``256``, ``512``: Threads per block, if eligible.
+
     * - | ``RCCL_DDA_A2A_PUSH``
         | Selects the ``ncclAllToAll`` kernel on the DDA fabric (VMM) tier. The push
           kernels write each rank's chunks straight into its peers' DDA scratch

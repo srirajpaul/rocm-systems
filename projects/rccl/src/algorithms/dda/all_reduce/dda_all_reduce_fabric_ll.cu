@@ -44,6 +44,9 @@ RCCL_PARAM_DECLARE(DdaLLOneShotThreshold);
 RCCL_PARAM_DECLARE(DdaLL128OneShotThreshold);
 RCCL_PARAM_DECLARE(DdaLL128AsyncWire);
 RCCL_PARAM(DdaLL128ArPeerParallel, "DDA_LL128_AR_PEER_PARALLEL", 1);
+RCCL_PARAM(DdaLL128ArPartialReduce, "DDA_LL128_AR_PARTIAL_REDUCE", 0);
+RCCL_PARAM(DdaLL128ArPeersPerWarp, "DDA_LL128_AR_PEERS_PER_WARP", 0);
+RCCL_PARAM(DdaLL128ArBlockThreads, "DDA_LL128_AR_BLOCK_THREADS", 0);
 // -1: measured automatic policy; 0: legacy one-shot; 1: peer-parallel at all supported sizes/ranks.
 RCCL_PARAM(DdaLL128ArOneShotPeerParallel, "DDA_LL128_AR_ONESHOT_PEER_PARALLEL", -1);
 
@@ -120,19 +123,59 @@ static bool ddaArLL128PeerParallel(const ncclComm* comm, rcclDdaLaunchCap cap) {
          rcclParamDdaLL128AsyncWire() == 0;
 }
 
+// Explicit experiments at power-of-two ranks. Count the local input as one
+// contribution; eight requested contributions at four ranks clamp to four.
+// Zero and unsupported settings preserve the existing selection.
+static int ddaArLL128PeersPerWarp(int nRanks) {
+  const int64_t value = rcclParamDdaLL128ArPeersPerWarp();
+  if ((nRanks != 4 && nRanks != 8 && nRanks != 16) ||
+      (value != 1 && value != 2 && value != 4 && value != 8)) return 0;
+  return value > nRanks ? nRanks : (int)value;
+}
+
+// Block tuning is opt-in together with an explicit peer factor. Invalid
+// sizes preserve 512 threads; every valid block holds complete slice groups.
+static unsigned ddaArLL128BlockThreads(int nRanks, bool partialReduce) {
+  const int factor = ddaArLL128PeersPerWarp(nRanks);
+  const int64_t threads = rcclParamDdaLL128ArBlockThreads();
+  if (factor > 0 && (threads == 64 || threads == 128 || threads == 256 || threads == 512)) {
+    const int groupThreads = (nRanks / factor) * kDdaLL128Warp;
+    if (threads >= groupThreads && threads % groupThreads == 0) return (unsigned)threads;
+  }
+  return !partialReduce && nRanks == 32 ? 1024 : 512;
+}
+
 // At four ranks, the legacy two-shot sustains higher bandwidth from 64 MiB.
 // Share this choice between the geometry reporter and the actual launcher.
 static bool ddaArLL128TwoShotPeerParallel(const ncclComm* comm, size_t bytes, rcclDdaLaunchCap cap) {
-  return ddaArLL128PeerParallel(comm, cap) && !(comm->nRanks == 4 && bytes >= 64 * 1024 * 1024);
+  // Twelve ranks are supported only by the opt-in eight-warp partial tree.
+  // Keep the shared eligibility helper unchanged: one-shot uses it too.
+  const bool partial12 = comm->nRanks == 12 && rcclParamDdaLL128ArPartialReduce() != 0 &&
+                         rcclParamDdaLL128ArPeerParallel() != 0 && comm->archName != nullptr &&
+                         IsArchMatch(comm->archName, "gfx1250") && comm->WarpSize == kDdaLL128Warp &&
+                         (cap.threads == 0 || cap.threads >= 512) && rcclParamDdaLL128AsyncWire() == 0;
+  return (ddaArLL128PeerParallel(comm, cap) || partial12) &&
+         !(comm->nRanks == 4 && bytes >= 64 * 1024 * 1024 && ddaArLL128PeersPerWarp(comm->nRanks) == 0);
+}
+
+// An explicit factor takes precedence over the earlier fixed-eight-warp
+// partial mode. With neither option, preserve the existing specialization.
+static bool ddaArLL128PartialReduce(int nRanks) {
+  const int peersPerWarp = ddaArLL128PeersPerWarp(nRanks);
+  if (peersPerWarp != 0) return peersPerWarp > 1;
+  return nRanks > dda::common::kDdaLL128WordsPerThread && rcclParamDdaLL128ArPartialReduce() != 0;
 }
 
 // LL128 two-shot: complete peer-parallel slice groups per CTA, or the original warp per slice.
 static inline std::pair<dim3, dim3> ddaArLL128TwoShotGeom(const ncclComm* comm, size_t bytes, rcclDdaLaunchCap cap) {
   const size_t shardBytes = bytes / (size_t)std::max(comm->nRanks, 1);
   if (ddaArLL128TwoShotPeerParallel(comm, bytes, cap)) {
-    const unsigned threads = comm->nRanks == 32 ? 1024 : 512;
+    const bool partialReduce = ddaArLL128PartialReduce(comm->nRanks);
+    const unsigned threads = ddaArLL128BlockThreads(comm->nRanks, partialReduce);
+    const unsigned peerWarps = dda::common::ddaLL128ArTwoShotPeerWarps(
+        comm->nRanks, partialReduce, ddaArLL128PeersPerWarp(comm->nRanks));
     return ddaArFabricLLGrid(comm, ddaLL128Slices(shardBytes), threads,
-                             (unsigned)comm->nRanks * kDdaLL128Warp, cap);
+                             peerWarps * kDdaLL128Warp, cap);
   }
   return ddaArFabricLLGrid(comm, ddaLL128Slices(shardBytes), kDdaArLL128Threads, kDdaLL128Warp, cap);
 }
@@ -255,8 +298,47 @@ static DdaArLL128Kernel<T> ddaArLL128TwoShotKernel(int nRanks, int wire) {
   });
 }
 
+template <typename T, int N, int P>
+static DdaArLL128Kernel<T> ddaArLL128BlockKernel(unsigned threads) {
+  constexpr int factor = P == 1 ? 0 : P;
+  constexpr int groupThreads = (N / P) * kDdaLL128Warp;
+  if constexpr (groupThreads <= 64) {
+    if (threads == 64) return &dda::common::ddaAllReduceTwoShotLL128PeerParallel<T, N, (P > 1), factor, 64>;
+  }
+  if constexpr (groupThreads <= 128) {
+    if (threads == 128) return &dda::common::ddaAllReduceTwoShotLL128PeerParallel<T, N, (P > 1), factor, 128>;
+  }
+  if constexpr (groupThreads <= 256) {
+    if (threads == 256) return &dda::common::ddaAllReduceTwoShotLL128PeerParallel<T, N, (P > 1), factor, 256>;
+  }
+  return &dda::common::ddaAllReduceTwoShotLL128PeerParallel<T, N, (P > 1), factor>;
+}
+
+template <typename T, int N>
+static DdaArLL128Kernel<T> ddaArLL128PeersPerWarpKernel(int peersPerWarp, unsigned threads) {
+  switch (peersPerWarp) {
+  case 2: return ddaArLL128BlockKernel<T, N, 2>(threads);
+  case 4: return ddaArLL128BlockKernel<T, N, 4>(threads);
+  case 8:
+    if constexpr (N >= 8) return ddaArLL128BlockKernel<T, N, 8>(threads);
+    else return ddaArLL128BlockKernel<T, N, 4>(threads);
+  default: return ddaArLL128BlockKernel<T, N, 1>(threads);
+  }
+}
+
 template <typename T>
-static DdaArLL128Kernel<T> ddaArLL128PeerParallelKernel(int nRanks) {
+static DdaArLL128Kernel<T> ddaArLL128PeerParallelKernel(int nRanks, bool partialReduce, int peersPerWarp) {
+  if (peersPerWarp != 0) {
+    const unsigned threads = ddaArLL128BlockThreads(nRanks, partialReduce);
+    if (nRanks == 4) return ddaArLL128PeersPerWarpKernel<T, 4>(peersPerWarp, threads);
+    if (nRanks == 8) return ddaArLL128PeersPerWarpKernel<T, 8>(peersPerWarp, threads);
+    return ddaArLL128PeersPerWarpKernel<T, 16>(peersPerWarp, threads);
+  }
+  if (partialReduce) {
+    if (nRanks == 12) return &dda::common::ddaAllReduceTwoShotLL128PeerParallel<T, 12, true>;
+    if (nRanks == 32) return &dda::common::ddaAllReduceTwoShotLL128PeerParallel<T, 32, true>;
+    return &dda::common::ddaAllReduceTwoShotLL128PeerParallel<T, 16, true>;
+  }
   switch (nRanks) {
   case 4: return &dda::common::ddaAllReduceTwoShotLL128PeerParallel<T, 4>;
   case 8: return &dda::common::ddaAllReduceTwoShotLL128PeerParallel<T, 8>;
@@ -334,8 +416,9 @@ static ncclResult_t ncclAllReduceDdaFabricLL128OneShotTyped(const void* sendbuff
   return ncclSuccess;
 }
 
-// The peer-parallel two-shot grid covers 16/nRanks slices per CTA (one at 32 ranks); the legacy
-// kernel covers 16. Both retain the scratch layout indexed by shard and slice.
+// The peer-parallel two-shot grid covers 16/nRanks slices per CTA (one at 32 ranks),
+// or two with partial reductions at 12/16/32 ranks. The legacy kernel covers 16.
+// All retain the scratch layout indexed by shard and slice.
 template <typename T>
 static ncclResult_t ncclAllReduceDdaFabricLL128TwoShotTyped(const void* sendbuff, void* recvbuff, size_t count,
                                                             ncclComm* comm, cudaStream_t stream, rcclDdaLaunchCap cap) {
@@ -357,15 +440,20 @@ static ncclResult_t ncclAllReduceDdaFabricLL128TwoShotTyped(const void* sendbuff
   const int wire = ddaArLL128Wire(comm, bytes);
   const size_t lds = ddaArLL128SharedBytes(wire, block.x);
   const bool peerParallel = ddaArLL128TwoShotPeerParallel(comm, bytes, cap);
+  const bool partialReduce = peerParallel && ddaArLL128PartialReduce(nRanks);
+  const int peerFactor = ddaArLL128PeersPerWarp(nRanks);
+  const int peerWarps = peerParallel ? dda::common::ddaLL128ArTwoShotPeerWarps(nRanks, partialReduce, peerFactor) : 1;
+  const int peersPerWarp = peerParallel ? (nRanks + peerWarps - 1) / peerWarps : 0;
 
   INFO(NCCL_COLL,
        "DDA fabric AllReduce LL128 two-shot: nRanks=%d bytes=%zu shardBytes=%zu slices=%zu grid=%u block=%u wire=%d "
-       "lds=%zu peerParallel=%d (bankSize=%zu)",
-       nRanks, bytes, shardBytes, slices, grid.x, block.x, wire, lds, (int)peerParallel, bankSize);
+       "lds=%zu peerParallel=%d partialReduce=%d peersPerWarp=%d peerWarps=%d (bankSize=%zu)",
+       nRanks, bytes, shardBytes, slices, grid.x, block.x, wire, lds, (int)peerParallel, (int)partialReduce,
+       peersPerWarp, peerWarps, bankSize);
 
   const dda::common::DdaKernelParams params{comm->abortFlagDev};
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
-  const auto kernel = peerParallel ? ddaArLL128PeerParallelKernel<T>(nRanks)
+  const auto kernel = peerParallel ? ddaArLL128PeerParallelKernel<T>(nRanks, partialReduce, peerFactor)
                                    : ddaArLL128TwoShotKernel<T>(nRanks, wire);
   hipExtLaunchKernelGGL(kernel, grid, block, lds, stream, /*startEvent=*/nullptr,
                         stopEvent, /*flags=*/0, peers, static_cast<T*>(recvbuff), static_cast<const T*>(sendbuff),
