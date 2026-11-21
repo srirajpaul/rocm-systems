@@ -1,8 +1,9 @@
 # DPX hierarchical DDA ReduceScatter
 
 `RCCL_DDA_RS_HIERARCHICAL=1` enables an experimental hierarchy inside DDA's
-fabric/VMM (SIMPLE) ReduceScatter path. The default is `0`: initial measurements
-on eight gfx1250 DPX ranks showed the flat path was faster. This switch does not
+fabric/VMM (SIMPLE) ReduceScatter path. The default is `0`. Single-node tuning
+on eight gfx1250-strict DPX ranks improves large messages, while small messages
+still favor flat DDA. This switch does not
 change the existing DDA size thresholds or the LL/LL128 selection priority.
 Set it consistently on all communicator ranks before communicator creation.
 
@@ -13,7 +14,8 @@ hierarchy switch:
 export RCCL_FORCE_DDA=1
 export RCCL_DDA_LL=0
 export RCCL_DDA_LL128=0
-export RCCL_DDA_THRESHOLD=67108864  # total input bytes, 64 MiB
+export RCCL_DDA_THRESHOLD=268435456  # total input bytes, 256 MiB
+export RCCL_DDA_FABRIC_BUFFER_SIZE=268435456
 export RCCL_DDA_RS_HIERARCHICAL=1  # 0 selects the flat baseline
 ```
 
@@ -31,14 +33,38 @@ shards; each odd tile computes pair sums for odd destination shards. Stage 2
 reduces those partial sums within `(0,2,4,6)` or `(1,3,5,7)` and writes each rank's
 output shard. Reordered communicators use the actual destination rank offsets.
 
-The input is first staged using the existing stream-ordered copy. Pair sums
-overwrite only the scratch shards the sibling is not reading, keeping the
-existing scratch footprint. System-scope vector loads/stores provide peer
-visibility. Both stages assign the same offsets within every shard to the same
-block, so the intermediate per-block barrier orders all relevant producers.
+For eight ranks, staging is fused into the hierarchical kernel: each tile copies
+only the four input shards needed by its sibling. It reads its own contributions
+directly from the send buffer and overwrites only its own rail's scratch shards
+with pair sums. This removes the separate full-input copy and retains the existing
+scratch footprint. Other eligible rank counts retain the stream-ordered copy.
+System-scope vector loads/stores provide peer visibility, and every wave drains
+its scratch stores before the existing release/acquire barrier publishes them.
+All stages assign the same offsets within every shard to the same block, so the
+intermediate per-block barrier orders all relevant producers. This ownership also
+preserves in-place operation: a block consumes its input before writing its output.
 The final barrier protects scratch reuse by subsequent collectives. Graph replay
 uses the existing device barrier protocol. Floating-point reduction order differs
 from flat DDA, so bitwise equality with the flat algorithm is not guaranteed.
+
+The eight-rank kernel specializes the four-peer scaleup loop, defaults to 1024
+threads per block, and balances short grid-stride loops to avoid idle blocks.
+Large messages retain the full configured block cap. Small shards reduce the
+thread count automatically. Optional tuning controls, identical on every rank:
+
+- `RCCL_DDA_RS_HIER_THREADS=0` (default): automatic width; a positive override is
+  clamped to 64–1024 and rounded down to a multiple of 64. Generic hierarchies
+  default to 512 threads.
+- `RCCL_DDA_RS_HIER_BLOCKS=0` (default): use the existing fabric block cap; a
+  positive override caps the hierarchical grid without enlarging barrier storage.
+
+These settings do not alter the flat kernel or the global DDA thresholds. The
+eight-rank tuning was measured on node 02; other nodes and multi-node performance
+have not been evaluated in this tuning pass. Build RCCL with
+`bash install.sh --amdgpu_targets gfx1250-strict`. On this machine, `-l` detects
+`gfx1250` and produces a library that fails to launch with "device kernel image
+is invalid". Build rccl-tests for `gfx1250-strict` as well so its verification
+kernels can run.
 
 Initialization logs `DDA ReduceScatter hierarchy: rank=... sibling=...`.
 With `NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,COLL`, hierarchical launches log

@@ -14,12 +14,19 @@
 #include "algorithms/dda/dda_init_detail.h"
 #include "algorithms/dda/fabric/fabric_gpu_barrier.h"
 #include "rccl_common.h"
+#include "param.h"
 
 #include <cuda_runtime.h>
 #include <hip/hip_ext.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
+
+// Zero selects the tuned eight-rank width (1024), or 512 for the generic path.
+// Overrides must agree across ranks; block count cannot exceed allocated flags.
+RCCL_PARAM(DdaRsHierThreads, "DDA_RS_HIER_THREADS", 0);
+RCCL_PARAM(DdaRsHierBlocks, "DDA_RS_HIER_BLOCKS", 0);
 
 namespace {
 
@@ -46,8 +53,8 @@ static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* 
   // For reduce-scatter we use recvcount for grid calculation since each rank
   // processes its own shard.
   auto gridBlock = dda::common::getGridAndBlockDims(recvcount, sizeof(T), nBlocksMax);
-  const auto& grid = gridBlock.first;
-  const auto& block = gridBlock.second;
+  auto grid = gridBlock.first;
+  auto block = gridBlock.second;
 
   auto* barrierState = static_cast<DdaFabricBarrierState*>(comm->ddaFabricBarrierState);
   dda::common::FabricGpuBarrier barrierHost = barrierState->barrierHost;
@@ -55,15 +62,40 @@ static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* 
   void* peerPtrsDev = comm->ddaPeerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
 
-  CUDACHECK(cudaMemcpyAsync(comm->ddaScratch, sendbuff, totalCount * sizeof(T), cudaMemcpyDeviceToDevice, stream));
+  const bool stageInKernel = nRanks == 8 && barrierState->rsHierarchy.nScaleUp == 4;
+  if (!stageInKernel) {
+    CUDACHECK(cudaMemcpyAsync(comm->ddaScratch, sendbuff, totalCount * sizeof(T), cudaMemcpyDeviceToDevice, stream));
+  }
 
   if (barrierState->rsHierarchy.nScaleUp != 0) {
+    const int64_t requestedThreads = rcclParamDdaRsHierThreads() > 0
+                                       ? rcclParamDdaRsHierThreads() : (stageInKernel ? 1024 : 512);
+    const unsigned threads = std::clamp<int64_t>(requestedThreads, 64, 1024) / 64 * 64;
+    const size_t vectors = recvcount * sizeof(T) / 16;
+    const unsigned cap = rcclParamDdaRsHierBlocks() > 0
+                           ? std::min<int64_t>(rcclParamDdaRsHierBlocks(), nBlocksMax) : nBlocksMax;
+    grid.x = std::max<size_t>(1, std::min<size_t>(cap, (vectors + threads - 1) / threads));
+    if (stageInKernel) {
+      const size_t trips = std::max<size_t>(1, (vectors + size_t(cap) * threads - 1) / (size_t(cap) * threads));
+      // For short loops, avoid leaving many blocks idle on the last trip.
+      // Longer loops benefit more from keeping the full grid's parallelism.
+      if (trips <= 3) grid.x = std::max<size_t>(1, (vectors + trips * threads - 1) / (trips * threads));
+    }
+    block.x = std::min<size_t>(threads, std::max<size_t>(64, (vectors + 63) / 64 * 64));
     INFO(NCCL_COLL, "DDA fabric ReduceScatter: launching kernel: hierarchical scale-in=2 scaleup=%d "
                    "nRanks=%d recvcount=%zu grid=%u block=%u",
          barrierState->rsHierarchy.nScaleUp, nRanks, recvcount, grid.x, block.x);
-    hipExtLaunchKernelGGL((dda::common::ddaReduceScatterFabricHierarchical<T>), grid, block, 0, stream,
+    if (stageInKernel) {
+      hipExtLaunchKernelGGL((dda::common::ddaReduceScatterFabricHierarchical<T, 4, true>), grid, block, 0, stream,
                          /*startEvent=*/nullptr, rcclTakeAddonStopEvent(comm), /*flags=*/0, d_ipcbuffs,
-                         static_cast<T*>(recvbuff), recvcount, comm->rank, barrierState->rsHierarchy, barrierHost);
+                         static_cast<T*>(recvbuff), recvcount, comm->rank, barrierState->rsHierarchy, barrierHost,
+                         static_cast<const T*>(sendbuff));
+    } else {
+      hipExtLaunchKernelGGL((dda::common::ddaReduceScatterFabricHierarchical<T>), grid, block, 0, stream,
+                         /*startEvent=*/nullptr, rcclTakeAddonStopEvent(comm), /*flags=*/0, d_ipcbuffs,
+                         static_cast<T*>(recvbuff), recvcount, comm->rank, barrierState->rsHierarchy, barrierHost,
+                         static_cast<const T*>(sendbuff));
+    }
     CUDACHECK(cudaGetLastError());
     return ncclSuccess;
   }

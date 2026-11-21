@@ -35,8 +35,8 @@ RCCL_PARAM(DdaFabricBufferSizeForScratch, "DDA_FABRIC_BUFFER_SIZE", -1);
 // one-token CAS flags (see FabricGpuBarrier::signalWaitPeer / postPeer / waitPeer). Must be the same on every rank.
 // With 0 the pushes run without drain blocks (RCCL_DDA_A2A_PUSH_PEER_DRAIN is ignored).
 RCCL_PARAM(DdaA2APushPeerEpoch, "DDA_A2A_PUSH_PEER_EPOCH", 1);
-// Opt-in DPX scale-in followed by scaleup for VMM ReduceScatter. The extra
-// synchronization is not yet faster than the flat path on the measured sizes.
+// Opt-in DPX scale-in followed by scaleup for VMM ReduceScatter. Eight-rank
+// tuning improves large messages; small messages still favor the flat path.
 // Like the other DDA protocol switches, this must agree across communicator ranks.
 RCCL_PARAM(DdaRsHierarchical, "DDA_RS_HIERARCHICAL", 0);
 
