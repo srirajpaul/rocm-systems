@@ -229,6 +229,41 @@ public:
     return peerFlags_[selfRank_] + getEpochFlagIdx(from, fromBlock);
   }
 
+  // Pipeline ready/credit exchange. Producer and consumer CTAs use distinct
+  // block rows of the existing epoch region; each peer gets one signaling lane.
+  template <int Peers>
+  __device__ __forceinline__ void epochPostRanks(const int* ranks, FlagType value) {
+#if defined(__gfx1250__) || defined(__gfx1250_strict__)
+    // The pipeline's payload stores are already system-scope. Match the tuned
+    // hierarchy's strict-target drain instead of flushing unrelated scratch.
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    asm volatile("s_wait_loadcnt 0x0\n\ts_wait_storecnt 0x0" ::: "memory");
+    __syncthreads();
+#else
+    orderDestWrites();
+#endif
+    if (threadIdx.x < Peers) {
+      // Same publication sequence as epochPost, applied to each rail peer.
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      __scoped_atomic_store_n(peerFlags_[ranks[threadIdx.x]] + getEpochFlagIdx(selfRank_, blockIdx.x),
+                              value, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
+    }
+    __syncthreads();
+  }
+
+  template <int Peers>
+  __device__ __forceinline__ void epochWaitRanks(const int* ranks, int fromBlock, FlagType value) {
+    if (threadIdx.x < Peers) {
+      const FlagType* flag = epochFlagFrom(ranks[threadIdx.x], fromBlock);
+      int spins = 0;
+      while (static_cast<int32_t>(__scoped_atomic_load_n(flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - value) < 0) {
+        if (params_.abortSpinTick(spins)) break;
+      }
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    }
+    __syncthreads();
+  }
+
   // ---- The flag calls of the peer-major pushes ----------------------------------------------------------------------
   // Two schemes behind the same three calls, chosen on the host with setEpochFlags (RCCL_DDA_A2A_PUSH_PEER_EPOCH):
   //   epoch (default): monotonic epoch flags, a post never waits (epochSignalWait / epochPostPiece / epochWaitPiece);

@@ -763,7 +763,7 @@ endforeach()
 foreach(_coll all_reduce reduce_scatter all_gather alltoall)
   foreach(_proto "" _ll _ll128)
     dl_add_fat_object(dda_${_coll}_fabric${_proto}
-      ${_dda_dir}/${_coll}/dda_${_coll}_fabric${_proto}.cu.cpp SUPPRESS_WARNINGS)
+      ${_dda_dir}/${_coll}/dda_${_coll}_fabric${_proto}.cu.cpp SUPPRESS_WARNINGS DEPFILE_TRACKING)
   endforeach()
 endforeach()
 foreach(_proto _ll _ll128)
