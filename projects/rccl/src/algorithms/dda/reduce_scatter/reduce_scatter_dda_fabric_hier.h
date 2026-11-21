@@ -100,18 +100,48 @@ __launch_bounds__(512)
   syncGroup(pkgFirst, 1, scaleIn, 0);
 
   // Scale-in: partial[shard] = sum over the package of shard, for the shards of this tile.
-  for (size_t idx = idxStart; idx < count; idx += idxStride) {
-#pragma unroll kGroupUnroll
-    for (int g = 0; g < nGroups; ++g) {
-      const size_t off = static_cast<size_t>(g * scaleIn + tile) * count + idx;
-      uint4 sum = reinterpret_cast<const uint4*>(&sendbuff[off])[0];
-#pragma unroll kScaleInUnroll
-      for (int t = 0; t < scaleIn; ++t) {
-        if (t != tile) {
-          sum = vecElementAdd<T>(sum, reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][off])[0]);
+  if constexpr (SCALE_IN_CT > 0 && NGROUPS_CT > 0) {
+    // A row loads every input before it stores any partial. The stores go through the ipcbuffs table, so the compiler
+    // cannot move a later load above an earlier store, and an interleaved loop would wait out each load in turn.
+    for (size_t idx = idxStart; idx < count; idx += idxStride) {
+      uint4 sum[NGROUPS_CT];
+      uint4 peer[NGROUPS_CT][SCALE_IN_CT];
+#pragma unroll
+      for (int g = 0; g < NGROUPS_CT; ++g) {
+        const size_t off = static_cast<size_t>(g * SCALE_IN_CT + tile) * count + idx;
+        sum[g] = reinterpret_cast<const uint4*>(&sendbuff[off])[0];
+#pragma unroll
+        for (int t = 0; t < SCALE_IN_CT; ++t) {
+          if (t != tile) {
+            peer[g][t] = reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][off])[0];
+          }
         }
       }
-      *reinterpret_cast<uint4*>(&self[off]) = sum;
+#pragma unroll
+      for (int g = 0; g < NGROUPS_CT; ++g) {
+#pragma unroll
+        for (int t = 0; t < SCALE_IN_CT; ++t) {
+          if (t != tile) {
+            sum[g] = vecElementAdd<T>(sum[g], peer[g][t]);
+          }
+        }
+        *reinterpret_cast<uint4*>(&self[static_cast<size_t>(g * SCALE_IN_CT + tile) * count + idx]) = sum[g];
+      }
+    }
+  } else {
+    for (size_t idx = idxStart; idx < count; idx += idxStride) {
+#pragma unroll kGroupUnroll
+      for (int g = 0; g < nGroups; ++g) {
+        const size_t off = static_cast<size_t>(g * scaleIn + tile) * count + idx;
+        uint4 sum = reinterpret_cast<const uint4*>(&sendbuff[off])[0];
+#pragma unroll kScaleInUnroll
+        for (int t = 0; t < scaleIn; ++t) {
+          if (t != tile) {
+            sum = vecElementAdd<T>(sum, reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][off])[0]);
+          }
+        }
+        *reinterpret_cast<uint4*>(&self[off]) = sum;
+      }
     }
   }
   syncGroup(tile, scaleIn, nGroups, 1);
@@ -322,25 +352,60 @@ __launch_bounds__(512)
     return r / scaleIn == pkg || r % scaleIn == tile;
   });
 
-  for (size_t idx = idxStart; idx < count; idx += idxStride) {
-#pragma unroll kGroupUnroll
-    for (int k = 0; k < nGroups; ++k) {
-      // Start each rank on a different owner, so this tile's ranks do not all store into one package at once.
-      int g = pkg + k;
-      if (g >= nGroups) g -= nGroups;
-      const size_t off = static_cast<size_t>(g * scaleIn + tile) * count + idx;
-      uint4 sum = reinterpret_cast<const uint4*>(&sendbuff[off])[0];
-#pragma unroll kScaleInUnroll
-      for (int t = 0; t < scaleIn; ++t) {
-        if (t != tile) {
-          sum = vecElementAdd<T>(sum, reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][off])[0]);
+  auto ownerOf = [&](int k) {
+    // Start each rank on a different owner, so this tile's ranks do not all store into one package at once.
+    const int g = pkg + k;
+    return g >= nGroups ? g - nGroups : g;
+  };
+  auto storePartial = [&](int g, size_t idx, const uint4& sum) {
+    if (g == pkg) {
+      // recvbuff may alias shard selfRank of sendbuff, which this thread has already read at idx.
+      *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
+    } else {
+      *reinterpret_cast<uint4*>(&ipcbuffs[g * scaleIn + tile][static_cast<size_t>(selfRank) * count + idx]) = sum;
+    }
+  };
+  if constexpr (SCALE_IN_CT > 0 && NGROUPS_CT > 0) {
+    // A row loads every input before its first store, as in ddaReduceScatterFabricHier's scale-in.
+    for (size_t idx = idxStart; idx < count; idx += idxStride) {
+      uint4 sum[NGROUPS_CT];
+      uint4 peer[NGROUPS_CT][SCALE_IN_CT];
+#pragma unroll
+      for (int k = 0; k < NGROUPS_CT; ++k) {
+        const size_t off = static_cast<size_t>(ownerOf(k) * SCALE_IN_CT + tile) * count + idx;
+        sum[k] = reinterpret_cast<const uint4*>(&sendbuff[off])[0];
+#pragma unroll
+        for (int t = 0; t < SCALE_IN_CT; ++t) {
+          if (t != tile) {
+            peer[k][t] = reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][off])[0];
+          }
         }
       }
-      if (g == pkg) {
-        // recvbuff may alias shard selfRank of sendbuff, which this thread has just read at idx.
-        *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
-      } else {
-        *reinterpret_cast<uint4*>(&ipcbuffs[g * scaleIn + tile][static_cast<size_t>(selfRank) * count + idx]) = sum;
+#pragma unroll
+      for (int k = 0; k < NGROUPS_CT; ++k) {
+#pragma unroll
+        for (int t = 0; t < SCALE_IN_CT; ++t) {
+          if (t != tile) {
+            sum[k] = vecElementAdd<T>(sum[k], peer[k][t]);
+          }
+        }
+        storePartial(ownerOf(k), idx, sum[k]);
+      }
+    }
+  } else {
+    for (size_t idx = idxStart; idx < count; idx += idxStride) {
+#pragma unroll kGroupUnroll
+      for (int k = 0; k < nGroups; ++k) {
+        const int g = ownerOf(k);
+        const size_t off = static_cast<size_t>(g * scaleIn + tile) * count + idx;
+        uint4 sum = reinterpret_cast<const uint4*>(&sendbuff[off])[0];
+#pragma unroll kScaleInUnroll
+        for (int t = 0; t < scaleIn; ++t) {
+          if (t != tile) {
+            sum = vecElementAdd<T>(sum, reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][off])[0]);
+          }
+        }
+        storePartial(g, idx, sum);
       }
     }
   }
