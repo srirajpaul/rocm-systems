@@ -57,6 +57,23 @@ public:
   // (the ranks of a package, or one rank of every package) without waiting on the rest of the comm.
   template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess>
   __device__ __forceinline__ void syncGroupOnSameBlockIdx(int firstRank, int rankStride, int nGroupRanks) {
+    syncRanksOnSameBlockIdx<hasPreviousMemAccess, hasSubsequentMemAccess>(nGroupRanks, [&](int i) {
+      return firstRank + i * rankStride;
+    });
+  }
+
+  // syncOnSameBlockIdx with every rank r != this rank for which inPeerSet(r) holds. The relation must be symmetric
+  // (r is in this rank's set exactly when this rank is in r's), so two topology levels can sync in one round.
+  template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess, typename InPeerSet>
+  __device__ __forceinline__ void syncPeerSetOnSameBlockIdx(InPeerSet inPeerSet) {
+    syncRanksOnSameBlockIdx<hasPreviousMemAccess, hasSubsequentMemAccess>(nRanks_, [&](int r) {
+      return r != selfRank_ && inPeerSet(r) ? r : -1;
+    });
+  }
+
+  // The body of the syncs above: rankOf(0) .. rankOf(nIter - 1) name the peers in increasing order, -1 skips one.
+  template <bool hasPreviousMemAccess, bool hasSubsequentMemAccess, typename RankOf>
+  __device__ __forceinline__ void syncRanksOnSameBlockIdx(int nIter, RankOf rankOf) {
     enum class MemFenceType {
       RELEASE_ACQUIRE,
       RELEASE_ONLY,
@@ -81,8 +98,9 @@ public:
     // same increasing order, so the interleaved signal/wait cannot deadlock.
     FlagType* selfBuf = peerFlags_[selfRank_];
     bool gaveUp = false;
-    for (int i = threadIdx.x; !aborted_ && i < nGroupRanks; i += blockDim.x) {
-      const int peerRank = firstRank + i * rankStride;
+    for (int i = threadIdx.x; !aborted_ && i < nIter; i += blockDim.x) {
+      const int peerRank = rankOf(i);
+      if (peerRank < 0) continue;
       FlagType* peerBuf = peerFlags_[peerRank];
       bool signaled = false;
 

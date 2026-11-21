@@ -36,6 +36,10 @@
  * and the input needs no staging copy. Each block cuts its rows into pieces and
  * pipelines them with per-peer tokens, so a piece's scale-up overlaps the next
  * pieces' scale-in and pushes instead of every rank waiting at group barriers.
+ *
+ * ddaReduceScatterFabricHierPushUp loads at the scale-in level, like the pull
+ * kernel, and stores at the scale-up level: each rank pushes every partial to
+ * the rank that owns its shard, which then reduces from its own scratch.
  * See LICENSE.txt for license information.
  ************************************************************************/
 
@@ -247,6 +251,92 @@ __launch_bounds__(512)
       });
       barrier.postPeers(pkgPeer, scaleIn - 1);
     }
+  }
+
+  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
+}
+
+// Scale-in by loads, scale-up by stores. Rank r = pkg * S + tile (S = scaleIn); its scratch slots are:
+//   slot g * S + t, t != tile: this rank's staged shard g * S + t, which package peer t loads.
+//   slot g * S + tile, g != pkg: package g's partial of shard r, stored by rank g * S + tile.
+// The slot sets are disjoint, so a partial can land while the package peer still loads the staged shards.
+//
+//   Stage:    copy the shards of the other tiles from sendbuff into scratch. Sync the package and this tile's ranks
+//             in one round: the package peers' staged shards are then readable, and every rank this one stores into
+//             is past its previous collective, which may still use the slots (the LL tiers have no closing barrier).
+//   Scale-in: for every shard of this tile, add the package peers' staged copies to sendbuff. Keep the own shard's
+//             partial in recvbuff; store the others into their owners' scratch. Sync this tile's ranks.
+//   Scale-up: add the partials of the other packages from this rank's scratch to recvbuff.
+//   End:      sync the comm, so no rank reuses scratch a peer still loads or stores into.
+template <typename T, int SCALE_IN_CT, int NGROUPS_CT>
+#if defined(USE_ROCM)
+__launch_bounds__(512)
+#endif
+  __global__ void ddaReduceScatterFabricHierPushUp(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff,
+                                                   size_t count, const T* __restrict__ sendbuff, int selfRank,
+                                                   int nRanks, int scaleInRt, FabricGpuBarrier barrier) {
+  static_assert(is_supported_type_v<T>, "dda: unsupported element type");
+  const int scaleIn = (SCALE_IN_CT > 0) ? SCALE_IN_CT : scaleInRt;
+  const int nGroups = (NGROUPS_CT > 0) ? NGROUPS_CT : nRanks / scaleIn;
+  constexpr int kScaleInUnroll = (SCALE_IN_CT > 0) ? SCALE_IN_CT : 2;
+  constexpr int kGroupUnroll = (NGROUPS_CT > 0) ? NGROUPS_CT : 8;
+  const int tile = selfRank % scaleIn;
+  const int pkg = selfRank / scaleIn;
+  const int pkgFirst = selfRank - tile;
+
+  constexpr auto countPerThread = sizeof(uint4) / sizeof(T);
+  const size_t idxStart = (static_cast<size_t>(blockDim.x) * blockIdx.x + threadIdx.x) * countPerThread;
+  const size_t idxStride = static_cast<size_t>(gridDim.x) * blockDim.x * countPerThread;
+
+  T* const self = ipcbuffs[selfRank];
+
+  for (int g = 0; g < nGroups; ++g) {
+#pragma unroll kScaleInUnroll
+    for (int t = 0; t < scaleIn; ++t) {
+      if (t != tile) {
+        const size_t off = static_cast<size_t>(g * scaleIn + t) * count;
+        copyFromSrcToDest<T>(sendbuff + off, self + off, idxStart, count, idxStride);
+      }
+    }
+  }
+  barrier.syncPeerSetOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>([&](int r) {
+    return r / scaleIn == pkg || r % scaleIn == tile;
+  });
+
+  for (size_t idx = idxStart; idx < count; idx += idxStride) {
+#pragma unroll kGroupUnroll
+    for (int k = 0; k < nGroups; ++k) {
+      // Start each rank on a different owner, so this tile's ranks do not all store into one package at once.
+      int g = pkg + k;
+      if (g >= nGroups) g -= nGroups;
+      const size_t off = static_cast<size_t>(g * scaleIn + tile) * count + idx;
+      uint4 sum = reinterpret_cast<const uint4*>(&sendbuff[off])[0];
+#pragma unroll kScaleInUnroll
+      for (int t = 0; t < scaleIn; ++t) {
+        if (t != tile) {
+          sum = vecElementAdd<T>(sum, reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][off])[0]);
+        }
+      }
+      if (g == pkg) {
+        // recvbuff may alias shard selfRank of sendbuff, which this thread has just read at idx.
+        *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
+      } else {
+        *reinterpret_cast<uint4*>(&ipcbuffs[g * scaleIn + tile][static_cast<size_t>(selfRank) * count + idx]) = sum;
+      }
+    }
+  }
+  barrier.syncGroupOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(tile, scaleIn,
+                                                                                                      nGroups);
+
+  for (size_t idx = idxStart; idx < count; idx += idxStride) {
+    uint4 sum = *reinterpret_cast<const uint4*>(&recvbuff[idx]);
+#pragma unroll kGroupUnroll
+    for (int k = 1; k < nGroups; ++k) {
+      int g = pkg + k;
+      if (g >= nGroups) g -= nGroups;
+      sum = vecElementAdd<T>(sum, ddaHierLoadPushed(&self[static_cast<size_t>(g * scaleIn + tile) * count + idx]));
+    }
+    *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
   }
 
   barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
