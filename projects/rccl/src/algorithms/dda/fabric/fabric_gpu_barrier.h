@@ -126,6 +126,30 @@ public:
     }
   }
 
+  // Posts this rank's token for this block to every rank peerOf(0) .. peerOf(nPeers - 1) once every store of the
+  // block has completed, one peer per thread. A slot holds one token and a post waits until the previous one was
+  // consumed, so each post must be matched by one waitPeers on the receiver within the same kernel.
+  template <typename PeerOf>
+  __device__ __forceinline__ void postPeers(PeerOf peerOf, int nPeers) {
+    orderDestWrites();
+    for (int i = threadIdx.x; !aborted_ && i < nPeers; i += blockDim.x) {
+      if (!putFlag<std::memory_order_release>(peerFlags_[peerOf(i)] + getFlagIdx(selfRank_, blockIdx.x), params_)) {
+        aborted_ = true;
+      }
+    }
+  }
+
+  // Consumes the token of every rank peerOf(0) .. peerOf(nPeers - 1) for this block, then syncs the block.
+  template <typename PeerOf>
+  __device__ __forceinline__ void waitPeers(PeerOf peerOf, int nPeers) {
+    for (int i = threadIdx.x; !aborted_ && i < nPeers; i += blockDim.x) {
+      if (!waitFlag<std::memory_order_acquire>(peerFlags_[selfRank_] + getFlagIdx(peerOf(i), blockIdx.x), params_)) {
+        aborted_ = true;
+      }
+    }
+    aborted_ = __syncthreads_or(aborted_);
+  }
+
   // Waits until every store this wave has issued has completed, so a system-scope store has reached its
   // destination and then syncs the block so every wave's stores are done.
   __device__ __forceinline__ void orderDestWrites() {
