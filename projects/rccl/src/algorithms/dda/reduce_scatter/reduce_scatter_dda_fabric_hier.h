@@ -32,6 +32,11 @@
  * EPOCH_FLAGS syncs with the barrier's epoch flags (one-way stores) instead of
  * its toggle flags (a remote CAS round trip per peer); the three syncs post
  * epoch, epoch + 1 and epoch + 2.
+ * Scratch is used from element scratchOff of every rank's buffer. Without
+ * END_BARRIER the kernel skips the closing comm sync; the launcher then gives it
+ * a private scratch region no other collective uses and alternates its two
+ * halves per launch, so the next launch never overwrites what a slow peer of
+ * this one may still load (see ncclReduceScatterDdaFabricTyped).
  *
  * ddaReduceScatterFabricHierPush runs the same two levels with stores instead
  * of loads: every cross-rank transfer pushes into the receiver's scratch and
@@ -57,13 +62,13 @@
 
 namespace dda::common {
 
-template <typename T, int SCALE_IN_CT, int NGROUPS_CT, bool EPOCH_FLAGS>
+template <typename T, int SCALE_IN_CT, int NGROUPS_CT, bool EPOCH_FLAGS, bool END_BARRIER>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
   __global__ void ddaReduceScatterFabricHier(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                              const T* __restrict__ sendbuff, int selfRank, int nRanks, int scaleInRt,
-                                             FabricGpuBarrier barrier) {
+                                             size_t scratchOff, FabricGpuBarrier barrier) {
   static_assert(is_supported_type_v<T>, "dda: unsupported element type");
   const int scaleIn = (SCALE_IN_CT > 0) ? SCALE_IN_CT : scaleInRt;
   const int nGroups = (NGROUPS_CT > 0) ? NGROUPS_CT : nRanks / scaleIn;
@@ -76,7 +81,7 @@ __launch_bounds__(512)
   const size_t idxStart = (static_cast<size_t>(blockDim.x) * blockIdx.x + threadIdx.x) * countPerThread;
   const size_t idxStride = static_cast<size_t>(gridDim.x) * blockDim.x * countPerThread;
 
-  T* const self = ipcbuffs[selfRank];
+  T* const self = ipcbuffs[selfRank] + scratchOff;
 
   // Stage: only the package peers read this rank's raw input.
   for (int g = 0; g < nGroups; ++g) {
@@ -113,7 +118,7 @@ __launch_bounds__(512)
 #pragma unroll
         for (int t = 0; t < SCALE_IN_CT; ++t) {
           if (t != tile) {
-            peer[g][t] = reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][off])[0];
+            peer[g][t] = reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][scratchOff + off])[0];
           }
         }
       }
@@ -137,7 +142,7 @@ __launch_bounds__(512)
 #pragma unroll kScaleInUnroll
         for (int t = 0; t < scaleIn; ++t) {
           if (t != tile) {
-            sum = vecElementAdd<T>(sum, reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][off])[0]);
+            sum = vecElementAdd<T>(sum, reinterpret_cast<const uint4*>(&ipcbuffs[pkgFirst + t][scratchOff + off])[0]);
           }
         }
         *reinterpret_cast<uint4*>(&self[off]) = sum;
@@ -156,7 +161,8 @@ __launch_bounds__(512)
       // Start each rank on a different package so the tile's ranks do not all load from one peer at once.
       int g = pkg + k;
       if (g >= nGroups) g -= nGroups;
-      sum = vecElementAdd<T>(sum, reinterpret_cast<const uint4*>(&ipcbuffs[g * scaleIn + tile][selfOff + idx])[0]);
+      sum = vecElementAdd<T>(
+        sum, reinterpret_cast<const uint4*>(&ipcbuffs[g * scaleIn + tile][scratchOff + selfOff + idx])[0]);
     }
     *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
   }
@@ -164,7 +170,7 @@ __launch_bounds__(512)
   if constexpr (EPOCH_FLAGS) {
     barrier.epochSyncGroup(0, 1, nRanks, epoch + 2);
     barrier.epochEnd(epoch, 1);
-  } else {
+  } else if constexpr (END_BARRIER) {
     barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
   }
 }

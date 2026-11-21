@@ -746,6 +746,12 @@ struct ncclComm {
   // when the comm does not split into two or more such packages. Hierarchical DDA kernels
   // reduce within a package (scale-in) before crossing packages (scale-up).
   int ddaHierScaleIn;
+  // Private scratch of the hierarchical DDA ReduceScatter without a closing barrier (RCCL_DDA_RS_HIER_PRIVATE): byte
+  // offset in ddaScratch past ddaScratchBytes, bytes per half (0 = none), and launches so far, whose parity picks
+  // the half. No other collective uses it.
+  size_t ddaHierRsPrivOffset;
+  size_t ddaHierRsPrivHalfBytes;
+  uint64_t ddaHierRsPrivCalls;
   // [RCCL] Set by ncclCommShrink(NCCL_SHRINK_ABORT). An abort can leave ranks with
   // different LL epochs and unconsumed barrier mailbox slots, so DDA must not
   // run on this comm again until that state is resynchronized.

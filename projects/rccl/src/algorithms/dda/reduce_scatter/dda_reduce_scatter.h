@@ -41,6 +41,10 @@ ncclResult_t ncclReduceScatterDdaFabric(const void* sendbuff, void* recvbuff, si
 // does not split into packages or RCCL_DDA_RS_HIER=0. The selector lifts the RS VMM tier to it.
 size_t ncclReduceScatterDdaFabricHierMaxBytes(const ncclComm* comm);
 
+// Before the private scratch region of RCCL_DDA_RS_HIER_MODE=5 is freed: waits until every rank's launches are done,
+// since that mode has no closing barrier. A no-op unless the comm launched mode 5.
+ncclResult_t ncclReduceScatterDdaFabricHierDrain(ncclComm* comm);
+
 // LL-protocol fabric path (small-shard fast lane, 16B lines, no barrier).
 bool ncclReduceScatterDdaFabricLLEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t recvcount,
                                           ncclDataType_t datatype, ncclRedOp_t op);

@@ -14,6 +14,7 @@
 #include "algorithms/dda/dda_init_detail.h"
 #include "algorithms/dda/fabric/fabric_gpu_barrier.h"
 #include "algorithms/dda/fabric/fabric_mem_handler.h"
+#include "algorithms/dda/reduce_scatter/dda_reduce_scatter.h"
 #include "bootstrap.h"
 #include "rccl_common.h"
 #include "param.h"
@@ -31,6 +32,11 @@ using nccl_dda_detail::DdaFabricBarrierState;
 using nccl_dda_detail::DdaFabricMaxBlocksOverride;
 
 RCCL_PARAM(DdaFabricBufferSizeForScratch, "DDA_FABRIC_BUFFER_SIZE", -1);
+// RCCL_DDA_RS_HIER_PRIVATE: 1 appends a private region of two RCCL_DDA_RS_HIER_THRESHOLD halves to the scratch of a
+// partitioned comm, for the hierarchical ReduceScatter without a closing barrier (RCCL_DDA_RS_HIER_MODE=5). 0 (default)
+// allocates nothing extra. Must be the same on every rank.
+RCCL_PARAM(DdaRsHierPrivate, "DDA_RS_HIER_PRIVATE", 0);
+RCCL_PARAM_DECLARE(DdaRsHierThreshold);
 // RCCL_DDA_A2A_PUSH_PEER_EPOCH: 1 (default) uses epoch flags for the peer-major vector and TDM alltoall pushes, 0 the
 // one-token CAS flags (see FabricGpuBarrier::signalWaitPeer / postPeer / waitPeer). Must be the same on every rank.
 // With 0 the pushes run without drain blocks (RCCL_DDA_A2A_PUSH_PEER_DRAIN is ignored).
@@ -106,6 +112,15 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
   if (bytes == 0) {
     return ncclSuccess;
   }
+  // The private region sits past ddaScratchBytes, which every other collective stays below.
+  const int hierScaleIn = ddaHierScaleInSize(comm);
+  constexpr size_t kPrivAlign = 4096;
+  const size_t privOffset = (bytes + kPrivAlign - 1) / kPrivAlign * kPrivAlign;
+  size_t privHalf = 0;
+  if (rcclParamDdaRsHierPrivate() && hierScaleIn > 0 && rcclParamDdaRsHierThreshold() > 0) {
+    privHalf = (static_cast<size_t>(rcclParamDdaRsHierThreshold()) + kPrivAlign - 1) / kPrivAlign * kPrivAlign;
+  }
+  const size_t allocBytes = privHalf > 0 ? privOffset + 2 * privHalf : bytes;
 
   // Scratch (temp) buffer via VMM: the fabric path requires a fabric-capable
   // (cuMem) allocation so the handle can be exported across the clique. If VMM
@@ -168,7 +183,7 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
   const size_t epochLen = ddaLLEpochCount(nRanks, nBlocksMax);
   ncclResult_t res = ncclSuccess;
 
-  res = ncclCuMemAlloc(&scratch, &scratchHandle, ncclCuMemHandleType, bytes, comm->memManager);
+  res = ncclCuMemAlloc(&scratch, &scratchHandle, ncclCuMemHandleType, allocBytes, comm->memManager);
   if (res != ncclSuccess || scratch == nullptr) {
     INFO(NCCL_INIT, "ncclDdaFabricCommInit: VMM scratch alloc failed; skipping fabric DDA path");
     scratch = nullptr;
@@ -181,7 +196,7 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
     goto fail;
   }
 
-  NCCLCHECKGOTO(handler->addSelfDeviceMem(scratch, scratchHandle, bytes), res, fail);
+  NCCLCHECKGOTO(handler->addSelfDeviceMem(scratch, scratchHandle, allocBytes), res, fail);
   NCCLCHECKGOTO(handler->exchangeMemPtrs(), res, fail);
 
   CUDACHECKGOTO(cudaMalloc(&peerDev, nRanks * sizeof(void*)), res, fail);
@@ -223,7 +238,7 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
     cudaStream_t zeroStream = nullptr;
     ready = ready && cudaOk(cudaStreamCreateWithFlags(&zeroStream, cudaStreamNonBlocking), "zero-fill stream create");
     // Zeroed once; later LL calls rely on monotonic epochs (>= 1) and two banks, not re-zeroing.
-    ready = ready && cudaOk(cudaMemsetAsync(scratch, 0, bytes, zeroStream), "scratch memset");
+    ready = ready && cudaOk(cudaMemsetAsync(scratch, 0, allocBytes, zeroStream), "scratch memset");
     // Zeroed epoch cells make the first device-derived LL flag 1.
     ready = ready && cudaOk(cudaMalloc(&epochDev, epochLen * sizeof(uint32_t)), "epoch alloc") &&
             cudaOk(cudaMemsetAsync(epochDev, 0, epochLen * sizeof(uint32_t), zeroStream), "epoch memset");
@@ -255,7 +270,14 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
   comm->ddaFabricMaxBlocks = nBlocksMax;
   comm->ddaLLEpochDev = epochDev;
   comm->ddaLLEpochLen = (int)epochLen;
-  comm->ddaHierScaleIn = ddaHierScaleInSize(comm);
+  comm->ddaHierScaleIn = hierScaleIn;
+  comm->ddaHierRsPrivOffset = privHalf > 0 ? privOffset : 0;
+  comm->ddaHierRsPrivHalfBytes = privHalf;
+  comm->ddaHierRsPrivCalls = 0;
+  if (privHalf > 0) {
+    INFO(NCCL_INIT, "ncclDdaFabricCommInit: hierarchical RS private scratch: 2 x %zu bytes at offset %zu", privHalf,
+         privOffset);
+  }
   if (comm->ddaHierScaleIn > 0) {
     INFO(NCCL_INIT, "ncclDdaFabricCommInit: hierarchical scale-in size %d (%d packages of nRanks %d)",
          comm->ddaHierScaleIn, nRanks / comm->ddaHierScaleIn, nRanks);
@@ -297,6 +319,7 @@ ncclResult_t ncclDdaFabricCommFini(ncclComm* comm) {
   if (comm == nullptr) {
     return ncclSuccess;
   }
+  NCCLCHECK(ncclReduceScatterDdaFabricHierDrain(comm));
   if (comm->ddaFabricBarrierState != nullptr) {
     delete static_cast<DdaFabricBarrierState*>(comm->ddaFabricBarrierState);
     comm->ddaFabricBarrierState = nullptr;
@@ -307,6 +330,8 @@ ncclResult_t ncclDdaFabricCommFini(ncclComm* comm) {
   comm->ddaLLEpochDev = nullptr;
   comm->ddaLLEpochLen = 0;
   comm->ddaHierScaleIn = 0;
+  comm->ddaHierRsPrivOffset = 0;
+  comm->ddaHierRsPrivHalfBytes = 0;
   free(comm->ddaPeerPtrsHost);
   comm->ddaPeerPtrsHost = nullptr;
   // Destroying the fabric handler unmaps/frees the imported peer scratch buffers.

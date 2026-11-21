@@ -14,6 +14,7 @@
 #include "debug.h"
 #include "algorithms/dda/dda_init_detail.h"
 #include "algorithms/dda/fabric/fabric_gpu_barrier.h"
+#include "bootstrap.h"
 #include "param.h"
 #include "rccl_common.h"
 
@@ -36,7 +37,9 @@ RCCL_PARAM(DdaRsHierThreshold, "DDA_RS_HIER_THRESHOLD", (int64_t)256 * 1024 * 10
 RCCL_PARAM(DdaRsHierMinBytes, "DDA_RS_HIER_MIN_BYTES", (int64_t)16 * 1024 * 1024);
 // RCCL_DDA_RS_HIER_MODE: 0 (default) the pull kernel; 1 the push kernel (stores to peers, local reductions, pipelined
 // pieces); 2 loads at scale-in and stores at scale-up; 3 the pull kernel synced with epoch flags; 4 the pull kernel
-// pipelined over pieces. RCCL_DDA_RS_HIER_PIECES: pieces per block of modes 1 and 4.
+// pipelined over pieces; 5 the pull kernel without its closing comm sync, on the private scratch region of
+// RCCL_DDA_RS_HIER_PRIVATE (mode 0 when the comm has none or the message does not fit a half).
+// RCCL_DDA_RS_HIER_PIECES: pieces per block of modes 1 and 4.
 // RCCL_DDA_RS_HIER_PUSH_SYS_STORE: 1 (default) mode 1 pushes with system-scope stores, 0 with plain ones. All must be
 // the same on every rank.
 RCCL_PARAM(DdaRsHierMode, "DDA_RS_HIER_MODE", 0);
@@ -47,7 +50,7 @@ namespace {
 
 using nccl_dda_detail::DdaFabricBarrierState;
 
-constexpr const char* kDdaRsHierModeName[] = {"pull", "push", "pushup", "pull-epoch", "pull-pipe"};
+constexpr const char* kDdaRsHierModeName[] = {"pull", "push", "pushup", "pull-epoch", "pull-pipe", "pull-private"};
 
 template <typename T>
 static void launchReduceScatterDdaFabricHier(T** d_ipcbuffs, void* recvbuff, size_t recvcount, const void* sendbuff,
@@ -72,17 +75,37 @@ static void launchReduceScatterDdaFabricHier(T** d_ipcbuffs, void* recvbuff, siz
       launch(kernelFor(std::integral_constant<int, 0>{}, std::integral_constant<int, 0>{}));
     }
   };
-  const int64_t mode = rcclParamDdaRsHierMode();
+  int64_t mode = rcclParamDdaRsHierMode();
+  const size_t totalBytes = recvcount * nRanks * sizeof(T);
+  if (mode == 5 && (comm->ddaHierRsPrivHalfBytes < totalBytes)) {
+    mode = 0;
+  }
+  if (mode == 5) {
+    // Alternate the two halves: launch n + 2 reuses launch n's half only after this rank has passed launch n + 1's
+    // syncs with every rank that loads from it (its package peers and its tile's ranks), so they are done with it.
+    const size_t half = static_cast<size_t>(comm->ddaHierRsPrivCalls++ & 1);
+    const size_t scratchOff = (comm->ddaHierRsPrivOffset + half * comm->ddaHierRsPrivHalfBytes) / sizeof(T);
+    launchSized(
+      [](auto s, auto g) {
+        return dda::common::ddaReduceScatterFabricHier<T, decltype(s)::value, decltype(g)::value, false, false>;
+      },
+      scratchOff);
+    return;
+  }
   if (mode == 0) {
-    launchSized([](auto s, auto g) {
-      return dda::common::ddaReduceScatterFabricHier<T, decltype(s)::value, decltype(g)::value, false>;
-    });
+    launchSized(
+      [](auto s, auto g) {
+        return dda::common::ddaReduceScatterFabricHier<T, decltype(s)::value, decltype(g)::value, false, true>;
+      },
+      size_t{0});
     return;
   }
   if (mode == 3) {
-    launchSized([](auto s, auto g) {
-      return dda::common::ddaReduceScatterFabricHier<T, decltype(s)::value, decltype(g)::value, true>;
-    });
+    launchSized(
+      [](auto s, auto g) {
+        return dda::common::ddaReduceScatterFabricHier<T, decltype(s)::value, decltype(g)::value, true, true>;
+      },
+      size_t{0});
     return;
   }
   if (mode == 2) {
@@ -153,7 +176,7 @@ static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* 
          "DDA fabric ReduceScatter: launching hierarchical kernel: nRanks=%d scaleIn=%d recvcount=%zu grid=%u block=%u "
          "%s pieces=%lld",
          nRanks, scaleIn, recvcount, grid.x, block.x,
-         kDdaRsHierModeName[std::clamp<int64_t>(rcclParamDdaRsHierMode(), 0, 4)],
+         kDdaRsHierModeName[std::clamp<int64_t>(rcclParamDdaRsHierMode(), 0, 5)],
          (long long)rcclParamDdaRsHierPieces());
     launchReduceScatterDdaFabricHier<T>(d_ipcbuffs, recvbuff, recvcount, sendbuff, comm, scaleIn, grid, block,
                                         barrierHost, rcclTakeAddonStopEvent(comm), stream);
@@ -191,6 +214,19 @@ static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* 
 }
 
 } // namespace
+
+ncclResult_t ncclReduceScatterDdaFabricHierDrain(ncclComm* comm) {
+  // Mode 5 skips the closing comm sync, so a peer may still load this rank's private region after this rank's last
+  // launch. Every rank finishes its own work, then waits for all ranks to do the same before the region is freed.
+  if (comm == nullptr || comm->ddaHierRsPrivCalls == 0 || comm->bootstrap == nullptr ||
+      (comm->abortFlag != nullptr && __atomic_load_n(comm->abortFlag, __ATOMIC_ACQUIRE) != 0)) {
+    return ncclSuccess;
+  }
+  CUDACHECK(cudaDeviceSynchronize());
+  NCCLCHECK(bootstrapBarrier(comm->bootstrap, comm->rank, comm->nRanks, 0x2395));
+  comm->ddaHierRsPrivCalls = 0;
+  return ncclSuccess;
+}
 
 size_t ncclReduceScatterDdaFabricHierMaxBytes(const ncclComm* comm) {
   if (comm == nullptr || comm->ddaHierScaleIn <= 0 || !rcclParamDdaRsHier()) {
