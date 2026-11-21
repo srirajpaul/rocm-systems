@@ -50,6 +50,8 @@ static void launchReduceScatterDdaFabricHier(T** d_ipcbuffs, void* recvbuff, siz
   };
   if (scaleIn == 2 && nRanks == 8) {
     launch(dda::common::ddaReduceScatterFabricHier<T, 2, 4>);
+  } else if (scaleIn == 2 && nRanks == 16) {
+    launch(dda::common::ddaReduceScatterFabricHier<T, 2, 8>);
   } else if (scaleIn == 2) {
     launch(dda::common::ddaReduceScatterFabricHier<T, 2, 0>);
   } else {

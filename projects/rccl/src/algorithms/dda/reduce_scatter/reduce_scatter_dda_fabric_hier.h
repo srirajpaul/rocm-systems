@@ -28,7 +28,7 @@
  * scale-in step, before it writes it in scale-up.
  *
  * Templated on compile-time SCALE_IN_CT / NGROUPS_CT (0 = runtime) like the
- * flat fabric kernel's NRANKS_CT, so the DPX 8-rank case fully unrolls.
+ * flat fabric kernel's NRANKS_CT, so the DPX 8- and 16-rank cases fully unroll.
  * See LICENSE.txt for license information.
  ************************************************************************/
 
