@@ -54,6 +54,9 @@ namespace {
 
 using nccl_dda_detail::DdaFabricBarrierState;
 
+// comm->ddaHierRsArriveDev: mode 9's arrival counters, then the DdaHierHalf cells.
+constexpr int kDdaHierHalfCellsOffset = 2 * dda::common::kDdaHierMaxPieces;
+
 constexpr const char* kDdaRsHierModeName[] = {
   "pull",         "push",           "pushup",        "pull-epoch",     "pull-pipe",
   "pull-private", "pushup-private", "pushin-pushup", "pushup-farpull", "pushup-rankflags"
@@ -98,20 +101,28 @@ static void launchReduceScatterDdaFabricHier(T** d_ipcbuffs, void* recvbuff, siz
     }
   };
   int64_t mode = rcclParamDdaRsHierMode();
+  // The private region's half is picked on the device (see DdaHierHalf), so graph replays alternate as eager
+  // launches do; the call count only tells teardown that a barrier-free launch ran.
+  auto privHalf = [&] {
+    ++comm->ddaHierRsPrivCalls;
+    return dda::common::DdaHierHalf{comm->ddaHierRsArriveDev + kDdaHierHalfCellsOffset,
+                                    comm->ddaHierRsPrivHalfBytes / sizeof(T), comm->ddaFabricMaxBlocks};
+  };
   const size_t totalBytes = recvcount * nRanks * sizeof(T);
-  if (mode == 5 && (comm->ddaHierRsPrivHalfBytes < totalBytes)) {
+  const bool privFits = comm->ddaHierRsArriveDev != nullptr && comm->ddaHierRsPrivHalfBytes >= totalBytes;
+  if (mode == 5 && !privFits) {
     mode = 0;
   }
   if (mode == 5) {
     // Alternate the two halves: launch n + 2 reuses launch n's half only after this rank has passed launch n + 1's
     // syncs with every rank that loads from it (its package peers and its tile's ranks), so they are done with it.
-    const size_t half = static_cast<size_t>(comm->ddaHierRsPrivCalls++ & 1);
-    const size_t scratchOff = (comm->ddaHierRsPrivOffset + half * comm->ddaHierRsPrivHalfBytes) / sizeof(T);
+    const size_t scratchOff = comm->ddaHierRsPrivOffset / sizeof(T);
+    const dda::common::DdaHierHalf half = privHalf();
     launchSized(
       [](auto s, auto g) {
         return dda::common::ddaReduceScatterFabricHier<T, decltype(s)::value, decltype(g)::value, false, false>;
       },
-      scratchOff);
+      scratchOff, half);
     return;
   }
   if (mode == 0) {
@@ -119,7 +130,7 @@ static void launchReduceScatterDdaFabricHier(T** d_ipcbuffs, void* recvbuff, siz
       [](auto s, auto g) {
         return dda::common::ddaReduceScatterFabricHier<T, decltype(s)::value, decltype(g)::value, false, true>;
       },
-      size_t{0});
+      size_t{0}, dda::common::DdaHierHalf{});
     return;
   }
   if (mode == 3) {
@@ -127,51 +138,48 @@ static void launchReduceScatterDdaFabricHier(T** d_ipcbuffs, void* recvbuff, siz
       [](auto s, auto g) {
         return dda::common::ddaReduceScatterFabricHier<T, decltype(s)::value, decltype(g)::value, true, true>;
       },
-      size_t{0});
+      size_t{0}, dda::common::DdaHierHalf{});
     return;
   }
-  if (mode >= 6 && mode <= 9 && comm->ddaHierRsPrivHalfBytes < totalBytes) {
+  if (mode >= 6 && mode <= 9 && !privFits) {
     mode = 2;
   }
-  if (mode == 9 && comm->ddaHierRsArriveDev == nullptr) {
-    mode = 6;
-  }
   if (mode == 9) {
-    const size_t half = static_cast<size_t>(comm->ddaHierRsPrivCalls++ & 1);
-    const size_t scratchOff = (comm->ddaHierRsPrivOffset + half * comm->ddaHierRsPrivHalfBytes) / sizeof(T);
+    const size_t scratchOff = comm->ddaHierRsPrivOffset / sizeof(T);
+    const dda::common::DdaHierHalf half = privHalf();
     const unsigned pieces = static_cast<unsigned>(std::max<int64_t>(rcclParamDdaRsHierPieces(), 1));
     launchSized(
       [](auto s, auto g) {
         return dda::common::ddaReduceScatterFabricHierPushUpPipe<T, decltype(s)::value, decltype(g)::value>;
       },
-      scratchOff, pieces, comm->ddaHierRsArriveDev);
+      scratchOff, half, pieces, comm->ddaHierRsArriveDev);
     return;
   }
   const int hostSize = ddaHierHostSize(comm);
   if (mode >= 6 && mode <= 8) {
-    const size_t half = static_cast<size_t>(comm->ddaHierRsPrivCalls++ & 1);
-    const size_t scratchOff = (comm->ddaHierRsPrivOffset + half * comm->ddaHierRsPrivHalfBytes) / sizeof(T);
+    const size_t scratchOff = comm->ddaHierRsPrivOffset / sizeof(T);
+    const dda::common::DdaHierHalf half = privHalf();
     if (mode == 6) {
       launchSized(
         [](auto s, auto g) {
           return dda::common::ddaReduceScatterFabricHierPushUp<T, decltype(s)::value, decltype(g)::value, true, false,
                                                                false>;
         },
-        scratchOff, hostSize);
+        scratchOff, half, hostSize);
     } else if (mode == 7) {
       launchSized(
         [](auto s, auto g) {
           return dda::common::ddaReduceScatterFabricHierPushUp<T, decltype(s)::value, decltype(g)::value, true, true,
                                                                false>;
         },
-        scratchOff, hostSize);
+        scratchOff, half, hostSize);
     } else {
       launchSized(
         [](auto s, auto g) {
           return dda::common::ddaReduceScatterFabricHierPushUp<T, decltype(s)::value, decltype(g)::value, true, false,
                                                                true>;
         },
-        scratchOff, hostSize);
+        scratchOff, half, hostSize);
     }
     return;
   }
@@ -181,7 +189,7 @@ static void launchReduceScatterDdaFabricHier(T** d_ipcbuffs, void* recvbuff, siz
         return dda::common::ddaReduceScatterFabricHierPushUp<T, decltype(s)::value, decltype(g)::value, false, false,
                                                              false>;
       },
-      size_t{0}, hostSize);
+      size_t{0}, dda::common::DdaHierHalf{}, hostSize);
     return;
   }
   const unsigned pieces = static_cast<unsigned>(std::max<int64_t>(rcclParamDdaRsHierPieces(), 1));

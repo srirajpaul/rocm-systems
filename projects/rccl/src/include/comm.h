@@ -753,7 +753,8 @@ struct ncclComm {
   size_t ddaHierRsPrivHalfBytes;
   uint64_t ddaHierRsPrivCalls;
   // Arrival counters of the rank-level syncs of RCCL_DDA_RS_HIER_MODE=9 (2 * kDdaHierMaxPieces device cells, zero
-  // between launches), allocated with the private region.
+  // between launches), then the per-block cells that pick the private region's half on the device (DdaHierHalf);
+  // allocated with the private region, which modes 5-9 use only when this is set.
   uint32_t* ddaHierRsArriveDev;
   // [RCCL] Set by ncclCommShrink(NCCL_SHRINK_ABORT). An abort can leave ranks with
   // different LL epochs and unconsumed barrier mailbox slots, so DDA must not

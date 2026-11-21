@@ -87,13 +87,39 @@ __device__ __forceinline__ void ddaHierCopy(const T* __restrict__ src, T* __rest
   }
 }
 
+// Picks the private-region half of a launch on the device, so CUDA graph replays alternate too. cells has nCells
+// (the fabric block cap) entries, equal on every rank and every block between launches: a block reads its own cell
+// at entry and, at exit, writes cell + 1 to every cell e with e % gridDim.x == blockIdx.x (as FabricGpuBarrier's epoch
+// cells), so each launch flips all of them whatever its grid. Null cells: no private region, scratchBase as given.
+struct DdaHierHalf {
+  uint32_t* cells;
+  size_t halfElems;
+  int nCells;
+};
+
+__device__ __forceinline__ uint32_t ddaHierHalfCell(const DdaHierHalf& half) {
+  return half.cells != nullptr ? half.cells[blockIdx.x] : 0;
+}
+
+// Called by every thread of the block after its last use of the half.
+__device__ __forceinline__ void ddaHierHalfAdvance(const DdaHierHalf& half, uint32_t cell) {
+  if (half.cells == nullptr) return;
+  __syncthreads(); // every wave has read this block's cell
+  for (int e = static_cast<int>(blockIdx.x + threadIdx.x * gridDim.x); e < half.nCells;
+       e += static_cast<int>(blockDim.x * gridDim.x)) {
+    half.cells[e] = cell + 1;
+  }
+}
+
 template <typename T, int SCALE_IN_CT, int NGROUPS_CT, bool EPOCH_FLAGS, bool END_BARRIER>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
   __global__ void ddaReduceScatterFabricHier(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                              const T* __restrict__ sendbuff, int selfRank, int nRanks, int scaleInRt,
-                                             size_t scratchOff, FabricGpuBarrier barrier) {
+                                             size_t scratchBase, DdaHierHalf half, FabricGpuBarrier barrier) {
+  const uint32_t halfCell = ddaHierHalfCell(half);
+  const size_t scratchOff = scratchBase + (halfCell & 1) * half.halfElems;
   static_assert(is_supported_type_v<T>, "dda: unsupported element type");
   const int scaleIn = (SCALE_IN_CT > 0) ? SCALE_IN_CT : scaleInRt;
   const int nGroups = (NGROUPS_CT > 0) ? NGROUPS_CT : nRanks / scaleIn;
@@ -198,6 +224,7 @@ __launch_bounds__(512)
   } else if constexpr (END_BARRIER) {
     barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
   }
+  ddaHierHalfAdvance(half, halfCell);
 }
 
 // Loads 16 bytes another rank pushed into this rank's scratch, with system scope so no cache holds a stale copy.
@@ -367,7 +394,9 @@ __launch_bounds__(512)
   __global__
   void ddaReduceScatterFabricHierPushUp(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff, size_t count,
                                         const T* __restrict__ sendbuff, int selfRank, int nRanks, int scaleInRt,
-                                        size_t scratchOff, int hostSize, FabricGpuBarrier barrier) {
+                                        size_t scratchBase, DdaHierHalf half, int hostSize, FabricGpuBarrier barrier) {
+  const uint32_t halfCell = ddaHierHalfCell(half);
+  const size_t scratchOff = scratchBase + (halfCell & 1) * half.halfElems;
   static_assert(is_supported_type_v<T>, "dda: unsupported element type");
   static_assert(PRIVATE || !PUSH_IN, "push-in stores into the package peers before any sync: needs the private region");
   static_assert(PRIVATE || !FAR_PULL, "far owners load after the last sync: needs the private region");
@@ -568,6 +597,7 @@ __launch_bounds__(512)
   if constexpr (!PRIVATE) {
     barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
   }
+  ddaHierHalfAdvance(half, halfCell);
 }
 
 // Pipelined form of ddaReduceScatterFabricHier, with the same scratch layout. A block's rows
@@ -693,8 +723,10 @@ __launch_bounds__(512)
 #endif
   __global__ void ddaReduceScatterFabricHierPushUpPipe(T* const* __restrict__ ipcbuffs, T* __restrict__ recvbuff,
                                                        size_t count, const T* __restrict__ sendbuff, int selfRank,
-                                                       int nRanks, int scaleInRt, size_t scratchOff, unsigned pieces,
-                                                       uint32_t* counters, FabricGpuBarrier barrier) {
+                                                       int nRanks, int scaleInRt, size_t scratchBase, DdaHierHalf half,
+                                                       unsigned pieces, uint32_t* counters, FabricGpuBarrier barrier) {
+  const uint32_t halfCell = ddaHierHalfCell(half);
+  const size_t scratchOff = scratchBase + (halfCell & 1) * half.halfElems;
   static_assert(is_supported_type_v<T>, "dda: unsupported element type");
   const int scaleIn = (SCALE_IN_CT > 0) ? SCALE_IN_CT : scaleInRt;
   const int nGroups = (NGROUPS_CT > 0) ? NGROUPS_CT : nRanks / scaleIn;
@@ -816,6 +848,7 @@ __launch_bounds__(512)
     }
   }
   barrier.epochEnd(epoch, static_cast<unsigned>(nPieces));
+  ddaHierHalfAdvance(half, halfCell);
 }
 
 } // namespace dda::common

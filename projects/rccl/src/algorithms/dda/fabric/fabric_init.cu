@@ -276,8 +276,9 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
   comm->ddaHierRsPrivCalls = 0;
   comm->ddaHierRsArriveDev = nullptr;
   if (privHalf > 0) {
-    // 2 * kDdaHierMaxPieces cells; zero, and left zero by every launch.
-    constexpr size_t kArriveCells = 32;
+    // Mode 9's 2 * kDdaHierMaxPieces arrival counters (zero, and left zero by every launch), then one private-region
+    // half cell per block (DdaHierHalf), all zero.
+    const size_t kArriveCells = 32 + static_cast<size_t>(nBlocksMax);
     if (cudaMalloc(&comm->ddaHierRsArriveDev, kArriveCells * sizeof(uint32_t)) != cudaSuccess ||
         cudaMemset(comm->ddaHierRsArriveDev, 0, kArriveCells * sizeof(uint32_t)) != cudaSuccess) {
       (void)cudaGetLastError();
