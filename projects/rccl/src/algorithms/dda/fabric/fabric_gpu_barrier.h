@@ -246,6 +246,32 @@ public:
     __syncthreads();
   }
 
+  // Epoch form of syncGroupOnSameBlockIdx<true, true> over firstRank, firstRank + rankStride, ... (nGroupRanks ranks):
+  // posts value to every other rank of the group and waits for each of them to post at least value. A post is a
+  // one-way store, where the toggle flags pay a remote CAS round trip per peer. Values must grow within a launch and
+  // stay below the next launch's epoch (see epochEnd).
+  __device__ __forceinline__ void epochSyncGroup(int firstRank, int rankStride, int nGroupRanks, FlagType value) {
+    orderDestWrites();
+    for (int i = threadIdx.x; i < nGroupRanks; i += blockDim.x) {
+      const int peerRank = firstRank + i * rankStride;
+      if (peerRank == selfRank_) continue;
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "");
+      __scoped_atomic_store_n(peerFlags_[peerRank] + getEpochFlagIdx(selfRank_, blockIdx.x), value, __ATOMIC_RELAXED,
+                              __MEMORY_SCOPE_SYSTEM);
+    }
+    for (int i = threadIdx.x; i < nGroupRanks; i += blockDim.x) {
+      const int peerRank = firstRank + i * rankStride;
+      if (peerRank == selfRank_) continue;
+      const FlagType* flag = epochFlagFrom(peerRank);
+      int spins = 0;
+      while (static_cast<int32_t>(__scoped_atomic_load_n(flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM) - value) < 0) {
+        if (params_.abortSpinTick(spins)) break;
+      }
+    }
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+    __syncthreads();
+  }
+
   // Posts value to rank `to` once every store of the block has completed.
   __device__ __forceinline__ void epochPost(int to, FlagType value) {
     orderDestWrites();

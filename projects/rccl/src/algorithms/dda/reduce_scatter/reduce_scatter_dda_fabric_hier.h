@@ -29,6 +29,9 @@
  *
  * Templated on compile-time SCALE_IN_CT / NGROUPS_CT (0 = runtime) like the
  * flat fabric kernel's NRANKS_CT, so the DPX 8- and 16-rank cases fully unroll.
+ * EPOCH_FLAGS syncs with the barrier's epoch flags (one-way stores) instead of
+ * its toggle flags (a remote CAS round trip per peer); the three syncs post
+ * epoch, epoch + 1 and epoch + 2.
  *
  * ddaReduceScatterFabricHierPush runs the same two levels with stores instead
  * of loads: every cross-rank transfer pushes into the receiver's scratch and
@@ -50,7 +53,7 @@
 
 namespace dda::common {
 
-template <typename T, int SCALE_IN_CT, int NGROUPS_CT>
+template <typename T, int SCALE_IN_CT, int NGROUPS_CT, bool EPOCH_FLAGS>
 #if defined(USE_ROCM)
 __launch_bounds__(512)
 #endif
@@ -81,8 +84,16 @@ __launch_bounds__(512)
       }
     }
   }
-  barrier.syncGroupOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(pkgFirst, 1,
-                                                                                                      scaleIn);
+  const FabricGpuBarrier::FlagType epoch = EPOCH_FLAGS ? barrier.epochBegin() : 0;
+  auto syncGroup = [&](int firstRank, int rankStride, int nGroupRanks, int step) {
+    if constexpr (EPOCH_FLAGS) {
+      barrier.epochSyncGroup(firstRank, rankStride, nGroupRanks, epoch + step);
+    } else {
+      barrier.syncGroupOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(
+        firstRank, rankStride, nGroupRanks);
+    }
+  };
+  syncGroup(pkgFirst, 1, scaleIn, 0);
 
   // Scale-in: partial[shard] = sum over the package of shard, for the shards of this tile.
   for (size_t idx = idxStart; idx < count; idx += idxStride) {
@@ -99,8 +110,7 @@ __launch_bounds__(512)
       *reinterpret_cast<uint4*>(&self[off]) = sum;
     }
   }
-  barrier.syncGroupOnSameBlockIdx<true /* hasPreviousMemAccess */, true /* hasSubsequentMemAccess */>(tile, scaleIn,
-                                                                                                      nGroups);
+  syncGroup(tile, scaleIn, nGroups, 1);
 
   // Scale-up: this rank's shard summed over the partials of every package, own package first.
   const int pkg = selfRank / scaleIn;
@@ -117,7 +127,12 @@ __launch_bounds__(512)
     *reinterpret_cast<uint4*>(&recvbuff[idx]) = sum;
   }
 
-  barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
+  if constexpr (EPOCH_FLAGS) {
+    barrier.epochSyncGroup(0, 1, nRanks, epoch + 2);
+    barrier.epochEnd(epoch, 1);
+  } else {
+    barrier.syncOnSameBlockIdx<true /* hasPreviousMemAccess */, false /* hasSubsequentMemAccess */>();
+  }
 }
 
 // Loads 16 bytes another rank pushed into this rank's scratch, with system scope so no cache holds a stale copy.
