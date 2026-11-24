@@ -3361,6 +3361,14 @@ void InitA2ADecisionComm(ncclComm& comm, ncclTopoSystem& topo, const char* arch,
         reinterpret_cast<nccl_dda_detail::DdaFabricBarrierState*>(0x5);
     comm.ddaLLEpochDev         = reinterpret_cast<uint32_t*>(0x6);
     comm.ddaLLEpochLen         = DDA_FABRIC_MAXBLOCKS;
+    for (int i = 0; i < ncclDdaScratchCount; ++i) {
+        comm.ddaFabricScratch.regions[i] = {reinterpret_cast<void*>(0x1000 + i * 0x100),
+            std::numeric_limits<size_t>::max(), reinterpret_cast<void*>(0x2000 + i * 0x100),
+            reinterpret_cast<void**>(0x3000 + i * 0x100), reinterpret_cast<uint32_t*>(0x4000 + i * 0x100),
+            DDA_FABRIC_MAXBLOCKS};
+    }
+    comm.ddaFabricScratch.tokenPeerPtrsDev = reinterpret_cast<void*>(0x5000);
+    comm.ddaFabricScratch.tokenBankBytes = 2304;
     // Non-fabric archs take the DDA IPC branch, whose eligibility check wants the IPC handles.
     comm.ddaIpcMemHandler      = reinterpret_cast<ncclIpcMemHandler*>(0x7);
     comm.ddaIpcBarrierState    = reinterpret_cast<nccl_dda_detail::DdaIpcBarrierState*>(0x8);

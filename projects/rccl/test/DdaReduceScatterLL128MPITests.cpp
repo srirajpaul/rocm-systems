@@ -98,7 +98,7 @@ size_t ll128NearCapShardBytes(ncclComm* comm)
         return 0;
     size_t shard = (ll128Cap / static_cast<size_t>(nRanks)) & ~size_t{15};
     const size_t slotWords = dda::common::ddaLL128SlotWords(
-        dda::common::ddaBankSize(comm->ddaScratchBytes), nRanks, 1);
+        dda::common::ddaBankSize(ncclDdaGetScratch(comm, ncclDdaScratchLL128).bytes), nRanks, 1);
     const size_t maxSlices = slotWords / static_cast<size_t>(dda::common::kDdaLL128WireWordsPerSlice);
     const size_t maxBytes  = maxSlices * static_cast<size_t>(dda::common::kDdaLL128DataBytesPerSlice);
     if(shard > maxBytes)
@@ -121,8 +121,8 @@ bool shardTakesAnotherPass(const ncclComm* comm, size_t shardBytes)
         (slices + static_cast<size_t>(warpsPerBlock) - 1) / static_cast<size_t>(warpsPerBlock);
     if(wantBlocks < static_cast<size_t>(blocks))
         blocks = static_cast<int>(wantBlocks);
-    if(comm->ddaLLEpochLen > 0 && blocks > comm->ddaLLEpochLen)
-        blocks = comm->ddaLLEpochLen;
+    if(ncclDdaGetScratch(comm, ncclDdaScratchLL128).epochLen > 0 && blocks > ncclDdaGetScratch(comm, ncclDdaScratchLL128).epochLen)
+        blocks = ncclDdaGetScratch(comm, ncclDdaScratchLL128).epochLen;
     if(blocks < 1)
         blocks = 1;
     const size_t warps = static_cast<size_t>(blocks) * static_cast<size_t>(warpsPerBlock);
@@ -205,7 +205,7 @@ protected:
         // A zero shard means the RS thresholds no longer leave an LL128 window.
         shardBytes_ = ll128ShardBytes(getActiveCommunicator());
         ASSERT_MPI_TRUE(getActiveCommunicator()->ddaFabricMemHandler != nullptr);
-        ASSERT_MPI_TRUE(getActiveCommunicator()->ddaLLEpochDev != nullptr);
+        ASSERT_MPI_TRUE(ncclDdaGetScratch(getActiveCommunicator(), ncclDdaScratchLL128).epochDev != nullptr);
         ASSERT_MPI_NE(shardBytes_, static_cast<size_t>(0));
     }
 

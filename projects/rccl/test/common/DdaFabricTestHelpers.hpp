@@ -33,7 +33,8 @@ struct DdaFabricMockComm
         comm.nRanks             = 8; // any value in [2, kDdaMaxNranks]
         // Capacity is not under test by default. Individual tests override this
         // with an exact small value when exercising scratch-size rejection.
-        comm.ddaScratchBytes    = std::numeric_limits<size_t>::max();
+        for (auto& region : comm.ddaFabricScratch.regions)
+            region.bytes = std::numeric_limits<size_t>::max();
         comm.ddaFabricMaxBlocks = DDA_FABRIC_MAXBLOCKS;
         comm.archName            = const_cast<char*>("gfx1250");
         // Non-null so launcher tests can tell the abort flag was forwarded.
@@ -47,21 +48,31 @@ struct DdaFabricMockComm
         {
             comm.ddaFabricMemHandler =
                 reinterpret_cast<ncclFabricMemHandler*>(0x1);
-            comm.ddaScratch     = reinterpret_cast<void*>(0x2);
-            comm.ddaPeerPtrsDev = reinterpret_cast<void*>(0x3);
             comm.ddaFabricBarrierState =
                 reinterpret_cast<nccl_dda_detail::DdaFabricBarrierState*>(0x4);
-            comm.ddaLLEpochDev = reinterpret_cast<uint32_t*>(0x5);
-            comm.ddaLLEpochLen = DDA_FABRIC_MAXBLOCKS;
+            for (int i = 0; i < ncclDdaScratchCount; ++i) {
+                auto& region = comm.ddaFabricScratch.regions[i];
+                region.scratch = reinterpret_cast<void*>(0x1000 + 0x100 * i);
+                region.peerPtrsDev = reinterpret_cast<void*>(0x2000 + 0x100 * i);
+                region.peerPtrsHost = reinterpret_cast<void**>(0x3000 + 0x100 * i);
+                region.epochDev = reinterpret_cast<uint32_t*>(0x4000 + 0x100 * i);
+                region.epochLen = DDA_FABRIC_MAXBLOCKS;
+            }
+            comm.ddaFabricScratch.tokenPeerPtrsDev = reinterpret_cast<void*>(0x5000);
+            comm.ddaFabricScratch.tokenBankBytes = 2304;
+
         }
         else
         {
             comm.ddaFabricMemHandler   = nullptr;
-            comm.ddaScratch            = nullptr;
-            comm.ddaPeerPtrsDev        = nullptr;
             comm.ddaFabricBarrierState = nullptr;
-            comm.ddaLLEpochDev         = nullptr;
-            comm.ddaLLEpochLen         = 0;
+            for (auto& region : comm.ddaFabricScratch.regions) {
+                const size_t bytes = region.bytes;
+                region = {};
+                region.bytes = bytes;
+            }
+            comm.ddaFabricScratch.tokenPeerPtrsDev = nullptr;
+
         }
     }
 

@@ -65,7 +65,7 @@ class DdaReduceScatterFabricMicrotest : public ::testing::Test {
   void ExpectLaunchOf(const DdaLaunch& launch, size_t recvcount) {
     EXPECT_EQ(launch.kernel, (Kernel<T, 8>()));
     ASSERT_EQ(launch.args.size(), 8u);
-    EXPECT_EQ(launch.Arg<T**>(0), comm().ddaPeerPtrsDev);
+    EXPECT_EQ(launch.Arg<T**>(0), comm().ddaFabricScratch.regions[ncclDdaScratchSimple].peerPtrsDev);
     EXPECT_EQ(launch.Arg<T*>(1), kRecvbuff);
     EXPECT_EQ(launch.Arg<size_t>(2), recvcount);
     EXPECT_EQ(launch.Arg<const T*>(3), kSendbuff);
@@ -95,8 +95,8 @@ TEST_F(DdaReduceScatterFabricMicrotest, Eligible_EachMissingFabricResourceReject
     mock_.setFabricResourcesPresent(true);
     comm().ddaFabricMemHandler = missing == 0 ? nullptr : comm().ddaFabricMemHandler;
     comm().ddaFabricBarrierState = missing == 1 ? nullptr : barrier_;
-    comm().ddaScratch = missing == 2 ? nullptr : comm().ddaScratch;
-    comm().ddaPeerPtrsDev = missing == 3 ? nullptr : comm().ddaPeerPtrsDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchSimple].scratch = missing == 2 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchSimple].scratch;
+    comm().ddaFabricScratch.regions[ncclDdaScratchSimple].peerPtrsDev = missing == 3 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchSimple].peerPtrsDev;
     EXPECT_FALSE(Eligible(4)) << "missing resource " << missing;
   }
 }
@@ -144,7 +144,7 @@ TEST_F(DdaReduceScatterFabricMicrotest, Eligible_PerRankBytesMustBeMultipleOf16)
 }
 
 TEST_F(DdaReduceScatterFabricMicrotest, Eligible_WholeSendBufferMustFitScratch) {
-  comm().ddaScratchBytes = 8 * 64;
+  comm().ddaFabricScratch.regions[ncclDdaScratchSimple].bytes = 8 * 64;
   EXPECT_TRUE(Eligible(16));
   EXPECT_FALSE(Eligible(20));
   EXPECT_TRUE(Eligible(32, ncclFloat16));
@@ -162,8 +162,8 @@ TEST_F(DdaReduceScatterFabricMicrotest, Launch_EachMissingFabricResourceReturnsI
   for (int missing = 0; missing < 4; ++missing) {
     mock_.setFabricResourcesPresent(true);
     comm().ddaFabricMemHandler = missing == 0 ? nullptr : comm().ddaFabricMemHandler;
-    comm().ddaScratch = missing == 1 ? nullptr : comm().ddaScratch;
-    comm().ddaPeerPtrsDev = missing == 2 ? nullptr : comm().ddaPeerPtrsDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchSimple].scratch = missing == 1 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchSimple].scratch;
+    comm().ddaFabricScratch.regions[ncclDdaScratchSimple].peerPtrsDev = missing == 2 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchSimple].peerPtrsDev;
     comm().ddaFabricBarrierState = missing == 3 ? nullptr : barrier_;
     EXPECT_EQ(Run(4), ncclInvalidUsage) << "missing resource " << missing;
   }
@@ -172,7 +172,7 @@ TEST_F(DdaReduceScatterFabricMicrotest, Launch_EachMissingFabricResourceReturnsI
 }
 
 TEST_F(DdaReduceScatterFabricMicrotest, Launch_ScratchCheckUsesTheDispatchedElementSize) {
-  comm().ddaScratchBytes = 8 * 64;
+  comm().ddaFabricScratch.regions[ncclDdaScratchSimple].bytes = 8 * 64;
   EXPECT_EQ(Run(32, ncclFloat16), ncclSuccess);
   EXPECT_EQ(Run(17, ncclFloat32), ncclInvalidArgument);
   EXPECT_EQ(Run(33, ncclBfloat16), ncclInvalidArgument);
@@ -196,7 +196,7 @@ TEST_F(DdaReduceScatterFabricMicrotest, Launch_EachDatatypeLaunchesItsOwnKernel)
 TEST_F(DdaReduceScatterFabricMicrotest, Launch_StagesWholeSendBufferIntoScratchBeforeTheKernel) {
   ASSERT_EQ(Run(8, ncclBfloat16), ncclSuccess);
   ASSERT_EQ(copies_.size(), 1u);
-  EXPECT_EQ(copies_[0].dst, comm().ddaScratch);
+  EXPECT_EQ(copies_[0].dst, comm().ddaFabricScratch.regions[ncclDdaScratchSimple].scratch);
   EXPECT_EQ(copies_[0].src, kSendbuff);
   EXPECT_EQ(copies_[0].bytes, 8u * 8 * 2);
   EXPECT_EQ(copies_[0].kind, hipMemcpyDeviceToDevice);

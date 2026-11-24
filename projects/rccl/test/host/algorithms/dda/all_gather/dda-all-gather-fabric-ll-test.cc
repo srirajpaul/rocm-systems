@@ -86,8 +86,8 @@ TEST_F(DdaAllGatherFabricLLMicrotest, Eligible_NeedsHandlerScratchAndPeersButNot
   for (int missing = 0; missing < 3; ++missing) {
     mock_.setFabricResourcesPresent(true);
     comm().ddaFabricMemHandler = missing == 0 ? nullptr : comm().ddaFabricMemHandler;
-    comm().ddaScratch = missing == 1 ? nullptr : comm().ddaScratch;
-    comm().ddaPeerPtrsDev = missing == 2 ? nullptr : comm().ddaPeerPtrsDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL].scratch = missing == 1 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL].scratch;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL].peerPtrsDev = missing == 2 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL].peerPtrsDev;
     EXPECT_FALSE(Eligible(4)) << "missing resource " << missing;
   }
 }
@@ -140,15 +140,15 @@ TEST_F(DdaAllGatherFabricLLMicrotest, Eligible_GatheredTotalUpToAllGatherLLThres
 }
 
 TEST_F(DdaAllGatherFabricLLMicrotest, Eligible_PerRankPacketsMustFitTheSlot) {
-  comm().ddaScratchBytes = kSlotScratch;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = kSlotScratch;
   EXPECT_TRUE(Eligible(64));
   EXPECT_FALSE(Eligible(68));
   // 31 packets per rank in the bank floor to a 16-packet slot.
-  comm().ddaScratchBytes = 2 * 8 * 31 * 16;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 2 * 8 * 31 * 16;
   EXPECT_TRUE(Eligible(32));
   EXPECT_FALSE(Eligible(36));
   // A bank under one 16-packet granule per rank leaves no slot at all.
-  comm().ddaScratchBytes = 2 * 8 * 15 * 16;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 2 * 8 * 15 * 16;
   EXPECT_FALSE(Eligible(4));
 }
 
@@ -174,7 +174,7 @@ TEST_F(DdaAllGatherFabricLLMicrotest, Launch_FourAndEightRanksUnrolledOthersRunt
 }
 
 TEST_F(DdaAllGatherFabricLLMicrotest, Launch_PassesBuffersBytesEpochAndBank) {
-  comm().ddaScratchBytes = 4096 + 40;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 4096 + 40;
   ASSERT_EQ(Run(8, ncclFloat16), ncclSuccess);
   ASSERT_EQ(g_ddaLaunches.size(), 1u);
   const DdaLaunch& launch = g_ddaLaunches[0];
@@ -187,13 +187,13 @@ TEST_F(DdaAllGatherFabricLLMicrotest, Launch_PassesBuffersBytesEpochAndBank) {
   EXPECT_EQ(launch.sharedMemBytes, 0u);
   EXPECT_EQ(launch.flags, 0u);
   ASSERT_EQ(launch.args.size(), 10u);
-  EXPECT_EQ(launch.Arg<int8_t**>(0), comm().ddaPeerPtrsDev);
+  EXPECT_EQ(launch.Arg<int8_t**>(0), comm().ddaFabricScratch.regions[ncclDdaScratchLL].peerPtrsDev);
   EXPECT_EQ(launch.Arg<int8_t*>(1), kRecvbuff);
   EXPECT_EQ(launch.Arg<const int8_t*>(2), kSendbuff);
   EXPECT_EQ(launch.Arg<size_t>(3), 16u);
   EXPECT_EQ(launch.Arg<int>(4), 5);
-  EXPECT_EQ(launch.Arg<uint32_t*>(6), comm().ddaLLEpochDev);
-  EXPECT_EQ(launch.Arg<int>(7), comm().ddaLLEpochLen);
+  EXPECT_EQ(launch.Arg<uint32_t*>(6), comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochDev);
+  EXPECT_EQ(launch.Arg<int>(7), comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochLen);
   EXPECT_EQ(launch.Arg<size_t>(8), 2048u);
   EXPECT_EQ(launch.Arg<dda::common::DdaKernelParams>(9).flag, comm().abortFlagDev);
 }

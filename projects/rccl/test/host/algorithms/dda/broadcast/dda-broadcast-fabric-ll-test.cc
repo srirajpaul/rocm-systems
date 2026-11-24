@@ -191,9 +191,9 @@ TEST_F(DdaBroadcastFabricLLMicrotest, Eligible_NeedsScratchPeersAndEpoch) {
   EXPECT_FALSE(ncclBroadcastDdaFabricLLEligible(nullptr, 16, ncclInt8));
   for (int missing = 0; missing < 3; ++missing) {
     mock_.setFabricResourcesPresent(true);
-    comm().ddaScratch = missing == 0 ? nullptr : comm().ddaScratch;
-    comm().ddaPeerPtrsDev = missing == 1 ? nullptr : comm().ddaPeerPtrsDev;
-    comm().ddaLLEpochDev = missing == 2 ? nullptr : comm().ddaLLEpochDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL].scratch = missing == 0 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL].scratch;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL].peerPtrsDev = missing == 1 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL].peerPtrsDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochDev = missing == 2 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochDev;
     EXPECT_FALSE(Eligible(16)) << "missing resource " << missing;
   }
 }
@@ -203,6 +203,14 @@ TEST_F(DdaBroadcastFabricLLMicrotest, Eligible_NeedsFabricOrIpcHandler) {
   comm().ddaFabricMemHandler = nullptr;
   EXPECT_FALSE(Eligible(16));
   comm().ddaIpcMemHandler = reinterpret_cast<ncclIpcMemHandler*>(0x1);
+  const auto& ll = comm().ddaFabricScratch.regions[ncclDdaScratchLL];
+  comm().ddaScratch = ll.scratch;
+  comm().ddaScratchBytes = ll.bytes;
+  comm().ddaPeerPtrsDev = ll.peerPtrsDev;
+  comm().ddaLLEpochDev = ll.epochDev;
+  comm().ddaLLEpochLen = ll.epochLen;
+  // An IPC call must keep working when the fabric region is unavailable.
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL] = {};
   EXPECT_TRUE(Eligible(16));
   comm().ddaIpcMemHandler = nullptr;
 }
@@ -247,11 +255,11 @@ TEST_F(DdaBroadcastFabricLLMicrotest, Eligible_UpToBroadcastLLThreshold) {
 
 TEST_F(DdaBroadcastFabricLLMicrotest, Eligible_PayloadMustFitBankAfterTokenLines) {
   // A 1152 B bank is 72 lines: 8 rank tokens leave 64 packets, 512 B.
-  comm().ddaScratchBytes = 2 * 1152;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 2 * 1152;
   EXPECT_TRUE(Eligible(512));
   EXPECT_FALSE(Eligible(528));
   // The bank floors to 128 B.
-  comm().ddaScratchBytes = 2 * 1152 + 254;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 2 * 1152 + 254;
   EXPECT_TRUE(Eligible(512));
   EXPECT_FALSE(Eligible(528));
   // Four rank tokens leave 68 packets, 544 B.
@@ -262,9 +270,9 @@ TEST_F(DdaBroadcastFabricLLMicrotest, Eligible_PayloadMustFitBankAfterTokenLines
 
 TEST_F(DdaBroadcastFabricLLMicrotest, Eligible_RootGridMustFitEpoch) {
   // Root grid 7 x 8; non-root 8.
-  comm().ddaLLEpochLen = 56;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochLen = 56;
   EXPECT_TRUE(Eligible(kEightChunks));
-  comm().ddaLLEpochLen = 55;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochLen = 55;
   EXPECT_FALSE(Eligible(kEightChunks));
 }
 
@@ -272,15 +280,15 @@ TEST_F(DdaBroadcastFabricLLMicrotest, Eligible_NonRootGridMustFitEpoch) {
   // Budget 5 on 4 ranks: root grid 3 x 1, non-root 5.
   comm().nRanks = 4;
   params_["RCCL_DDA_BC_MAX_BLOCKS"] = 5;
-  comm().ddaLLEpochLen = 5;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochLen = 5;
   EXPECT_TRUE(Eligible(kEightChunks));
-  comm().ddaLLEpochLen = 4;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochLen = 4;
   EXPECT_FALSE(Eligible(kEightChunks));
 }
 
 TEST_F(DdaBroadcastFabricLLMicrotest, Eligible_SameAnswerOnEveryRank) {
   for (int epochLen : {55, 56}) {
-    comm().ddaLLEpochLen = epochLen;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochLen = epochLen;
     comm().rank = 0;
     const bool expected = Eligible(kEightChunks);
     for (int rank = 1; rank < comm().nRanks; ++rank) {
@@ -311,7 +319,7 @@ TEST_F(DdaBroadcastFabricLLMicrotest, Launch_AlignedKernelFromOwnBuffersOnly) {
 }
 
 TEST_F(DdaBroadcastFabricLLMicrotest, Launch_PassesBuffersBytesRanksEpochAndBank) {
-  comm().ddaScratchBytes = 4096 + 40;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 4096 + 40;
   ASSERT_EQ(Run(/*root=*/2, 8, kSendbuff, kRecvbuff, ncclFloat16), ncclSuccess);
   ASSERT_EQ(g_ddaLaunches.size(), 1u);
   const DdaLaunch& launch = g_ddaLaunches[0];
@@ -325,15 +333,15 @@ TEST_F(DdaBroadcastFabricLLMicrotest, Launch_PassesBuffersBytesRanksEpochAndBank
   EXPECT_EQ(launch.sharedMemBytes, 0u);
   EXPECT_EQ(launch.flags, 0u);
   ASSERT_EQ(launch.args.size(), 11u);
-  EXPECT_EQ(launch.Arg<char* const*>(0), comm().ddaPeerPtrsDev);
+  EXPECT_EQ(launch.Arg<char* const*>(0), comm().ddaFabricScratch.regions[ncclDdaScratchLL].peerPtrsDev);
   EXPECT_EQ(launch.Arg<char*>(1), kRecvbuff);
   EXPECT_EQ(launch.Arg<const char*>(2), kSendbuff);
   EXPECT_EQ(launch.Arg<size_t>(3), 16u);
   EXPECT_EQ(launch.Arg<int>(4), kRank);
   EXPECT_EQ(launch.Arg<int>(5), 8);
   EXPECT_EQ(launch.Arg<int>(6), 2);
-  EXPECT_EQ(launch.Arg<uint32_t*>(7), comm().ddaLLEpochDev);
-  EXPECT_EQ(launch.Arg<int>(8), comm().ddaLLEpochLen);
+  EXPECT_EQ(launch.Arg<uint32_t*>(7), comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochDev);
+  EXPECT_EQ(launch.Arg<int>(8), comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochLen);
   EXPECT_EQ(launch.Arg<size_t>(9), 2048u);
   EXPECT_EQ(launch.Arg<dda::common::DdaKernelParams>(10).flag, comm().abortFlagDev);
 }

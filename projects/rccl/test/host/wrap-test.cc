@@ -7618,8 +7618,9 @@ TEST(WrapMicrotestIsolated, SelectAllGather_CeForceScratchChosen) {
         // gfx942 has ceNonRegMax[AG]=0; CE-scratch fires via CTAPolicy_ZERO.
         comm->config.CTAPolicy = NCCL_CTA_POLICY_ZERO;
         uint8_t scratch[64];
-        comm->ddaScratch = scratch;
-        comm->ddaScratchBytes = sizeof(scratch);
+        comm->ddaFabricMemHandler = reinterpret_cast<ncclFabricMemHandler*>(0x1);
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].scratch = scratch;
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].bytes = sizeof(scratch);
         rcclCollDecision decision{};
         EXPECT_EQ(ncclSuccess, rcclSelectAllGather(comm, nullptr, nullptr, /*sendcount=*/8, ncclFloat32,
                                                    /*stream=*/nullptr, /*query=*/true, /*graphCapturingHint=*/false,
@@ -7637,8 +7638,9 @@ TEST(WrapMicrotestIsolated, SelectAllGather_CaptureExcludesCeForceScratch) {
                                                        ncclSymRegType_t) { return true; });
         ncclComm* comm = MakeSelectComm();
         uint8_t scratch[64];
-        comm->ddaScratch = scratch;
-        comm->ddaScratchBytes = sizeof(scratch);
+        comm->ddaFabricMemHandler = reinterpret_cast<ncclFabricMemHandler*>(0x1);
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].scratch = scratch;
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].bytes = sizeof(scratch);
         rcclCollDecision decision{};
         EXPECT_EQ(ncclSuccess, rcclSelectAllGather(comm, nullptr, nullptr, /*sendcount=*/8, ncclFloat32,
                                                    /*stream=*/nullptr, /*query=*/true, /*graphCapturingHint=*/true,
@@ -7679,8 +7681,9 @@ TEST(WrapMicrotestIsolated, SelectAllGather_CeForceScratchRequiresForceCe) {
                                                        ncclSymRegType_t) { return true; });
         ncclComm* comm = MakeSelectComm();
         uint8_t scratch[64];
-        comm->ddaScratch = scratch;
-        comm->ddaScratchBytes = sizeof(scratch);
+        comm->ddaFabricMemHandler = reinterpret_cast<ncclFabricMemHandler*>(0x1);
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].scratch = scratch;
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].bytes = sizeof(scratch);
         rcclCollDecision decision{};
         EXPECT_EQ(ncclSuccess, rcclSelectAllGather(comm, nullptr, nullptr, /*sendcount=*/8, ncclFloat32,
                                                    /*stream=*/nullptr, /*query=*/true, /*graphCapturingHint=*/false,
@@ -7702,8 +7705,9 @@ TEST(WrapMicrotestIsolated, SelectAllGather_CeForceScratchRejectsFullyRegistered
         });
         ncclComm* comm = MakeSelectComm();
         uint8_t scratch[64];
-        comm->ddaScratch = scratch;
-        comm->ddaScratchBytes = sizeof(scratch);
+        comm->ddaFabricMemHandler = reinterpret_cast<ncclFabricMemHandler*>(0x1);
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].scratch = scratch;
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].bytes = sizeof(scratch);
         rcclCollDecision decision{};
         EXPECT_EQ(ncclSuccess, rcclSelectAllGather(comm, nullptr, nullptr, 8, ncclFloat32, /*stream=*/nullptr, true,
                                                    false, &decision));
@@ -7724,8 +7728,9 @@ TEST(WrapMicrotestIsolated, SelectAllGather_CeForceScratchRejectsRegisteredRecvW
         });
         ncclComm* comm = MakeSelectComm();
         uint8_t scratch[64];
-        comm->ddaScratch = scratch;
-        comm->ddaScratchBytes = sizeof(scratch);
+        comm->ddaFabricMemHandler = reinterpret_cast<ncclFabricMemHandler*>(0x1);
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].scratch = scratch;
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].bytes = sizeof(scratch);
         rcclCollDecision decision{};
         EXPECT_EQ(ncclSuccess, rcclSelectAllGather(comm, nullptr, nullptr, 8, ncclFloat32, /*stream=*/nullptr, true,
                                                    false, &decision));
@@ -7744,8 +7749,9 @@ TEST(WrapMicrotestIsolated, SelectAllGather_CeForceScratchRejectsSysmemSegment) 
         int sendBuffer = 0, recvBuffer = 0;
         TestDevrWindows registered(comm, &sendBuffer, true, &recvBuffer, false);
         uint8_t scratch[64];
-        comm->ddaScratch = scratch;
-        comm->ddaScratchBytes = sizeof(scratch);
+        comm->ddaFabricMemHandler = reinterpret_cast<ncclFabricMemHandler*>(0x1);
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].scratch = scratch;
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].bytes = sizeof(scratch);
         rcclCollDecision decision{};
         EXPECT_EQ(ncclSuccess,
                   rcclSelectAllGather(comm, &sendBuffer, &recvBuffer, 8, ncclFloat32, /*stream=*/nullptr, true, false,
@@ -7765,8 +7771,9 @@ TEST(WrapMicrotestIsolated, SelectAllGather_CeForceScratchAcceptsExactCapacity) 
         // null table -> ceNonRegMax[AG]=0; CE-scratch fires via CTAPolicy_ZERO.
         comm->config.CTAPolicy = NCCL_CTA_POLICY_ZERO;
         uint8_t scratch[64];
-        comm->ddaScratch = scratch;
-        comm->ddaScratchBytes = sizeof(scratch);
+        comm->ddaFabricMemHandler = reinterpret_cast<ncclFabricMemHandler*>(0x1);
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].scratch = scratch;
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].bytes = sizeof(scratch);
         rcclCollDecision decision{};
         // nRanks(1) * sendcount(16) * sizeof(float32)(4) == 64 bytes == ddaScratchBytes exactly.
         EXPECT_EQ(ncclSuccess, rcclSelectAllGather(comm, nullptr, nullptr, 16, ncclFloat32, /*stream=*/nullptr, true,
@@ -7793,8 +7800,9 @@ TEST(WrapMicrotestIsolated, SelectAllGather_CeForceScratchNotChosenWhenProbeSays
         comm->nRanks = 1;
         comm->nNodes = 1;
         uint8_t scratch[64];
-        comm->ddaScratch = scratch;
-        comm->ddaScratchBytes = sizeof(scratch);
+        comm->ddaFabricMemHandler = reinterpret_cast<ncclFabricMemHandler*>(0x1);
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].scratch = scratch;
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].bytes = sizeof(scratch);
         rcclCollDecision decision{};
         EXPECT_EQ(ncclSuccess, rcclSelectAllGather(comm, nullptr, nullptr, /*sendcount=*/8, ncclFloat32,
                                                    /*stream=*/nullptr, /*query=*/true, /*graphCapturingHint=*/false,
@@ -7822,8 +7830,9 @@ ncclComm* MakeCeScratchComm(const char* arch, const rcclArchThresholds* table, u
   comm->nRanks = 1;
   comm->nNodes = 1;
   comm->archThresholds = table;
-  comm->ddaScratch = scratch;
-  comm->ddaScratchBytes = bytes;
+  comm->ddaFabricMemHandler = reinterpret_cast<ncclFabricMemHandler*>(0x1);
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].scratch = scratch;
+  comm->ddaFabricScratch.regions[ncclDdaScratchCE].bytes = bytes;
   return comm;
 }
 
@@ -8803,7 +8812,7 @@ TEST(WrapMicrotestIsolated, SelectAllGather_RecvWinSysmemSegmentBlocksCeRegister
       });
 }
 
-// Force-scratch's own conjuncts (comm->ddaScratch != nullptr, totalBytes <=
+// Force-scratch's own conjuncts (comm->ddaFabricScratch.regions[ncclDdaScratchCE].scratch != nullptr, totalBytes <=
 // ddaScratchBytes) had only ever been proven true (CeForceScratchChosen
 // above); this proves ddaScratch==nullptr correctly blocks it even though
 // every other force-scratch input stays eligible.
@@ -8816,7 +8825,7 @@ TEST(WrapMicrotestIsolated, SelectAllGather_ForceScratchBlockedWhenScratchBuffer
         ncclComm* comm = MakeCommWithArch("gfx942");
         comm->nRanks = 1;
         comm->nNodes = 1;
-        // comm->ddaScratch left at its zero-init default (nullptr).
+        // comm->ddaFabricScratch.regions[ncclDdaScratchCE].scratch left at its zero-init default (nullptr).
         rcclCollDecision decision{};
         EXPECT_EQ(ncclSuccess, rcclSelectAllGather(comm, nullptr, nullptr, /*sendcount=*/8, ncclFloat32,
                                                    /*stream=*/nullptr, /*query=*/true, /*graphCapturingHint=*/false,
@@ -8839,8 +8848,9 @@ TEST(WrapMicrotestIsolated, SelectAllGather_ForceScratchBlockedWhenMessageExceed
         comm->nRanks = 1;
         comm->nNodes = 1;
         uint8_t scratch[64];
-        comm->ddaScratch = scratch;
-        comm->ddaScratchBytes = sizeof(scratch); // 64 bytes
+        comm->ddaFabricMemHandler = reinterpret_cast<ncclFabricMemHandler*>(0x1);
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].scratch = scratch;
+        comm->ddaFabricScratch.regions[ncclDdaScratchCE].bytes = sizeof(scratch); // 64 bytes
         rcclCollDecision decision{};
         // totalBytes = nRanks(1) * sendcount(1024) * sizeof(float32)(4) = 4096, > 64.
         EXPECT_EQ(ncclSuccess, rcclSelectAllGather(comm, nullptr, nullptr, /*sendcount=*/1024, ncclFloat32,

@@ -94,16 +94,16 @@ class DdaReduceScatterFabricLL128Microtest : public ::testing::Test {
   void ExpectLaunchOf(const DdaLaunch& launch, size_t recvcount, const void* kernel = Kernel<T, 8>()) {
     EXPECT_EQ(launch.kernel, kernel);
     ASSERT_EQ(launch.args.size(), 11u);
-    EXPECT_EQ(launch.Arg<T**>(0), comm().ddaPeerPtrsDev);
+    EXPECT_EQ(launch.Arg<T**>(0), comm().ddaFabricScratch.regions[ncclDdaScratchLL128].peerPtrsDev);
     EXPECT_EQ(launch.Arg<T*>(1), kRecvbuff);
     EXPECT_EQ(launch.Arg<const T*>(2), kSendbuff);
     EXPECT_EQ(launch.Arg<size_t>(3), recvcount * sizeof(T));
     EXPECT_EQ(launch.Arg<int>(4), 7);
     EXPECT_EQ(launch.Arg<int>(5), 8);
-    EXPECT_EQ(launch.Arg<uint32_t*>(6), comm().ddaLLEpochDev);
-    EXPECT_EQ(launch.Arg<int>(7), comm().ddaLLEpochLen);
+    EXPECT_EQ(launch.Arg<uint32_t*>(6), comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochDev);
+    EXPECT_EQ(launch.Arg<int>(7), comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen);
     EXPECT_EQ(launch.Arg<size_t>(8), (recvcount * sizeof(T) + 1919) / 1920);
-    EXPECT_EQ(launch.Arg<size_t>(9), (comm().ddaScratchBytes / 2) / 128 * 128);
+    EXPECT_EQ(launch.Arg<size_t>(9), (comm().ddaFabricScratch.regions[ncclDdaScratchLL128].bytes / 2) / 128 * 128);
     EXPECT_EQ(launch.Arg<dda::common::DdaKernelParams>(10).flag, comm().abortFlagDev);
   }
 
@@ -133,18 +133,18 @@ TEST_F(DdaReduceScatterFabricLL128Microtest, Eligible_NeedsHandlerScratchAndPeer
   for (int missing = 0; missing < 3; ++missing) {
     mock_.setFabricResourcesPresent(true);
     comm().ddaFabricMemHandler = missing == 0 ? nullptr : comm().ddaFabricMemHandler;
-    comm().ddaScratch = missing == 1 ? nullptr : comm().ddaScratch;
-    comm().ddaPeerPtrsDev = missing == 2 ? nullptr : comm().ddaPeerPtrsDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL128].scratch = missing == 1 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL128].scratch;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL128].peerPtrsDev = missing == 2 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL128].peerPtrsDev;
     EXPECT_FALSE(Eligible(4)) << "missing resource " << missing;
   }
 }
 
 TEST_F(DdaReduceScatterFabricLL128Microtest, Eligible_NeedsTheEpochArray) {
-  comm().ddaLLEpochLen = 0;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 0;
   EXPECT_FALSE(Eligible(4));
-  comm().ddaLLEpochLen = 1;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 1;
   EXPECT_TRUE(Eligible(4));
-  comm().ddaLLEpochDev = nullptr;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochDev = nullptr;
   EXPECT_FALSE(Eligible(4));
 }
 
@@ -212,15 +212,15 @@ TEST_F(DdaReduceScatterFabricLL128Microtest, Eligible_WholeMessageWithinTheLL128
 }
 
 TEST_F(DdaReduceScatterFabricLL128Microtest, Eligible_RankSlotMustHoldEverySlice) {
-  comm().ddaScratchBytes = kOneSliceScratch8;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].bytes = kOneSliceScratch8;
   EXPECT_TRUE(Eligible(kSliceFloats));
   EXPECT_FALSE(Eligible(kSliceFloats + 4));
-  comm().ddaScratchBytes = kOneSliceScratch8 - 1;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].bytes = kOneSliceScratch8 - 1;
   EXPECT_FALSE(Eligible(4));
-  comm().ddaScratchBytes = 2 * kOneSliceScratch8;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].bytes = 2 * kOneSliceScratch8;
   EXPECT_TRUE(Eligible(kSliceFloats + 4));
   comm().nRanks = 4;
-  comm().ddaScratchBytes = kOneSliceScratch8 / 2;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].bytes = kOneSliceScratch8 / 2;
   EXPECT_TRUE(Eligible(4));
 }
 
@@ -276,9 +276,9 @@ TEST_F(DdaReduceScatterFabricLL128Microtest, Launch_GridFollowsShardSlicesWithin
   comm().ddaFabricMaxBlocks = 0;
   EXPECT_EQ(RunOne(16 * 100 * kSliceFloats).grid.x, 1u);
   comm().ddaFabricMaxBlocks = 256;
-  comm().ddaLLEpochLen = 9;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 9;
   EXPECT_EQ(RunOne(16 * 100 * kSliceFloats).grid.x, 9u);
-  comm().ddaLLEpochLen = 0;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 0;
   EXPECT_EQ(RunOne(16 * 100 * kSliceFloats).grid.x, 1u);
 }
 
@@ -405,9 +405,9 @@ TEST_F(DdaReduceScatterFabricLL128Microtest, PeerParallel_GridFollowsShardSlices
   comm().ddaFabricMaxBlocks = 0;
   EXPECT_EQ(RunOne(100 * kSliceFloats).grid.x, 1u);
   comm().ddaFabricMaxBlocks = 256;
-  comm().ddaLLEpochLen = 9;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 9;
   EXPECT_EQ(RunOne(100 * kSliceFloats).grid.x, 9u);
-  comm().ddaLLEpochLen = 0;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 0;
   EXPECT_EQ(RunOne(100 * kSliceFloats).grid.x, 1u);
 }
 

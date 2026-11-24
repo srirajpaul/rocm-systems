@@ -311,10 +311,10 @@ TEST_F(DdaBroadcastFabricLL128Microtest, Eligible_NeedsScratchPeersAndEpoch) {
   for (int missing = 0; missing < 5; ++missing) {
     mock_.setFabricResourcesPresent(true);
     comm().ddaFabricMemHandler = missing == 4 ? nullptr : comm().ddaFabricMemHandler;
-    comm().ddaScratch = missing == 0 ? nullptr : comm().ddaScratch;
-    comm().ddaPeerPtrsDev = missing == 1 ? nullptr : comm().ddaPeerPtrsDev;
-    comm().ddaLLEpochDev = missing == 2 ? nullptr : comm().ddaLLEpochDev;
-    comm().ddaLLEpochLen = missing == 3 ? 0 : comm().ddaLLEpochLen;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL128].scratch = missing == 0 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL128].scratch;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL128].peerPtrsDev = missing == 1 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL128].peerPtrsDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochDev = missing == 2 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = missing == 3 ? 0 : comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen;
     EXPECT_FALSE(Eligible(16)) << "missing resource " << missing;
   }
 }
@@ -361,39 +361,23 @@ TEST_F(DdaBroadcastFabricLL128Microtest, Eligible_UpToBroadcastLL128Threshold) {
   EXPECT_FALSE(Eligible(1040));
 }
 
-TEST_F(DdaBroadcastFabricLL128Microtest, Eligible_SlicesMustFitBankAfterTokenRegion) {
-  // 256-word slices; 8 rank tokens pad to one slice, so a 528-word bank leaves one (two if unpadded).
+TEST_F(DdaBroadcastFabricLL128Microtest, Eligible_SlicesMustFitDataBank) {
   SetArch("gfx1250");
-  comm().ddaScratchBytes = 2 * 528 * 8;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].bytes = 2 * 256 * 8;
   EXPECT_TRUE(Eligible(kGfx1250Slice));
   EXPECT_FALSE(Eligible(kGfx1250Slice + 16));
-  // 144 rank tokens pad to two slices: none left in a 528-word bank, one in a 768-word bank.
   comm().nRanks = 144;
-  EXPECT_FALSE(Eligible(16));
-  comm().ddaScratchBytes = 2 * 768 * 8;
   EXPECT_TRUE(Eligible(kGfx1250Slice));
-  EXPECT_FALSE(Eligible(kGfx1250Slice + 16));
-}
-
-TEST_F(DdaBroadcastFabricLL128Microtest, Eligible_TokenRegionKeepsDataSliceAndLineAligned) {
-  for (const char* arch : {"gfx1250", "gfx950"}) {
-    SetArch(arch);
-    const size_t sliceBytes = ddaLL128BcArch(mock_.get()).sliceWords * sizeof(uint64_t);
-    for (int nRanks = 2; nRanks <= 144; ++nRanks) {
-      const size_t offset = dda::common::ddaLL128BcTokenWords(nRanks, sliceBytes / sizeof(uint64_t)) * sizeof(uint64_t);
-      EXPECT_GE(offset, 16u * nRanks) << arch << " nRanks " << nRanks;
-      EXPECT_EQ(offset % 128, 0u) << arch << " nRanks " << nRanks;
-      EXPECT_EQ(offset % sliceBytes, 0u) << arch << " nRanks " << nRanks;
-    }
-  }
+  comm().ddaFabricScratch.tokenPeerPtrsDev = nullptr;
+  EXPECT_FALSE(Eligible(16));
 }
 
 TEST_F(DdaBroadcastFabricLL128Microtest, Eligible_RootGridMustFitEpoch) {
   // Root grid 7 x 8; non-root 8.
   SetArch("gfx1250");
-  comm().ddaLLEpochLen = 56;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 56;
   EXPECT_TRUE(Eligible(8 * kGfx1250Group));
-  comm().ddaLLEpochLen = 55;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 55;
   EXPECT_FALSE(Eligible(8 * kGfx1250Group));
 }
 
@@ -402,16 +386,16 @@ TEST_F(DdaBroadcastFabricLL128Microtest, Eligible_NonRootGridMustFitEpoch) {
   SetArch("gfx1250");
   comm().nRanks = 4;
   params_["RCCL_DDA_BC_MAX_BLOCKS"] = 5;
-  comm().ddaLLEpochLen = 5;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 5;
   EXPECT_TRUE(Eligible(8 * kGfx1250Group));
-  comm().ddaLLEpochLen = 4;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 4;
   EXPECT_FALSE(Eligible(8 * kGfx1250Group));
 }
 
 TEST_F(DdaBroadcastFabricLL128Microtest, Eligible_SameAnswerOnEveryRank) {
   SetArch("gfx1250");
   for (int epochLen : {55, 56}) {
-    comm().ddaLLEpochLen = epochLen;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = epochLen;
     comm().rank = 0;
     const bool expected = Eligible(8 * kGfx1250Group);
     for (int rank = 1; rank < comm().nRanks; ++rank) {
@@ -442,7 +426,7 @@ TEST_F(DdaBroadcastFabricLL128Microtest, Launch_AlignedKernelFrom16ByteOwnBuffer
 }
 
 TEST_F(DdaBroadcastFabricLL128Microtest, Launch_PassesBuffersBytesRanksEpochAndBank) {
-  comm().ddaScratchBytes = 4096 + 40;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].bytes = 4096 + 40;
   ASSERT_EQ(Run(/*root=*/2, 8, kSendbuff, kRecvbuff, ncclFloat16), ncclSuccess);
   ASSERT_EQ(g_ddaLaunches.size(), 1u);
   const DdaLaunch& launch = g_ddaLaunches[0];
@@ -455,16 +439,18 @@ TEST_F(DdaBroadcastFabricLL128Microtest, Launch_PassesBuffersBytesRanksEpochAndB
   EXPECT_EQ(comm().addonStopEvent, nullptr);
   EXPECT_EQ(launch.sharedMemBytes, 0u);
   EXPECT_EQ(launch.flags, 0u);
-  ASSERT_EQ(launch.args.size(), 11u);
-  EXPECT_EQ(launch.Arg<char* const*>(0), comm().ddaPeerPtrsDev);
+  ASSERT_EQ(launch.args.size(), 13u);
+  EXPECT_EQ(launch.Arg<char* const*>(0), comm().ddaFabricScratch.regions[ncclDdaScratchLL128].peerPtrsDev);
   EXPECT_EQ(launch.Arg<char*>(1), kRecvbuff);
   EXPECT_EQ(launch.Arg<const char*>(2), kSendbuff);
   EXPECT_EQ(launch.Arg<size_t>(3), 16u);
   EXPECT_EQ(launch.Arg<int>(4), kRank);
   EXPECT_EQ(launch.Arg<int>(5), 8);
   EXPECT_EQ(launch.Arg<int>(6), 2);
-  EXPECT_EQ(launch.Arg<uint32_t*>(7), comm().ddaLLEpochDev);
-  EXPECT_EQ(launch.Arg<int>(8), comm().ddaLLEpochLen);
+  EXPECT_EQ(launch.Arg<uint32_t*>(7), comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochDev);
+  EXPECT_EQ(launch.Arg<int>(8), comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen);
+  EXPECT_EQ(launch.Arg<char* const*>(11), comm().ddaFabricScratch.tokenPeerPtrsDev);
+  EXPECT_EQ(launch.Arg<size_t>(12), comm().ddaFabricScratch.tokenBankBytes);
   EXPECT_EQ(launch.Arg<size_t>(9), 2048u);
   EXPECT_EQ(launch.Arg<dda::common::DdaKernelParams>(10).flag, comm().abortFlagDev);
 }

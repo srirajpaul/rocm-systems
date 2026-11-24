@@ -377,9 +377,9 @@ protected:
   }
 
   // Value of this rank's epoch cells; the stream must be idle.
-  uint32_t currentEpoch() {
+  uint32_t currentEpoch(ncclDdaScratchKind kind = ncclDdaScratchLL) {
     uint32_t e = 0;
-    if (hipMemcpy(&e, getActiveCommunicator()->ddaLLEpochDev, sizeof(e), hipMemcpyDeviceToHost) != hipSuccess) return 0;
+    if (hipMemcpy(&e, ncclDdaGetScratch(getActiveCommunicator(), kind).epochDev, sizeof(e), hipMemcpyDeviceToHost) != hipSuccess) return 0;
     return e;
   }
 
@@ -482,6 +482,49 @@ TEST_F(DdaMPI_BroadcastLL128, BackToBackNoSync) {
   backToBackRounds(sizes, RCCL_DDA_FABRIC_LL128);
 }
 
+// AllGather deliberately retains LL128 payload. Its crafted words must neither
+// alter the reserved LL-format token banks nor satisfy a later Broadcast poll.
+TEST_F(DdaMPI_BroadcastLL128, AllGatherPayloadCannotOverwriteStartTokens) {
+  auto* comm = getActiveCommunicator();
+  const auto& arena = comm->ddaFabricScratch;
+  const size_t tokenBytes = 2 * arena.tokenBankBytes;
+  auto* tokens = static_cast<char*>(arena.allocation) + arena.offsets[ncclDdaScratchLL128];
+  ASSERT_MPI_TRUE(arena.tokenPeerPtrsDev != nullptr && tokenBytes != 0);
+  void* send = nullptr;
+  void* recv = nullptr;
+  constexpr size_t count = kLL128SliceBytes / sizeof(float);
+  ASSERT_MPI_EQ(hipSuccess, hipMalloc(&send, count * sizeof(float)));
+  ASSERT_MPI_EQ(hipSuccess, hipMalloc(&recv, count * nRanks_ * sizeof(float)));
+  for (int root = 0; root < nRanks_; ++root) {
+    for (int bank = 0; bank < 2; ++bank) {
+      // AllGather, filler Broadcast, target Broadcast: same LL128 bank on first/third.
+      const uint32_t poison = currentEpoch(ncclDdaScratchLL128) + 3;
+      std::vector<uint32_t> input(count, poison), output(count * nRanks_);
+      std::vector<uint8_t> before(tokenBytes), after(tokenBytes);
+      ASSERT_MPI_EQ(hipSuccess, hipMemcpy(send, input.data(), count * sizeof(float), hipMemcpyHostToDevice));
+      ASSERT_MPI_EQ(hipSuccess, hipMemcpy(before.data(), tokens, tokenBytes, hipMemcpyDeviceToHost));
+      int algo = -1, protocol = -1, channels = -1;
+      ASSERT_MPI_EQ(ncclSuccess, rcclGetCollImplInfo(comm, ncclFuncAllGather, count, ncclFloat32, ncclSum,
+                         send, recv, 0, &algo, &protocol, &channels));
+      ASSERT_MPI_EQ(algo, RCCL_DDA_FABRIC_LL128);
+      ASSERT_MPI_EQ(ncclSuccess, ncclAllGather(send, recv, count, ncclFloat32, comm, getActiveStream()));
+      drain();
+      ASSERT_MPI_EQ(hipSuccess, hipMemcpy(output.data(), recv, output.size() * sizeof(uint32_t), hipMemcpyDeviceToHost));
+      ASSERT_MPI_TRUE(std::all_of(output.begin(), output.end(), [poison](uint32_t v) { return v == poison; }));
+      ASSERT_MPI_EQ(hipSuccess, hipMemcpy(after.data(), tokens, tokenBytes, hipMemcpyDeviceToHost));
+      ASSERT_MPI_TRUE(before == after);
+      broadcastAndCheck({16, root, false, 0, 0}, RCCL_DDA_FABRIC_LL128);
+      if (HasFatalFailure() || IsSkipped()) break;
+      backToBack({{{kLL128PartialSlice, root, false, 0, 0}, RCCL_DDA_FABRIC_LL128}},
+                 [root, this](size_t) { return (root + 1) % nRanks_; }, kLateRootDelay);
+      if (HasFatalFailure() || IsSkipped()) break;
+    }
+    if (HasFatalFailure() || IsSkipped()) break;
+  }
+  EXPECT_EQ(hipSuccess, hipFree(send));
+  EXPECT_EQ(hipSuccess, hipFree(recv));
+}
+
 // ---- DDA fabric Broadcast LL128 two-shot ----
 //
 // Environment set by standard_env_dda_bc_ll128_two_shot in test_categories_mpi.yaml:
@@ -579,7 +622,7 @@ TEST_F(DdaMPI_BroadcastLL128DefaultFanOut, BackToBackNoSync) {
 
 class DdaMPI_BroadcastTransition : public DdaBroadcastMPITest {};
 
-// LL, LL128 two-shot, LL on one comm, twice over: each protocol reads the scratch the other just wrote.
+// LL, LL128 two-shot, LL on one comm, twice over: verify the isolated protocol regions.
 TEST_F(DdaMPI_BroadcastTransition, LLThenLL128ThenLL) {
   const std::pair<size_t, int> steps[] = {{kLLMultiChunk, RCCL_DDA_FABRIC_LL},
                                           {kLL128TwoShotMin, RCCL_DDA_FABRIC_LL128},
@@ -608,26 +651,28 @@ TEST_F(DdaMPI_BroadcastTransition, BackToBackNoSync) {
   backToBackRounds(steps);
 }
 
-// Stale flags: an LL128 two-shot call carries, in every 32-bit word, the flag of the LL call two launches
-// later in the same bank, so its leftovers would pass that call's line polls. The LL root enqueues late,
-// so non-roots poll the leftovers first; only the LL128 receivers clearing what they consumed keeps the LL
-// data correct.
+// Carry the target LL epoch in LL128 payload. Align the independently advancing
+// bank parities, then delay the LL root so non-roots reach their polls first.
 TEST_F(DdaMPI_BroadcastTransition, LL128LeftoversDoNotPassLLPoll) {
   for (int round = 0; round < 3; ++round) {
     const int root = round % nRanks_;
+    if (((currentEpoch(ncclDdaScratchLL128) + 1) & 1u) != (currentEpoch() & 1u)) {
+      broadcastAndCheck({16, root, false, 0, 0}, RCCL_DDA_FABRIC_LL);
+      if (HasFatalFailure() || IsSkipped()) return;
+    }
     const uint32_t epoch = currentEpoch();
     uint32_t lo = epoch, hi = epoch;
     MPI_Allreduce(MPI_IN_PLACE, &lo, 1, MPI_UINT32_T, MPI_MIN, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &hi, 1, MPI_UINT32_T, MPI_MAX, MPI_COMM_WORLD);
     ASSERT_MPI_EQ(lo, hi);
-    // Flags: LL128 two-shot epoch+1, filler epoch+2 (other bank), target LL epoch+3 (the LL128 bank).
-    broadcastAndCheck({kLL128TwoShotMin, root, false, 0, 0, epoch + 3}, RCCL_DDA_FABRIC_LL128);
+    // LL filler advances LL once; target advances LL twice. LL128 advances its own counter.
+    broadcastAndCheck({kLL128TwoShotMin, root, false, 0, 0, epoch + 2}, RCCL_DDA_FABRIC_LL128);
     if (HasFatalFailure() || IsSkipped()) return;
     broadcastAndCheck({16, root, false, 0, 0}, RCCL_DDA_FABRIC_LL);
     if (HasFatalFailure() || IsSkipped()) return;
     backToBack({{{kLLCap, root, false, 0, 0}, RCCL_DDA_FABRIC_LL}}, [root](size_t) { return root; }, kLateRootDelay);
     if (HasFatalFailure() || IsSkipped()) return;
-    ASSERT_MPI_EQ(currentEpoch(), epoch + 3);
+    ASSERT_MPI_EQ(currentEpoch(), epoch + 2);
   }
 }
 

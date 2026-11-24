@@ -197,3 +197,5 @@ rccl_add_dda_micro_binary(rccl-UnitTestsMicroDdaIpcLifecycle ipc/dda-ipc-lifecyc
     fakes/utils_fakes.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/algorithms/dda/device/device_buffer.cc
     ${RCCL_HOST_HIPIFY_DIR}/src/misc/archinfo.cc)
+
+rccl_add_dda_micro_binary(rccl-UnitTestsMicroDdaScratchLayout scratch-layout-test.cc)

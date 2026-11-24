@@ -78,8 +78,8 @@ TEST_F(DdaAllGatherFabricMicrotest, Eligible_EachMissingFabricResourceRejects) {
     mock_.setFabricResourcesPresent(true);
     comm().ddaFabricMemHandler = missing == 0 ? nullptr : comm().ddaFabricMemHandler;
     comm().ddaFabricBarrierState = missing == 1 ? nullptr : barrier_;
-    comm().ddaScratch = missing == 2 ? nullptr : comm().ddaScratch;
-    comm().ddaPeerPtrsDev = missing == 3 ? nullptr : comm().ddaPeerPtrsDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchSimple].scratch = missing == 2 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchSimple].scratch;
+    comm().ddaFabricScratch.regions[ncclDdaScratchSimple].peerPtrsDev = missing == 3 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchSimple].peerPtrsDev;
     EXPECT_FALSE(Eligible(4)) << "missing resource " << missing;
   }
 }
@@ -119,13 +119,13 @@ TEST_F(DdaAllGatherFabricMicrotest, Eligible_PerRankBytesMustBeMultipleOf16) {
   EXPECT_TRUE(Eligible(16, ncclBfloat16));
 }
 
-// Eligibility compares one rank's bytes with scratch, but the launcher needs room for all nRanks; a fix flips this pin.
-TEST_F(DdaAllGatherFabricMicrotest, Eligible_KnownBug_ScratchCheckUsesPerRankBytesNotGatheredTotal) {
-  comm().ddaScratchBytes = 64;
+// Only the local contribution is staged. Selection and launch must agree at capacity.
+TEST_F(DdaAllGatherFabricMicrotest, Eligible_AndLaunchUseTheSamePerRankFootprint) {
+  comm().ddaFabricScratch.regions[ncclDdaScratchSimple].bytes = 64;
   EXPECT_TRUE(Eligible(16));
   EXPECT_FALSE(Eligible(20));
-  EXPECT_EQ(Run(16), ncclInvalidArgument);
-  EXPECT_TRUE(g_ddaLaunches.empty());
+  EXPECT_EQ(Run(16), ncclSuccess);
+  EXPECT_EQ(g_ddaLaunches.size(), 1u);
 }
 
 TEST_F(DdaAllGatherFabricMicrotest, Launch_UnsupportedDatatypeReturnsInvalidArgument) {
@@ -139,17 +139,17 @@ TEST_F(DdaAllGatherFabricMicrotest, Launch_EachMissingFabricResourceReturnsInval
   for (int missing = 0; missing < 4; ++missing) {
     mock_.setFabricResourcesPresent(true);
     comm().ddaFabricMemHandler = missing == 0 ? nullptr : comm().ddaFabricMemHandler;
-    comm().ddaScratch = missing == 1 ? nullptr : comm().ddaScratch;
-    comm().ddaPeerPtrsDev = missing == 2 ? nullptr : comm().ddaPeerPtrsDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchSimple].scratch = missing == 1 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchSimple].scratch;
+    comm().ddaFabricScratch.regions[ncclDdaScratchSimple].peerPtrsDev = missing == 2 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchSimple].peerPtrsDev;
     comm().ddaFabricBarrierState = missing == 3 ? nullptr : barrier_;
     EXPECT_EQ(Run(4), ncclInvalidUsage) << "missing resource " << missing;
   }
   EXPECT_TRUE(g_ddaLaunches.empty());
 }
 
-TEST_F(DdaAllGatherFabricMicrotest, Launch_GatheredTotalMayFillScratchExactly) {
+TEST_F(DdaAllGatherFabricMicrotest, Launch_LocalContributionMayFillScratchExactly) {
   comm().nRanks = 4;
-  comm().ddaScratchBytes = 4 * 64;
+  comm().ddaFabricScratch.regions[ncclDdaScratchSimple].bytes = 64;
   EXPECT_EQ(Run(16), ncclSuccess);
   EXPECT_EQ(Run(20), ncclInvalidArgument);
   EXPECT_EQ(g_ddaLaunches.size(), 1u);
@@ -180,7 +180,7 @@ TEST_F(DdaAllGatherFabricMicrotest, Launch_PassesBuffersByteCountRankAndBarrier)
   EXPECT_EQ(launch.sharedMemBytes, 0u);
   EXPECT_EQ(launch.flags, 0u);
   ASSERT_EQ(launch.args.size(), 7u);
-  EXPECT_EQ(launch.Arg<int8_t**>(0), comm().ddaPeerPtrsDev);
+  EXPECT_EQ(launch.Arg<int8_t**>(0), comm().ddaFabricScratch.regions[ncclDdaScratchSimple].peerPtrsDev);
   EXPECT_EQ(launch.Arg<int8_t*>(1), kRecvbuff);
   EXPECT_EQ(launch.Arg<size_t>(2), 16u);
   EXPECT_EQ(launch.Arg<const int8_t*>(3), kSendbuff);
@@ -218,5 +218,6 @@ TEST_F(DdaAllGatherFabricMicrotest, Launch_LaunchErrorIsReported) {
   g_hipGetLastError = [] { return hipErrorLaunchFailure; };
   EXPECT_EQ(Run(4), ncclUnhandledCudaError);
 }
+
 
 }  // namespace

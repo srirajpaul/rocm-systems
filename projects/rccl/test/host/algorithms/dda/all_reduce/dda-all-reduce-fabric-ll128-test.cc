@@ -81,14 +81,14 @@ class DdaAllReduceFabricLL128Microtest : public ::testing::Test {
   void ExpectLaunchOf(const DdaLaunch& launch, size_t count, size_t lines) {
     EXPECT_EQ(launch.kernel, (Kernel<T, 8>()));
     ASSERT_EQ(launch.args.size(), 10u);
-    EXPECT_EQ(launch.Arg<T**>(0), comm().ddaPeerPtrsDev);
+    EXPECT_EQ(launch.Arg<T**>(0), comm().ddaFabricScratch.regions[ncclDdaScratchLL128].peerPtrsDev);
     EXPECT_EQ(launch.Arg<T*>(1), kRecvbuff);
     EXPECT_EQ(launch.Arg<const T*>(2), kSendbuff);
     EXPECT_EQ(launch.Arg<size_t>(3), count);
     EXPECT_EQ(launch.Arg<int>(4), 6);
     EXPECT_EQ(launch.Arg<int>(5), 8);
-    EXPECT_EQ(launch.Arg<uint32_t*>(6), comm().ddaLLEpochDev);
-    EXPECT_EQ(launch.Arg<int>(7), comm().ddaLLEpochLen);
+    EXPECT_EQ(launch.Arg<uint32_t*>(6), comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochDev);
+    EXPECT_EQ(launch.Arg<int>(7), comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen);
     EXPECT_EQ(launch.Arg<size_t>(8), lines);
     EXPECT_EQ(launch.Arg<dda::common::DdaKernelParams>(9).flag, comm().abortFlagDev);
   }
@@ -114,8 +114,8 @@ TEST_F(DdaAllReduceFabricLL128Microtest, Eligible_NeedsHandlerScratchAndPeersBut
   for (int missing = 0; missing < 3; ++missing) {
     mock_.setFabricResourcesPresent(true);
     comm().ddaFabricMemHandler = missing == 0 ? nullptr : comm().ddaFabricMemHandler;
-    comm().ddaScratch = missing == 1 ? nullptr : comm().ddaScratch;
-    comm().ddaPeerPtrsDev = missing == 2 ? nullptr : comm().ddaPeerPtrsDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL128].scratch = missing == 1 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL128].scratch;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL128].peerPtrsDev = missing == 2 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL128].peerPtrsDev;
     EXPECT_FALSE(Eligible(4)) << "missing resource " << missing;
   }
 }
@@ -173,13 +173,13 @@ TEST_F(DdaAllReduceFabricLL128Microtest, Eligible_UpToAllReduceLL128ThresholdAnd
 
 // Two banks of nRanks slots sized to this message's 128-byte lines.
 TEST_F(DdaAllReduceFabricLL128Microtest, Eligible_ScratchMustHoldThisMessagesLines) {
-  comm().ddaScratchBytes = 2 * 8 * 128;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].bytes = 2 * 8 * 128;
   EXPECT_TRUE(Eligible(kLineFloats));
   EXPECT_FALSE(Eligible(kLineFloats + 2));
-  comm().ddaScratchBytes = 2 * 8 * 128 - 1;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].bytes = 2 * 8 * 128 - 1;
   EXPECT_FALSE(Eligible(kLineFloats));
   comm().nRanks = 4;
-  comm().ddaScratchBytes = 2 * 4 * 3 * 128;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].bytes = 2 * 4 * 3 * 128;
   EXPECT_TRUE(Eligible(3 * kLineFloats));
   EXPECT_FALSE(Eligible(3 * kLineFloats + 2));
 }
@@ -236,9 +236,9 @@ TEST_F(DdaAllReduceFabricLL128Microtest, Launch_GridFollowsMessageLinesWithinCap
   comm().ddaFabricMaxBlocks = 0;
   EXPECT_EQ(RunOne(64 * 100 * kLineFloats).grid.x, 1u);
   comm().ddaFabricMaxBlocks = 256;
-  comm().ddaLLEpochLen = 9;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 9;
   EXPECT_EQ(RunOne(64 * 100 * kLineFloats).grid.x, 9u);
-  comm().ddaLLEpochLen = 0;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 0;
   EXPECT_EQ(RunOne(64 * 100 * kLineFloats).grid.x, 1u);
 }
 

@@ -79,8 +79,8 @@ TEST_F(DdaAlltoallFabricLLMicrotest, Eligible_NeedsHandlerScratchAndPeersButNotB
   for (int missing = 0; missing < 3; ++missing) {
     mock_.setFabricResourcesPresent(true);
     comm().ddaFabricMemHandler = missing == 0 ? nullptr : comm().ddaFabricMemHandler;
-    comm().ddaScratch = missing == 1 ? nullptr : comm().ddaScratch;
-    comm().ddaPeerPtrsDev = missing == 2 ? nullptr : comm().ddaPeerPtrsDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL].scratch = missing == 1 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL].scratch;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL].peerPtrsDev = missing == 2 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL].peerPtrsDev;
     EXPECT_FALSE(Eligible(4)) << "missing resource " << missing;
   }
 }
@@ -126,7 +126,7 @@ TEST_F(DdaAlltoallFabricLLMicrotest, Eligible_PerPeerBytesUpToHalfTheStagingCap)
 }
 
 TEST_F(DdaAlltoallFabricLLMicrotest, Eligible_PerPeerPacketsMustFitTheSlot) {
-  comm().ddaScratchBytes = kSlotScratch;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = kSlotScratch;
   EXPECT_TRUE(Eligible(64));
   EXPECT_FALSE(Eligible(68));
   // The same bank over 4 ranks doubles the slot to 64 packets, 512 B per peer.
@@ -135,11 +135,11 @@ TEST_F(DdaAlltoallFabricLLMicrotest, Eligible_PerPeerPacketsMustFitTheSlot) {
   EXPECT_FALSE(Eligible(132));
   comm().nRanks = 8;
   // 31 packets per peer in the bank floor to a 16-packet slot.
-  comm().ddaScratchBytes = 2 * 8 * 31 * 16;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 2 * 8 * 31 * 16;
   EXPECT_TRUE(Eligible(32));
   EXPECT_FALSE(Eligible(36));
   // A bank under one 16-packet granule per peer leaves no slot at all.
-  comm().ddaScratchBytes = 2 * 8 * 15 * 16;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 2 * 8 * 15 * 16;
   EXPECT_FALSE(Eligible(4));
 }
 
@@ -165,7 +165,7 @@ TEST_F(DdaAlltoallFabricLLMicrotest, Launch_FourAndEightRanksUnrolledOthersRunti
 }
 
 TEST_F(DdaAlltoallFabricLLMicrotest, Launch_PassesBuffersPerPeerBytesEpochAndBank) {
-  comm().ddaScratchBytes = 4096 + 40;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 4096 + 40;
   ASSERT_EQ(Run(8, ncclFloat16), ncclSuccess);
   ASSERT_EQ(g_ddaLaunches.size(), 1u);
   const DdaLaunch& launch = g_ddaLaunches[0];
@@ -178,13 +178,13 @@ TEST_F(DdaAlltoallFabricLLMicrotest, Launch_PassesBuffersPerPeerBytesEpochAndBan
   EXPECT_EQ(launch.sharedMemBytes, 0u);
   EXPECT_EQ(launch.flags, 0u);
   ASSERT_EQ(launch.args.size(), 10u);
-  EXPECT_EQ(launch.Arg<int8_t**>(0), comm().ddaPeerPtrsDev);
+  EXPECT_EQ(launch.Arg<int8_t**>(0), comm().ddaFabricScratch.regions[ncclDdaScratchLL].peerPtrsDev);
   EXPECT_EQ(launch.Arg<int8_t*>(1), kRecvbuff);
   EXPECT_EQ(launch.Arg<const int8_t*>(2), kSendbuff);
   EXPECT_EQ(launch.Arg<size_t>(3), 16u);
   EXPECT_EQ(launch.Arg<int>(4), 1);
-  EXPECT_EQ(launch.Arg<uint32_t*>(6), comm().ddaLLEpochDev);
-  EXPECT_EQ(launch.Arg<int>(7), comm().ddaLLEpochLen);
+  EXPECT_EQ(launch.Arg<uint32_t*>(6), comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochDev);
+  EXPECT_EQ(launch.Arg<int>(7), comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochLen);
   // Bank 1 starts at half the scratch floored to 128 B, the offset every DDA LL/LL128 tier uses.
   EXPECT_EQ(launch.Arg<size_t>(8), 2048u);
   EXPECT_EQ(launch.Arg<dda::common::DdaKernelParams>(9).flag, comm().abortFlagDev);
@@ -226,6 +226,15 @@ TEST_F(DdaAlltoallFabricLLMicrotest, Blocks_SizedOnBytesNotElements) {
 TEST_F(DdaAlltoallFabricLLMicrotest, Launch_LaunchErrorIsReported) {
   g_hipGetLastError = [] { return hipErrorLaunchFailure; };
   EXPECT_EQ(Run(4), ncclUnhandledCudaError);
+}
+
+TEST_F(DdaAlltoallFabricLLMicrotest, FixedRegionCapacityBoundary) {
+  comm().nRanks = 8;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 8u << 20;
+  EXPECT_TRUE(Eligible((256u << 10) / sizeof(float)));
+  EXPECT_FALSE(Eligible((256u << 10) / sizeof(float) + 4));
+  comm().ddaFabricScratch.regions[ncclDdaScratchSimple].bytes = 1ULL << 30;
+  EXPECT_FALSE(Eligible((256u << 10) / sizeof(float) + 4));
 }
 
 }  // namespace

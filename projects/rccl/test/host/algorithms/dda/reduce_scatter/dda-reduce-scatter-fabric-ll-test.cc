@@ -75,15 +75,15 @@ class DdaReduceScatterFabricLLMicrotest : public ::testing::Test {
   void ExpectLaunchOf(const DdaLaunch& launch, const void* kernel, size_t recvcount) {
     EXPECT_EQ(launch.kernel, kernel);
     ASSERT_EQ(launch.args.size(), 10u);
-    EXPECT_EQ(launch.Arg<T**>(0), comm().ddaPeerPtrsDev);
+    EXPECT_EQ(launch.Arg<T**>(0), comm().ddaFabricScratch.regions[ncclDdaScratchLL].peerPtrsDev);
     EXPECT_EQ(launch.Arg<T*>(1), kRecvbuff);
     EXPECT_EQ(launch.Arg<const T*>(2), kSendbuff);
     EXPECT_EQ(launch.Arg<size_t>(3), recvcount);
     EXPECT_EQ(launch.Arg<int>(4), 7);
     EXPECT_EQ(launch.Arg<int>(5), comm().nRanks);
-    EXPECT_EQ(launch.Arg<uint32_t*>(6), comm().ddaLLEpochDev);
-    EXPECT_EQ(launch.Arg<int>(7), comm().ddaLLEpochLen);
-    EXPECT_EQ(launch.Arg<size_t>(8), dda::common::ddaBankSize(comm().ddaScratchBytes));
+    EXPECT_EQ(launch.Arg<uint32_t*>(6), comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochDev);
+    EXPECT_EQ(launch.Arg<int>(7), comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochLen);
+    EXPECT_EQ(launch.Arg<size_t>(8), dda::common::ddaBankSize(comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes));
     EXPECT_EQ(launch.Arg<dda::common::DdaKernelParams>(9).flag, comm().abortFlagDev);
   }
 
@@ -106,8 +106,8 @@ TEST_F(DdaReduceScatterFabricLLMicrotest, Eligible_NeedsHandlerScratchAndPeersBu
   for (int missing = 0; missing < 3; ++missing) {
     mock_.setFabricResourcesPresent(true);
     comm().ddaFabricMemHandler = missing == 0 ? nullptr : comm().ddaFabricMemHandler;
-    comm().ddaScratch = missing == 1 ? nullptr : comm().ddaScratch;
-    comm().ddaPeerPtrsDev = missing == 2 ? nullptr : comm().ddaPeerPtrsDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL].scratch = missing == 1 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL].scratch;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL].peerPtrsDev = missing == 2 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL].peerPtrsDev;
     EXPECT_FALSE(Eligible(4)) << "missing resource " << missing;
   }
 }
@@ -163,12 +163,12 @@ TEST_F(DdaReduceScatterFabricLLMicrotest, Eligible_IgnoresBufferAlignment) {
 }
 
 TEST_F(DdaReduceScatterFabricLLMicrotest, Eligible_ScratchMustHoldBothBanksOfFixedSlots) {
-  comm().ddaScratchBytes = 8 * kScratchPerRank;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 8 * kScratchPerRank;
   EXPECT_TRUE(Eligible(4));
-  comm().ddaScratchBytes = 8 * kScratchPerRank - 1;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 8 * kScratchPerRank - 1;
   EXPECT_FALSE(Eligible(4));
   comm().nRanks = 4;
-  comm().ddaScratchBytes = 4 * kScratchPerRank;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 4 * kScratchPerRank;
   EXPECT_TRUE(Eligible(4));
 }
 
@@ -239,9 +239,9 @@ TEST_F(DdaReduceScatterFabricLLMicrotest, Launch_GridFollowsShardPacketsWithinCa
   comm().ddaFabricMaxBlocks = 0;
   EXPECT_EQ(RunOne(1u << 18).grid.x, 1u);
   comm().ddaFabricMaxBlocks = 256;
-  comm().ddaLLEpochLen = 9;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochLen = 9;
   EXPECT_EQ(RunOne(1u << 18).grid.x, 9u);
-  comm().ddaLLEpochLen = 0;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochLen = 0;
   EXPECT_EQ(RunOne(1u << 18).grid.x, 1u);
 }
 
@@ -260,10 +260,10 @@ TEST_F(DdaReduceScatterFabricLLMicrotest, Launch_SpreadGridFollowsMessagePackets
   comm().ddaFabricMaxBlocks = 6;
   EXPECT_EQ(RunOne(1u << 18).grid.x, 6u);
   comm().ddaFabricMaxBlocks = 256;
-  comm().ddaLLEpochLen = 9;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochLen = 9;
   EXPECT_EQ(RunOne(1u << 18).grid.x, 9u);
   // 32768 packets in 176-packet slices fill 187 of 192 blocks.
-  comm().ddaLLEpochLen = 256;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].epochLen = 256;
   comm().ddaFabricMaxBlocks = 192;
   EXPECT_EQ(RunOne(1u << 16).grid.x, 187u);
 }
@@ -294,6 +294,14 @@ TEST_F(DdaReduceScatterFabricLLMicrotest, Launch_LaunchErrorIsReported) {
     comm().nRanks = nRanks;
     EXPECT_EQ(Run(4), ncclUnhandledCudaError) << "nRanks " << nRanks;
   }
+}
+
+TEST_F(DdaReduceScatterFabricLLMicrotest, FixedRegionCapacityBoundary) {
+  comm().nRanks = 8;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 8u << 20;
+  EXPECT_FALSE(Eligible(4));
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL].bytes = 32u << 20;
+  EXPECT_TRUE(Eligible(4));
 }
 
 }  // namespace

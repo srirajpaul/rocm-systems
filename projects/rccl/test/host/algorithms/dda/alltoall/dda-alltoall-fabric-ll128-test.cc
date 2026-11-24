@@ -106,8 +106,8 @@ TEST_F(DdaAlltoallFabricLL128Microtest, Eligible_NeedsHandlerScratchAndPeersButN
   for (int missing = 0; missing < 3; ++missing) {
     mock_.setFabricResourcesPresent(true);
     comm().ddaFabricMemHandler = missing == 0 ? nullptr : comm().ddaFabricMemHandler;
-    comm().ddaScratch = missing == 1 ? nullptr : comm().ddaScratch;
-    comm().ddaPeerPtrsDev = missing == 2 ? nullptr : comm().ddaPeerPtrsDev;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL128].scratch = missing == 1 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL128].scratch;
+    comm().ddaFabricScratch.regions[ncclDdaScratchLL128].peerPtrsDev = missing == 2 ? nullptr : comm().ddaFabricScratch.regions[ncclDdaScratchLL128].peerPtrsDev;
     EXPECT_FALSE(Eligible(4)) << "missing resource " << missing;
   }
 }
@@ -150,22 +150,22 @@ TEST_F(DdaAlltoallFabricLL128Microtest, Eligible_PerPeerBytesMultipleOf16) {
 // Each bank holds nRanks slots of whole 2 KiB slices; a slot of S slices carries S * 1920 bytes.
 TEST_F(DdaAlltoallFabricLL128Microtest, Eligible_PerPeerBytesUpToTheSlotCapacity) {
   constexpr size_t kSlices = 10;
-  comm().ddaScratchBytes = 2 * 4 * kSlices * 2048;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].bytes = 2 * 4 * kSlices * 2048;
   EXPECT_TRUE(Eligible(kSlices * kSliceFloats));
   EXPECT_FALSE(Eligible(kSlices * kSliceFloats + 4));
-  comm().ddaScratchBytes = 2 * 4 * kSlices * 2048 - 1;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].bytes = 2 * 4 * kSlices * 2048 - 1;
   EXPECT_FALSE(Eligible(kSlices * kSliceFloats));
   EXPECT_TRUE(Eligible((kSlices - 1) * kSliceFloats));
 }
 
 // The grid is capped at the epoch cells and a column serves several peers, so one cell is enough.
 TEST_F(DdaAlltoallFabricLL128Microtest, Eligible_NeedsAnEpochCell) {
-  comm().ddaLLEpochLen = 1;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 1;
   EXPECT_TRUE(Eligible(4));
-  comm().ddaLLEpochLen = 0;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 0;
   EXPECT_FALSE(Eligible(4));
-  comm().ddaLLEpochLen = 256;
-  comm().ddaLLEpochDev = nullptr;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 256;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochDev = nullptr;
   EXPECT_FALSE(Eligible(4));
 }
 
@@ -211,15 +211,15 @@ TEST_F(DdaAlltoallFabricLL128Microtest, Launch_PassesBuffersSlicesBankAndAbortFl
   EXPECT_EQ(launch.sharedMemBytes, 0u);
   EXPECT_EQ(launch.flags, 0u);
   ASSERT_EQ(launch.args.size(), 11u);
-  EXPECT_EQ(launch.Arg<int8_t**>(0), comm().ddaPeerPtrsDev);
+  EXPECT_EQ(launch.Arg<int8_t**>(0), comm().ddaFabricScratch.regions[ncclDdaScratchLL128].peerPtrsDev);
   EXPECT_EQ(launch.Arg<int8_t*>(1), kRecvbuff);
   EXPECT_EQ(launch.Arg<const int8_t*>(2), kSendbuff);
   EXPECT_EQ(launch.Arg<size_t>(3), 16u);
   EXPECT_EQ(launch.Arg<int>(4), 2);
-  EXPECT_EQ(launch.Arg<uint32_t*>(6), comm().ddaLLEpochDev);
-  EXPECT_EQ(launch.Arg<int>(7), comm().ddaLLEpochLen);
+  EXPECT_EQ(launch.Arg<uint32_t*>(6), comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochDev);
+  EXPECT_EQ(launch.Arg<int>(7), comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen);
   EXPECT_EQ(launch.Arg<size_t>(8), 1u);
-  EXPECT_EQ(launch.Arg<size_t>(9), dda::common::ddaBankSize(comm().ddaScratchBytes));
+  EXPECT_EQ(launch.Arg<size_t>(9), dda::common::ddaBankSize(comm().ddaFabricScratch.regions[ncclDdaScratchLL128].bytes));
   EXPECT_EQ(launch.Arg<dda::common::DdaKernelParams>(10).flag, comm().abortFlagDev);
 }
 
@@ -240,11 +240,11 @@ TEST_F(DdaAlltoallFabricLL128Microtest, Launch_BlocksPerColumnFollowSlicesPerWar
 
 TEST_F(DdaAlltoallFabricLL128Microtest, Launch_GridStaysWithinTheEpochCellsAndCuBudget) {
   const size_t big = 1000 * kWarpsPerBlock * kSliceFloats;
-  comm().ddaLLEpochLen = 13;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 13;
   EXPECT_EQ(RunOne(big).grid.y, 4u);
-  comm().ddaLLEpochLen = 3;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 3;
   EXPECT_EQ(RunOne(big).grid.y, 1u);
-  comm().ddaLLEpochLen = 256;
+  comm().ddaFabricScratch.regions[ncclDdaScratchLL128].epochLen = 256;
   comm().ddaFabricMaxBlocks = 30;
   EXPECT_EQ(RunOne(big).grid.y, 10u);
   comm().ddaFabricMaxBlocks = 2;
