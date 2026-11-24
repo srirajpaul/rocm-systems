@@ -120,11 +120,16 @@ static inline std::pair<dim3, dim3> ddaBroadcastFabricLL128Geom(ncclComm* comm, 
 } // namespace
 
 bool ncclBroadcastDdaFabricLL128Eligible(ncclComm* comm, size_t count, ncclDataType_t datatype) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchLL128);
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(count, (size_t)ncclTypeSize(datatype), 1, &checkedBytes)) return false;
+
   if (comm == nullptr || comm->bootstrap == nullptr)
     return false;
-  if (comm->ddaFabricMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr)
+  if (comm->ddaFabricMemHandler == nullptr || scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr)
     return false;
-  if (comm->ddaLLEpochDev == nullptr || comm->ddaLLEpochLen < 1)
+  if (scratch.epochDev == nullptr || scratch.epochLen < 1)
     return false;
   if (comm->nRanks < 2 || comm->nRanks > (int)kDdaMaxNranks)
     return false;
@@ -137,20 +142,21 @@ bool ncclBroadcastDdaFabricLL128Eligible(ncclComm* comm, size_t count, ncclDataT
   if (bytes % 16 != 0)
     return false;
 
-  const size_t bank = ddaBankSize(comm->ddaScratchBytes);
+  const size_t bank = ddaBankSize(scratch.bytes);
 
   if (bytes < kDdaLL128BcTwoShotMin) {
+    if (comm->ddaFabricScratch.tokenPeerPtrsDev == nullptr) return false;
     // One-shot path checks
     if (bytes > rcclDdaLL128Threshold(comm, ncclFuncBroadcast)) return false;
-    if (ddaLL128BcSlices(comm, bytes) >
-        ddaLL128BcSlotSlices(bank, comm->nRanks, ddaLL128BcArch(comm).sliceWords)) {
+    if (!ncclDdaScratchFits("Broadcast LL128 slices/bank", ddaLL128BcSlices(comm, bytes),
+                           ddaLL128BcSlotSlices(bank, ddaLL128BcArch(comm).sliceWords))) {
       return false;
     }
     // Both the root and the non-root grid must fit the epoch cells.
     const dim3 r = ddaLL128BcGrid(comm, /*isRoot=*/true, bytes);
     const dim3 n = ddaLL128BcGrid(comm, /*isRoot=*/false, bytes);
     const long most = (long)r.x * r.y > (long)n.x ? (long)r.x * r.y : (long)n.x;
-    return most <= (long)comm->ddaLLEpochLen;
+    return most <= (long)scratch.epochLen;
   } else {
     // Two-shot path checks
     if (!rcclDdaDatatypeSupported(comm, datatype))
@@ -159,7 +165,10 @@ bool ncclBroadcastDdaFabricLL128Eligible(ncclComm* comm, size_t count, ncclDataT
     // LL128 cap check handled by the selector before calling us.
     // Scratch capacity: the bank must hold (nRanks + 1) chunk-sized slots.
     const size_t slices = ddaLL128Slices(bytes);
-    if (ddaLL128BcTwoShotSlotSlices(bank, comm->nRanks, slices) == 0)
+    const size_t chunkSlices = ddaLL128BcTwoShotChunkSlices(slices, comm->nRanks);
+    const size_t slotSlices = bank / (size_t)dda::common::kDdaLL128WireBytesPerSlice /
+                              (size_t)(comm->nRanks + 1);
+    if (!ncclDdaScratchFits("Broadcast LL128 two-shot slices/slot/bank", chunkSlices, slotSlices))
       return false;
 
     return true;
@@ -179,6 +188,12 @@ uint32_t ncclBroadcastDdaFabricLL128Blocks(ncclComm* comm, size_t count, ncclDat
 
 ncclResult_t ncclBroadcastDdaFabricLL128(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                          int root, ncclComm* comm, cudaStream_t stream) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchLL128);
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(count, (size_t)ncclTypeSize(datatype), 1, &checkedBytes))
+    return ncclInvalidArgument;
+
   const size_t bytes = count * ncclTypeSize(datatype);
 
   if (bytes < kDdaLL128BcTwoShotMin) {
@@ -189,8 +204,8 @@ ncclResult_t ncclBroadcastDdaFabricLL128(const void* sendbuff, void* recvbuff, s
       reinterpret_cast<uintptr_t>(recvbuff) | (isRoot ? reinterpret_cast<uintptr_t>(sendbuff) : 0);
     const bool aligned = addrs % 16 == 0;
 
-    char* const* peers = reinterpret_cast<char* const*>(comm->ddaPeerPtrsDev);
-    const size_t bankSize = ddaBankSize(comm->ddaScratchBytes);
+    char* const* peers = reinterpret_cast<char* const*>(scratch.peerPtrsDev);
+    const size_t bankSize = ddaBankSize(scratch.bytes);
     const dda::common::DdaKernelParams params{comm->abortFlagDev};
 
     const DdaLL128BcArch arch = ddaLL128BcArch(comm);
@@ -203,12 +218,16 @@ ncclResult_t ncclBroadcastDdaFabricLL128(const void* sendbuff, void* recvbuff, s
       hipExtLaunchKernelGGL((dda::common::ddaBroadcastFabricLL128<true>), grid, dim3(threads), 0,
                             stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0, peers, static_cast<char*>(recvbuff),
                             static_cast<const char*>(sendbuff), bytes, comm->rank, comm->nRanks, root,
-                            comm->ddaLLEpochDev, comm->ddaLLEpochLen, bankSize, params);
+                            scratch.epochDev, scratch.epochLen, bankSize, params,
+                            reinterpret_cast<char* const*>(comm->ddaFabricScratch.tokenPeerPtrsDev),
+                            comm->ddaFabricScratch.tokenBankBytes);
     } else {
       hipExtLaunchKernelGGL((dda::common::ddaBroadcastFabricLL128<false>), grid, dim3(threads), 0,
                             stream, /*startEvent=*/nullptr, stopEvent, /*flags=*/0, peers, static_cast<char*>(recvbuff),
                             static_cast<const char*>(sendbuff), bytes, comm->rank, comm->nRanks, root,
-                            comm->ddaLLEpochDev, comm->ddaLLEpochLen, bankSize, params);
+                            scratch.epochDev, scratch.epochLen, bankSize, params,
+                            reinterpret_cast<char* const*>(comm->ddaFabricScratch.tokenPeerPtrsDev),
+                            comm->ddaFabricScratch.tokenBankBytes);
     }
   } else {
     // Two-shot path
@@ -217,13 +236,13 @@ ncclResult_t ncclBroadcastDdaFabricLL128(const void* sendbuff, void* recvbuff, s
 
     const size_t slices = ddaLL128Slices(bytes);
     const size_t cs = ddaLL128BcTwoShotChunkSlices(slices, comm->nRanks);
-    const size_t bank = ddaBankSize(comm->ddaScratchBytes);
+    const size_t bank = ddaBankSize(scratch.bytes);
 
     auto [grid, block] = ddaBroadcastFabricLL128Geom(comm, bytes);
 
-    int8_t** peers = reinterpret_cast<int8_t**>(comm->ddaPeerPtrsDev);
-    uint32_t* epochDev = comm->ddaLLEpochDev;
-    const int epochLen = comm->ddaLLEpochLen;
+    int8_t** peers = reinterpret_cast<int8_t**>(scratch.peerPtrsDev);
+    uint32_t* epochDev = scratch.epochDev;
+    const int epochLen = scratch.epochLen;
     const int nRanks = comm->nRanks;
 
     INFO(NCCL_COLL,

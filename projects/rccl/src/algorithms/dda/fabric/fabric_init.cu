@@ -20,17 +20,34 @@
 
 #include <cuda_runtime.h>
 
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <utility>
 #include <vector>
 
 using dda::common::kDdaMaxNranks;
 using nccl_dda_detail::ddaFabricMaxNBlocksForScratch;
-using nccl_dda_detail::ddaFabricScratchSizing;
 using nccl_dda_detail::ddaLLEpochCount;
 using nccl_dda_detail::DdaFabricBarrierState;
 using nccl_dda_detail::DdaFabricMaxBlocksOverride;
 
-RCCL_PARAM(DdaFabricBufferSizeForScratch, "DDA_FABRIC_BUFFER_SIZE", -1);
+RCCL_PARAM(CeScratchSize, "CE_SCRATCH_SIZE", 256LL * 1024 * 1024);
+RCCL_PARAM(DdaSimpleScratchSize, "DDA_SIMPLE_SCRATCH_SIZE", 256LL * 1024 * 1024);
+RCCL_PARAM(DdaLL128ScratchSize, "DDA_LL128_SCRATCH_SIZE", 64LL * 1024 * 1024);
+RCCL_PARAM(DdaLLScratchSize, "DDA_LL_SCRATCH_SIZE", 8LL * 1024 * 1024);
+
+static void freeFabricScratch(ncclComm* comm, ncclDdaFabricScratch& state) {
+  for (auto& region : state.regions) {
+    CUDACHECKIGNORE(cudaFree(region.epochDev));
+    CUDACHECKIGNORE(cudaFree(region.peerPtrsDev));
+    free(region.peerPtrsHost);
+  }
+  CUDACHECKIGNORE(cudaFree(state.tokenPeerPtrsDev));
+  if (state.allocation != nullptr) (void)ncclCuMemFree(state.allocation, comm->memManager);
+  state = {};
+}
+
 // RCCL_DDA_A2A_PUSH_PEER_EPOCH: 1 (default) uses epoch flags for the peer-major vector and TDM alltoall pushes, 0 the
 // one-token CAS flags (see FabricGpuBarrier::signalWaitPeer / postPeer / waitPeer). Must be the same on every rank.
 // With 0 the pushes run without drain blocks (RCCL_DDA_A2A_PUSH_PEER_DRAIN is ignored).
@@ -62,28 +79,44 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
     return ncclSuccess;
   }
 
-  const int nRanks = comm->nRanks;
-  const int64_t llEnabled = rcclParamDdaLL();
-  const int64_t ll128Enabled = rcclParamDdaLL128();
-  // Size scratch to the largest DDA/CE-scratch table cap (all collectives,
-  // including graph VMM), not AllReduce VMM alone. Otherwise AG CE-Scratch
-  // or AR LL128 can win the selector and then fail the ddaScratchBytes check.
-  // ddaVmmMaxGraph is in that max even if this comm never captures: scratch
-  // is allocated once and exported across the clique, so a later graph AR
-  // must still fit. On gfx1250 that is a silent 256 MiB tax vs eager VMM.
-  // RCCL_DDA_FABRIC_BUFFER_SIZE overrides.
-  const size_t llThresh = rcclDdaLLThreshold(comm, ncclFuncAllReduce);
-  const size_t ll128Thresh = rcclDdaLL128Threshold(comm, ncclFuncAllReduce);
-  const size_t simpleThresh = rcclDdaScratchPayloadCap(comm);
-  const int64_t fabricScratchOverride = rcclParamDdaFabricBufferSizeForScratch();
+  if (!rcclParamDdaEnable()) return ncclSuccess;
 
-  // Right-sized from the DDA thresholds and nRanks (env-overridable) instead of
-  // a fixed 10 GiB. RCCL_DDA_FABRIC_BUFFER_SIZE=0 disables the fabric DDA path.
-  size_t bytes = ddaFabricScratchSizing(nRanks, fabricScratchOverride, rcclParamDdaEnable(), simpleThresh, llEnabled,
-                                        ll128Enabled, ll128Thresh);
-  if (bytes == 0) {
-    return ncclSuccess;
+  const int nRanks = comm->nRanks;
+  const char* names[ncclDdaScratchCount] = {"RCCL_CE_SCRATCH_SIZE", "RCCL_DDA_SIMPLE_SCRATCH_SIZE",
+                                           "RCCL_DDA_LL128_SCRATCH_SIZE", "RCCL_DDA_LL_SCRATCH_SIZE"};
+  struct Config {
+    int64_t capacities[ncclDdaScratchCount];
+    int valid;
+  } local = {{rcclParamCeScratchSize(), rcclParamDdaSimpleScratchSize(),
+              rcclParamDdaLL128ScratchSize(), rcclParamDdaLLScratchSize()}, 1};
+  // RCCL parameters cache values. Also reject malformed/overflowing input, which
+  // the generic parameter reader would otherwise replace with its default.
+  for (int i = 0; i < ncclDdaScratchCount; ++i) {
+    const char* value = ncclGetEnv(names[i]);
+    if (value != nullptr) {
+      errno = 0;
+      char* end = nullptr;
+      const long long parsed = strtoll(value, &end, 0);
+      if (errno == ERANGE || end == value || *end != '\0' || parsed < 0) local.valid = 0;
+    }
   }
+  ncclDdaFabricScratch state{};
+  local.valid = local.valid && ncclDdaScratchLayout(local.capacities, kDdaMaxNranks, &state);
+  std::vector<Config> configs(nRanks);
+  configs[comm->rank] = local;
+  NCCLCHECK(bootstrapAllGather(comm->bootstrap, configs.data(), sizeof(Config)));
+  for (int r = 0; r < nRanks; ++r) {
+    if (!configs[r].valid || memcmp(configs[r].capacities, local.capacities, sizeof(local.capacities)) != 0) {
+      WARN("Invalid or mismatched fixed DDA scratch capacities at rank %d", r);
+      return ncclInvalidArgument;
+    }
+  }
+  if (ncclGetEnv("RCCL_DDA_FABRIC_BUFFER_SIZE") != nullptr) {
+    WARN("RCCL_DDA_FABRIC_BUFFER_SIZE is deprecated and ignored; use RCCL_CE_SCRATCH_SIZE, "
+         "RCCL_DDA_SIMPLE_SCRATCH_SIZE, RCCL_DDA_LL128_SCRATCH_SIZE and RCCL_DDA_LL_SCRATCH_SIZE (bytes)");
+  }
+  const size_t bytes = state.allocationBytes;
+  if (bytes == 0) return ncclSuccess;
 
   // Scratch (temp) buffer via VMM: the fabric path requires a fabric-capable
   // (cuMem) allocation so the handle can be exported across the clique. If VMM
@@ -125,71 +158,47 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
     }
   }
 
-  const size_t eagerVmmAr = rcclDdaVmmThreshold(comm, ncclFuncAllReduce);
-  INFO(NCCL_INIT,
-       "ncclDdaFabricCommInit: allocating %zu-byte scratch; payload cap %lld includes graph VMM "
-       "(ddaVmmMaxGraph) even for eager-only comms; AR eager VMM=%zu. "
-       "Override with RCCL_DDA_FABRIC_BUFFER_SIZE.",
-       bytes, (long long)simpleThresh, eagerVmmAr);
+  for (int i = 0; i < ncclDdaScratchCount; ++i)
+    INFO(NCCL_INIT, "DDA fixed scratch: %s=%zu offset=%zu dataBytes=%zu", names[i], state.capacities[i],
+         state.offsets[i], state.regions[i].bytes);
 
-  // Owned resources: handed to comm on success, freed at `fail` otherwise.
-  // All declared before any goto so the cleanup label is reachable without
-  // jumping over an initialization.
-  void* scratch = nullptr;
   CUmemGenericAllocationHandle scratchHandle{};
   ncclFabricMemHandler* handler = nullptr;
-  void* peerDev = nullptr;
-  void** peerHost = nullptr;
   DdaFabricBarrierState* barrierState = nullptr;
-  uint32_t* epochDev = nullptr;
-  std::vector<void*> h_ptrs(nRanks, nullptr);
   const size_t epochLen = ddaLLEpochCount(nRanks, nBlocksMax);
+  std::vector<void*> h_ptrs(nRanks, nullptr);
+  std::vector<int> allReady(nRanks, 0);
   ncclResult_t res = ncclSuccess;
+  auto vote = [&](bool ready) -> ncclResult_t {
+    allReady[comm->rank] = ready ? 1 : 0;
+    NCCLCHECK(bootstrapAllGather(comm->bootstrap, allReady.data(), sizeof(int)));
+    for (int r = 0; r < nRanks; ++r)
+      if (!allReady[r]) return ncclSystemError;
+    return ncclSuccess;
+  };
+  auto cudaOk = [](cudaError_t err, const char* what) {
+    if (CUDACLEARERROR(err) != cudaSuccess) {
+      WARN("ncclDdaFabricCommInit: %s failed: %s", what, cudaGetErrorString(err));
+      return false;
+    }
+    return true;
+  };
 
-  res = ncclCuMemAlloc(&scratch, &scratchHandle, ncclCuMemHandleType, bytes, comm->memManager);
-  if (res != ncclSuccess || scratch == nullptr) {
-    INFO(NCCL_INIT, "ncclDdaFabricCommInit: VMM scratch alloc failed; skipping fabric DDA path");
-    scratch = nullptr;
-    goto fail;
-  }
-
+  res = ncclCuMemAlloc(&state.allocation, &scratchHandle, ncclCuMemHandleType, bytes, comm->memManager);
   handler = new (std::nothrow) ncclFabricMemHandler(comm->bootstrap, comm->rank, nRanks, comm->memManager);
-  if (handler == nullptr) {
-    WARN("ncclDdaFabricCommInit: OOM allocating ncclFabricMemHandler");
-    goto fail;
-  }
-
-  NCCLCHECKGOTO(handler->addSelfDeviceMem(scratch, scratchHandle, bytes), res, fail);
+  // All ranks must enter handle exchange together, including allocation failures.
+  if (vote(res == ncclSuccess && state.allocation != nullptr && handler != nullptr) != ncclSuccess) goto fail;
+  NCCLCHECKGOTO(handler->addSelfDeviceMem(state.allocation, scratchHandle, bytes), res, fail);
   NCCLCHECKGOTO(handler->exchangeMemPtrs(), res, fail);
 
-  CUDACHECKGOTO(cudaMalloc(&peerDev, nRanks * sizeof(void*)), res, fail);
-
-  for (int i = 0; i < nRanks; ++i) {
-    NCCLCHECKGOTO(handler->getPeerDeviceMemPtr(i, &h_ptrs[i]), res, fail);
-  }
-
-  CUDACHECKGOTO(cudaMemcpy(peerDev, h_ptrs.data(), nRanks * sizeof(void*), cudaMemcpyHostToDevice), res, fail);
-  NCCLCHECKGOTO(ncclCalloc(&peerHost, nRanks), res, fail);
-  CUDACHECKGOTO(cudaMemcpy(peerHost, h_ptrs.data(), nRanks * sizeof(void*), cudaMemcpyHostToHost), res, fail);
-
   {
-    auto cudaOk = [](cudaError_t err, const char* what) {
-      if (CUDACLEARERROR(err) != cudaSuccess) {
-        WARN("ncclDdaFabricCommInit: %s failed: %s", what, cudaGetErrorString(err));
-        return false;
-      }
-      return true;
-    };
-    // Past the barrier's pointer exchange, failures set !ready so every rank still reaches the allgather.
     bool ready = true;
-    auto barrierPair =
-      dda::common::FabricGpuBarrier::mallocAndInit(nRanks, nBlocksMax, comm->rank, comm->bootstrap, comm->memManager,
-                                                   dda::common::DdaKernelParams{comm->abortFlagDev});
+    auto barrierPair = dda::common::FabricGpuBarrier::mallocAndInit(
+      nRanks, nBlocksMax, comm->rank, comm->bootstrap, comm->memManager,
+      dda::common::DdaKernelParams{comm->abortFlagDev});
     if (!barrierPair.first) {
-      WARN("ncclDdaFabricCommInit: FabricGpuBarrier malloc/init failed");
       ready = false;
     } else if ((barrierState = new (std::nothrow) DdaFabricBarrierState()) == nullptr) {
-      WARN("ncclDdaFabricCommInit: OOM allocating DdaFabricBarrierState");
       ready = false;
     } else {
       barrierState->resources = std::move(barrierPair.first);
@@ -197,72 +206,60 @@ ncclResult_t ncclDdaFabricCommInit(ncclComm* comm) {
       barrierState->barrierHost.setEpochFlags(rcclParamDdaA2APushPeerEpoch() != 0);
     }
 
-    // Own stream: syncing the null stream would also consume async errors from the app's blocking streams.
     cudaStream_t zeroStream = nullptr;
-    ready = ready && cudaOk(cudaStreamCreateWithFlags(&zeroStream, cudaStreamNonBlocking), "zero-fill stream create");
-    // Zeroed once; later LL calls rely on monotonic epochs (>= 1) and two banks, not re-zeroing.
-    ready = ready && cudaOk(cudaMemsetAsync(scratch, 0, bytes, zeroStream), "scratch memset");
-    // Zeroed epoch cells make the first device-derived LL flag 1.
-    ready = ready && cudaOk(cudaMalloc(&epochDev, epochLen * sizeof(uint32_t)), "epoch alloc") &&
-            cudaOk(cudaMemsetAsync(epochDev, 0, epochLen * sizeof(uint32_t), zeroStream), "epoch memset");
-    // Fills must land before any rank's first LL kernel (and before `fail` frees scratch); the allgather orders ranks.
+    ready = ready && cudaOk(cudaStreamCreateWithFlags(&zeroStream, cudaStreamNonBlocking), "zero stream create");
+    ready = ready && cudaOk(cudaMemsetAsync(state.allocation, 0, bytes, zeroStream), "scratch memset");
+    for (int i = 0; ready && i < ncclDdaScratchCount; ++i) {
+      auto& region = state.regions[i];
+      if (region.bytes == 0) continue;
+      const size_t tokenBytes = i == ncclDdaScratchLL128 ? 2 * state.tokenBankBytes : 0;
+      const size_t offset = state.offsets[i] + tokenBytes;
+      region.scratch = static_cast<char*>(state.allocation) + offset;
+      for (int r = 0; r < nRanks; ++r) {
+        void* base = nullptr;
+        ready = ready && handler->getPeerDeviceMemPtr(r, &base) == ncclSuccess;
+        h_ptrs[r] = base != nullptr ? static_cast<char*>(base) + offset : nullptr;
+      }
+      ready = ready && ncclCalloc(&region.peerPtrsHost, nRanks) == ncclSuccess;
+      ready = ready && cudaOk(cudaMemcpy(region.peerPtrsHost, h_ptrs.data(), nRanks * sizeof(void*),
+                                         cudaMemcpyHostToHost), "host peer table copy");
+      ready = ready && cudaOk(cudaMalloc(&region.peerPtrsDev, nRanks * sizeof(void*)), "peer table alloc");
+      ready = ready && cudaOk(cudaMemcpy(region.peerPtrsDev, h_ptrs.data(), nRanks * sizeof(void*),
+                                         cudaMemcpyHostToDevice), "peer table copy");
+      if (i == ncclDdaScratchLL || i == ncclDdaScratchLL128) {
+        region.epochLen = (int)epochLen;
+        ready = ready && cudaOk(cudaMalloc(&region.epochDev, epochLen * sizeof(uint32_t)), "epoch alloc");
+        ready = ready && cudaOk(cudaMemsetAsync(region.epochDev, 0, epochLen * sizeof(uint32_t), zeroStream),
+                                 "epoch memset");
+      }
+      if (ready && i == ncclDdaScratchLL128) {
+        for (auto& ptr : h_ptrs) ptr = static_cast<char*>(ptr) - tokenBytes;
+        ready = ready && cudaOk(cudaMalloc(&state.tokenPeerPtrsDev, nRanks * sizeof(void*)), "token table alloc");
+        ready = ready && cudaOk(cudaMemcpy(state.tokenPeerPtrsDev, h_ptrs.data(), nRanks * sizeof(void*),
+                                           cudaMemcpyHostToDevice), "token table copy");
+      }
+    }
     if (zeroStream != nullptr) {
       ready = cudaOk(cudaStreamSynchronize(zeroStream), "zero-fill sync") && ready;
       CUDACHECKIGNORE(cudaStreamDestroy(zeroStream));
     }
-
-    std::vector<int> allReady(nRanks, 0);
-    allReady[comm->rank] = ready ? 1 : 0;
-    NCCLCHECKGOTO(bootstrapAllGather(comm->bootstrap, allReady.data(), sizeof(int)), res, fail);
-    for (int r = 0; r < nRanks; ++r) {
-      if (!allReady[r]) {
-        INFO(NCCL_INIT, "ncclDdaFabricCommInit: rank %d failed to set up its LL buffers; skipping fabric DDA path", r);
-        goto fail;
-      }
-    }
+    // Initialization must finish on every rank before any remote flag reader runs.
+    if (vote(ready) != ncclSuccess) goto fail;
   }
 
-  // Success: hand ownership of every resource to comm.
+  comm->ddaFabricScratch = state;
   comm->ddaFabricMemHandler = handler;
-  comm->ddaScratch = scratch;
-  comm->ddaScratchBytes = bytes;
-  comm->ddaScratchIsVmm = true;
-  comm->ddaPeerPtrsDev = peerDev;
-  comm->ddaPeerPtrsHost = peerHost;
   comm->ddaFabricBarrierState = barrierState;
   comm->ddaFabricMaxBlocks = nBlocksMax;
-  comm->ddaLLEpochDev = epochDev;
-  comm->ddaLLEpochLen = (int)epochLen;
-  INFO(NCCL_INIT,
-       "ncclDdaFabricCommInit: nRanks %d, scratch %zu bytes (vmm, gfx1250 fabric path; derived from RCCL DDA params; "
-       "RCCL_DDA_FABRIC_BUFFER_SIZE=%lld), LL enabled=%lld threshold=%lld, "
-       "LL128 enabled=%lld threshold=%lld, Simple threshold=%lld, FabricGpuBarrier nBlocks=%d, peer table on device",
-       nRanks, bytes, (long long)fabricScratchOverride, (long long)llEnabled, (long long)llThresh,
-       (long long)ll128Enabled, (long long)ll128Thresh, (long long)simpleThresh, nBlocksMax);
-  INFO(NCCL_INIT,
-       "ncclDdaFabricCommInit: CU count=%d, local max blocks=%d, communicator max blocks=%d",
-       comm->cuCount, localBlocksMax, nBlocksMax);
+  INFO(NCCL_INIT, "DDA fabric: fixed allocation=%zu bytes, LL128 token bank=%zu bytes, max blocks=%d, epochs=%zu",
+       bytes, state.tokenBankBytes, nBlocksMax, epochLen);
   return ncclSuccess;
 
 fail:
-  if (barrierState != nullptr) {
-    delete barrierState;
-  }
-  if (epochDev != nullptr) {
-    CUDACHECKIGNORE(cudaFree(epochDev));
-  }
-  if (peerHost != nullptr) {
-    free(peerHost);
-  }
-  if (peerDev != nullptr) {
-    CUDACHECKIGNORE(cudaFree(peerDev));
-  }
-  if (handler != nullptr) {
-    delete handler;
-  }
-  if (scratch != nullptr) {
-    (void)ncclCuMemFree(scratch, comm->memManager);
-  }
+  INFO(NCCL_INIT, "ncclDdaFabricCommInit: resource initialization failed; skipping fabric DDA path");
+  delete barrierState;
+  delete handler;
+  freeFabricScratch(comm, state);
   return ncclSuccess;
 }
 
@@ -274,28 +271,9 @@ ncclResult_t ncclDdaFabricCommFini(ncclComm* comm) {
     delete static_cast<DdaFabricBarrierState*>(comm->ddaFabricBarrierState);
     comm->ddaFabricBarrierState = nullptr;
   }
-  CUDACHECKIGNORE(cudaFree(comm->ddaPeerPtrsDev));
-  comm->ddaPeerPtrsDev = nullptr;
-  CUDACHECKIGNORE(cudaFree(comm->ddaLLEpochDev));
-  comm->ddaLLEpochDev = nullptr;
-  comm->ddaLLEpochLen = 0;
-  free(comm->ddaPeerPtrsHost);
-  comm->ddaPeerPtrsHost = nullptr;
-  // Destroying the fabric handler unmaps/frees the imported peer scratch buffers.
-  if (comm->ddaFabricMemHandler != nullptr) {
-    delete static_cast<ncclFabricMemHandler*>(comm->ddaFabricMemHandler);
-    comm->ddaFabricMemHandler = nullptr;
-  }
-  // Free this rank's scratch buffer with the allocator that produced it.
-  if (comm->ddaScratch != nullptr) {
-    if (comm->ddaScratchIsVmm) {
-      (void)ncclCuMemFree(comm->ddaScratch, comm->memManager);
-    } else {
-      CUDACHECKIGNORE(cudaFree(comm->ddaScratch));
-    }
-  }
-  comm->ddaScratch = nullptr;
-  comm->ddaScratchBytes = 0;
-  comm->ddaScratchIsVmm = false;
+  // Imported mappings are released before freeing the sole owning allocation.
+  delete comm->ddaFabricMemHandler;
+  comm->ddaFabricMemHandler = nullptr;
+  freeFabricScratch(comm, comm->ddaFabricScratch);
   return ncclSuccess;
 }

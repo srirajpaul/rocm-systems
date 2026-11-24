@@ -5120,7 +5120,10 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
       // CE ReduceScatter always stages through ceARTmpBuf, so it does not use this path.
       bool ceArSymRegistered =
         (info->coll == ncclFuncAllReduce && rcclForceCeAllReduceEnabled(comm) && ceAvailable && !hasSysmemSegment);
-      size_t recvBytes = (size_t)comm->nRanks * info->count * ncclTypeSize(info->datatype);
+      const auto ceScratchView = ncclDdaGetScratch(comm, ncclDdaScratchCE);
+      size_t recvBytes = 0;
+      const bool recvBytesValid = ncclDdaByteCount(info->count, (size_t)ncclTypeSize(info->datatype),
+                                                 (size_t)comm->nRanks, &recvBytes);
       // Sym-window CE AllGather (-R 2) above the symk/CE crossover. Mirrors
       // rcclSelectAllGather Branch #3 (ZERO || window) so ncclAllGatherConfig
       // and the selector agree. The selector's !symEligible guard prevents CE
@@ -5163,7 +5166,7 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
         } else {
           INFO(NCCL_TUNING, "Taking CE collective path for %s via DDA scratch, count=%zu", collName, info->count);
           NCCLCHECK(ceCollTaskAppend(comm, info, /*sendWin=*/nullptr, /*recvWin=*/nullptr,
-                                     comm->ddaScratch, comm->ddaPeerPtrsHost, opDev));
+                                     ceScratchView.scratch, ceScratchView.peerPtrsHost, opDev));
         }
       } else if ((!allGatherDecided && !alltoAllDecided &&
                   (comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO) &&
@@ -5176,11 +5179,12 @@ static ncclResult_t taskAppend(struct ncclComm* comm, struct ncclInfo* info) {
 
       } else if (!rcclNcclAlgoEnvIsSet() && !allGatherDecided && !alltoAllDecided &&
                  rcclForceCeScratchEnabled(comm) && CeScratchAvailable && !hasSysmemSegment &&
-                 comm->ddaScratch != nullptr && recvBytes <= comm->ddaScratchBytes && info->coll != ncclFuncAllReduce &&
-                 info->coll != ncclFuncReduceScatter) {
+                 ceScratchView.scratch != nullptr && recvBytesValid && info->coll != ncclFuncAllReduce &&
+                 info->coll != ncclFuncReduceScatter &&
+                 ncclDdaScratchFits("CE receive bytes", recvBytes, ceScratchView.bytes)) {
         INFO(NCCL_TUNING, "Using DDA scratch for CE collective, count=%zu, recvBytes=%zu", info->count, recvBytes);
-        NCCLCHECK(ceCollTaskAppend(comm, info, /*sendWin=*/nullptr, /*recvWin=*/nullptr, comm->ddaScratch,
-                                   comm->ddaPeerPtrsHost, opDev));
+        NCCLCHECK(ceCollTaskAppend(comm, info, /*sendWin=*/nullptr, /*recvWin=*/nullptr, ceScratchView.scratch,
+                                   ceScratchView.peerPtrsHost, opDev));
       } else if ((ceAllReduceFits || ceReduceScatterFits) && !hasSysmemSegment) {
         INFO(NCCL_COLL, "CE %s path without symmetric memory registration, count=%zu",
              info->coll == ncclFuncReduceScatter ? "ReduceScatter" : "AllReduce", info->count);

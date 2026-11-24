@@ -209,6 +209,7 @@ set(SRC_FILES
   include/coll_net.h
   include/collectives.h
   include/comm.h
+  include/dda_scratch.h
   include/compiler.h
   include/compiler/gcc.h
   include/compiler/msvc.h

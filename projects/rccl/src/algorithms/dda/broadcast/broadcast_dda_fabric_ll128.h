@@ -5,7 +5,7 @@
  * tier (root push, all-to-all start tokens), with the payload in register-packed
  * LL128 slices. Line length follows the arch (kDdaLL128ArchLineElems).
  *
- * Bank layout (8B words): [nRanks LL token lines, padded to whole slices][data slices].
+ * Payload banks contain LL128 slices; LL-format start tokens have a separate reserved view.
  *
  * See LICENSE.txt for license information.
  ************************************************************************/
@@ -26,16 +26,9 @@
 
 namespace dda::common {
 
-// Token region in 8B words: one 16B LL line per rank, padded to whole slices.
-constexpr size_t ddaLL128BcTokenWords(int nRanks, size_t sliceWords) {
-  return (2 * (size_t)nRanks + sliceWords - 1) / sliceWords * sliceWords;
-}
-
-// Data slices one bank holds after the token region.
-constexpr size_t ddaLL128BcSlotSlices(size_t bankSize, int nRanks, size_t sliceWords) {
-  const size_t words = bankSize / sizeof(uint64_t);
-  const size_t tok = ddaLL128BcTokenWords(nRanks, sliceWords);
-  return words > tok ? (words - tok) / sliceWords : 0;
+// Payload banks exclude the permanently reserved Broadcast token prefix.
+constexpr size_t ddaLL128BcSlotSlices(size_t bankSize, size_t sliceWords) {
+  return bankSize / sizeof(uint64_t) / sliceWords;
 }
 
 // A block's warps take consecutive slices (a "group"). Root grid: (nRanks-1)
@@ -47,7 +40,8 @@ __launch_bounds__(512)
                                           size_t bytes, // multiple of 16
                                           int selfRank, int nRanks, int root,
                                           uint32_t* __restrict__ epochDev, int epochLen, size_t bankSize,
-                                          DdaKernelParams params) {
+                                          DdaKernelParams params, char* const* __restrict__ peerTokens,
+                                          size_t tokenBankSize) {
   constexpr int kLine = kDdaLL128ArchLineElems;
   constexpr int kWarp = kDdaLL128ArchWarp;
   constexpr int kSliceBytes = kDdaLL128DataBytesPerSliceL<kLine, kWarp>;
@@ -65,12 +59,13 @@ __launch_bounds__(512)
   const uint32_t flag32 = ddaGetLLEpochInc(epochDev, flatBlockId, 1);
   const uint64_t flag = ((uint64_t)flag32 << 32) | (uint64_t)flag32;
   const size_t bankWords = (size_t)(flag32 & 1u) * (bankSize / sizeof(uint64_t));
-  const size_t dataWords = bankWords + ddaLL128BcTokenWords(nRanks, kSliceWords);
+  const size_t dataWords = bankWords;
+  const size_t tokenOffset = (size_t)(flag32 & 1u) * tokenBankSize;
   const size_t slices = ddaLL128SlicesL<kLine, kWarp>(bytes);
   const size_t nGroups = (slices + nwarps - 1) / nwarps;
 
   uint64_t* selfBase = reinterpret_cast<uint64_t*>(peerScratch[selfRank]);
-  const LLPacket16* selfTok = reinterpret_cast<const LLPacket16*>(selfBase + bankWords);
+  const LLPacket16* selfTok = reinterpret_cast<const LLPacket16*>(peerTokens[selfRank] + tokenOffset);
   const int8_t* src = reinterpret_cast<const int8_t*>(sendbuff);
   int8_t* dst = reinterpret_cast<int8_t*>(recvbuff);
 
@@ -106,7 +101,7 @@ __launch_bounds__(512)
     if (flatBlockId == 0) {
       for (int p = tid; p < nRanks; p += nthreads) {
         if (p == selfRank) continue;
-        LLPacket16* tok = reinterpret_cast<LLPacket16*>(reinterpret_cast<uint64_t*>(peerScratch[p]) + bankWords) +
+        LLPacket16* tok = reinterpret_cast<LLPacket16*>(peerTokens[p] + tokenOffset) +
           selfRank;
         ddaLLStoreLineB128(reinterpret_cast<uint32_t*>(tok), 0u, flag32, 0u, flag32);
       }

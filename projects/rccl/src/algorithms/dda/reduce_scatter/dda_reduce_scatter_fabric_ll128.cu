@@ -107,8 +107,8 @@ static inline DdaLL128RsGeom ddaReduceScatterFabricLL128Geom(ncclComm* comm, siz
     blocks = 1;
   }
   // flatBlockId (blockIdx.x) must stay within the device epoch array.
-  if ((int)blocks > comm->ddaLLEpochLen) {
-    blocks = (unsigned)comm->ddaLLEpochLen;
+  if ((int)blocks > ncclDdaGetScratch(comm, ncclDdaScratchLL128).epochLen) {
+    blocks = (unsigned)ncclDdaGetScratch(comm, ncclDdaScratchLL128).epochLen;
     if (blocks == 0) {
       blocks = 1;
     }
@@ -119,19 +119,20 @@ static inline DdaLL128RsGeom ddaReduceScatterFabricLL128Geom(ncclComm* comm, siz
 template <typename T>
 static ncclResult_t ncclReduceScatterDdaFabricLL128Typed(const void* sendbuff, void* recvbuff, size_t recvcount,
                                                          ncclComm* comm, cudaStream_t stream) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchLL128);
   const int nRanks = comm->nRanks;
   const size_t shardBytes = recvcount * sizeof(T);
   const size_t slices = ddaLL128Slices(shardBytes);
-  const size_t bankSize = ddaBankSize(comm->ddaScratchBytes);
+  const size_t bankSize = ddaBankSize(scratch.bytes);
 
   const DdaLL128RsGeom geom = ddaReduceScatterFabricLL128Geom(comm, shardBytes);
 
-  T** peers = reinterpret_cast<T**>(comm->ddaPeerPtrsDev);
+  T** peers = reinterpret_cast<T**>(scratch.peerPtrsDev);
   // Same epoch counter every other LL/LL128 tier uses: they share a scratch
   // layout, so one monotonic flag is what keeps either from accepting a line
   // the other left.
-  uint32_t* epochDev = comm->ddaLLEpochDev;
-  const int epochLen = comm->ddaLLEpochLen;
+  uint32_t* epochDev = scratch.epochDev;
+  const int epochLen = scratch.epochLen;
 
   INFO(NCCL_COLL,
        "DDA fabric ReduceScatter LL128: nRanks=%d shardBytes=%zu slices=%zu grid=%u block=%u "
@@ -169,13 +170,18 @@ static ncclResult_t ncclReduceScatterDdaFabricLL128Typed(const void* sendbuff, v
 
 bool ncclReduceScatterDdaFabricLL128Eligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t recvcount,
                                              ncclDataType_t datatype, ncclRedOp_t op) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchLL128);
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(recvcount, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes)) return false;
+
   if (comm == nullptr || comm->bootstrap == nullptr) {
     return false;
   }
-  if (comm->ddaFabricMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr) {
+  if (comm->ddaFabricMemHandler == nullptr || scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr) {
     return false;
   }
-  if (comm->ddaLLEpochDev == nullptr || comm->ddaLLEpochLen < 1) {
+  if (scratch.epochDev == nullptr || scratch.epochLen < 1) {
     return false;
   }
   if (comm->nRanks < 2 || comm->nRanks > dda::common::kDdaMaxNranks) {
@@ -210,8 +216,8 @@ bool ncclReduceScatterDdaFabricLL128Eligible(ncclComm* comm, const void* sendbuf
   }
 
   // The shard has to fit the slices one rank's slot holds.
-  const size_t slotWords = ddaLL128RsSlotWords(ddaBankSize(comm->ddaScratchBytes), comm->nRanks);
-  if (ddaLL128Slices(shardBytes) * (size_t)kDdaLL128WireWordsPerSlice > slotWords) {
+  const size_t slotWords = ddaLL128RsSlotWords(ddaBankSize(scratch.bytes), comm->nRanks);
+  if (!ncclDdaScratchFits("reduce_scatter LL128 wire words/slot/bank", ddaLL128Slices(shardBytes) * (size_t)kDdaLL128WireWordsPerSlice, slotWords)) {
     return false;
   }
 
@@ -226,6 +232,11 @@ uint32_t ncclReduceScatterDdaFabricLL128Blocks(ncclComm* comm, size_t recvcount,
 ncclResult_t ncclReduceScatterDdaFabricLL128(const void* sendbuff, void* recvbuff, size_t recvcount,
                                              ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm,
                                              cudaStream_t stream) {
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(recvcount, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes))
+    return ncclInvalidArgument;
+
   (void)op;
   switch (datatype) {
   case ncclFloat32:

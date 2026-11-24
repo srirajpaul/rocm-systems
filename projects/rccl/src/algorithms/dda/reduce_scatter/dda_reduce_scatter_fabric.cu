@@ -28,16 +28,17 @@ using nccl_dda_detail::DdaFabricBarrierState;
 template <typename T>
 static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* recvbuff, size_t recvcount,
                                                     ncclComm* comm, cudaStream_t stream) {
-  if (comm->ddaFabricMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr ||
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchSimple);
+  if (comm->ddaFabricMemHandler == nullptr || scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr ||
       comm->ddaFabricBarrierState == nullptr) {
     return ncclInvalidUsage;
   }
 
   const int nRanks = comm->nRanks;
   const size_t totalCount = recvcount * nRanks;
-  if (totalCount * sizeof(T) > comm->ddaScratchBytes) {
+  if (!ncclDdaScratchFits("reduce_scatter Simple bytes", totalCount * sizeof(T), scratch.bytes)) {
     WARN("DDA fabric reduce-scatter: total element count %zu needs %zu bytes; comm scratch is %zu bytes", totalCount,
-         totalCount * sizeof(T), comm->ddaScratchBytes);
+         totalCount * sizeof(T), scratch.bytes);
     return ncclInvalidArgument;
   }
 
@@ -52,10 +53,10 @@ static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* 
   auto* barrierState = static_cast<DdaFabricBarrierState*>(comm->ddaFabricBarrierState);
   dda::common::FabricGpuBarrier barrierHost = barrierState->barrierHost;
 
-  void* peerPtrsDev = comm->ddaPeerPtrsDev;
+  void* peerPtrsDev = scratch.peerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
 
-  CUDACHECK(cudaMemcpyAsync(comm->ddaScratch, sendbuff, totalCount * sizeof(T), cudaMemcpyDeviceToDevice, stream));
+  CUDACHECK(cudaMemcpyAsync(scratch.scratch, sendbuff, totalCount * sizeof(T), cudaMemcpyDeviceToDevice, stream));
 
   INFO(NCCL_COLL, "DDA fabric ReduceScatter: launching kernel: nRanks=%d recvcount=%zu grid=%u block=%u%s", nRanks,
        recvcount, grid.x, block.x, (nRanks == 4 || nRanks == 8) ? " (unrolled)" : " (runtime)");
@@ -88,6 +89,11 @@ static ncclResult_t ncclReduceScatterDdaFabricTyped(const void* sendbuff, void* 
 
 bool ncclReduceScatterDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t recvcount,
                                         ncclDataType_t datatype, ncclRedOp_t op) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchSimple);
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(recvcount, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes)) return false;
+
   (void)sendbuff;
   (void)recvbuff;
   if (comm == nullptr || comm->bootstrap == nullptr) {
@@ -98,7 +104,7 @@ bool ncclReduceScatterDdaFabricEligible(ncclComm* comm, const void* sendbuff, vo
   if (comm->ddaFabricMemHandler == nullptr || comm->ddaFabricBarrierState == nullptr) {
     return false;
   }
-  if (comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr) {
+  if (scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr) {
     return false;
   }
   if (recvcount == 0) {
@@ -116,9 +122,6 @@ bool ncclReduceScatterDdaFabricEligible(ncclComm* comm, const void* sendbuff, vo
 
   size_t totalCount = recvcount * comm->nRanks;
   size_t need = totalCount * ncclTypeSize(datatype);
-  if (need > comm->ddaScratchBytes) {
-    return false;
-  }
 
   // Check 16-byte alignment for total data
   if ((totalCount * ncclTypeSize(datatype)) % 16) {
@@ -130,11 +133,16 @@ bool ncclReduceScatterDdaFabricEligible(ncclComm* comm, const void* sendbuff, vo
     return false;
   }
 
-  return true;
+  return ncclDdaScratchFits("reduce_scatter Simple bytes", need, scratch.bytes);
 }
 
 ncclResult_t ncclReduceScatterDdaFabric(const void* sendbuff, void* recvbuff, size_t recvcount, ncclDataType_t datatype,
                                         ncclRedOp_t op, ncclComm* comm, cudaStream_t stream) {
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(recvcount, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes))
+    return ncclInvalidArgument;
+
   (void)op;
   switch (datatype) {
   case ncclFloat32:

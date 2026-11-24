@@ -48,8 +48,8 @@ static inline DdaLLRsGeom ddaReduceScatterFabricLLGeom(const ncclComm* comm, siz
     blocks = 1;
   }
   // flatBlockId (blockIdx.x) must stay within the device epoch array.
-  if ((int)blocks > comm->ddaLLEpochLen) {
-    blocks = (unsigned)comm->ddaLLEpochLen;
+  if ((int)blocks > ncclDdaGetScratch(comm, ncclDdaScratchLL).epochLen) {
+    blocks = (unsigned)ncclDdaGetScratch(comm, ncclDdaScratchLL).epochLen;
     if (blocks == 0) blocks = 1;
   }
   // Spread slices round up to whole lines, which can leave the last blocks without packets, so those are not launched.
@@ -63,6 +63,7 @@ static inline DdaLLRsGeom ddaReduceScatterFabricLLGeom(const ncclComm* comm, siz
 template <typename T>
 static ncclResult_t ncclReduceScatterDdaFabricLLTyped(const void* sendbuff, void* recvbuff, size_t recvcount,
                                                       ncclComm* comm, cudaStream_t stream) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchLL);
   const int nRanks = comm->nRanks;
   const size_t bytes = recvcount * sizeof(T); // per-rank shard bytes
   const size_t nPk = bytes >> 3;              // 8 payload bytes per packet
@@ -71,11 +72,11 @@ static ncclResult_t ncclReduceScatterDdaFabricLLTyped(const void* sendbuff, void
   const dim3 grid = geom.grid;
   const dim3 block = geom.block;
 
-  T** peers = reinterpret_cast<T**>(comm->ddaPeerPtrsDev);
-  uint32_t* epochDev = comm->ddaLLEpochDev;
-  const int epochLen = comm->ddaLLEpochLen;
+  T** peers = reinterpret_cast<T**>(scratch.peerPtrsDev);
+  uint32_t* epochDev = scratch.epochDev;
+  const int epochLen = scratch.epochLen;
   // Bank 1 starts at ddaBankSize, matching the other LL tiers on this scratch.
-  const size_t bankSize = dda::common::ddaBankSize(comm->ddaScratchBytes);
+  const size_t bankSize = dda::common::ddaBankSize(scratch.bytes);
 
   INFO(NCCL_COLL, "DDA fabric ReduceScatter LL: nRanks=%d shardBytes=%zu nPk=%zu grid=%u block=%u bankSize=%zu%s",
        nRanks, bytes, nPk, grid.x, block.x, bankSize, geom.spread ? " (spread)" : "");
@@ -118,12 +119,17 @@ static ncclResult_t ncclReduceScatterDdaFabricLLTyped(const void* sendbuff, void
 
 bool ncclReduceScatterDdaFabricLLEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t recvcount,
                                           ncclDataType_t datatype, ncclRedOp_t op) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchLL);
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(recvcount, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes)) return false;
+
   (void)sendbuff;
   (void)recvbuff;
   if (comm == nullptr || comm->bootstrap == nullptr) {
     return false;
   }
-  if (comm->ddaFabricMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr) {
+  if (comm->ddaFabricMemHandler == nullptr || scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr) {
     return false;
   }
   if (comm->nRanks < 2 || comm->nRanks > dda::common::kDdaMaxNranks) {
@@ -150,8 +156,8 @@ bool ncclReduceScatterDdaFabricLLEligible(ncclComm* comm, const void* sendbuff, 
   }
   // Bank 0 is [0, bankBytes). Bank 1 is [bankSize, bankSize + bankBytes).
   const size_t bankBytes = dda::common::ddaLLRsBankBytes(comm->nRanks);
-  const size_t bankSize = dda::common::ddaBankSize(comm->ddaScratchBytes);
-  if (bankBytes > bankSize || bankSize + bankBytes > comm->ddaScratchBytes) {
+  const size_t bankSize = dda::common::ddaBankSize(scratch.bytes);
+  if (!ncclDdaScratchFits("reduce_scatter LL bytes/bank", bankBytes, bankSize)) {
     return false;
   }
 
@@ -165,6 +171,11 @@ uint32_t ncclReduceScatterDdaFabricLLBlocks(ncclComm* comm, size_t recvcount, nc
 ncclResult_t ncclReduceScatterDdaFabricLL(const void* sendbuff, void* recvbuff, size_t recvcount,
                                           ncclDataType_t datatype, ncclRedOp_t op, ncclComm* comm,
                                           cudaStream_t stream) {
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(recvcount, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes))
+    return ncclInvalidArgument;
+
   (void)op;
   switch (datatype) {
   case ncclFloat32:

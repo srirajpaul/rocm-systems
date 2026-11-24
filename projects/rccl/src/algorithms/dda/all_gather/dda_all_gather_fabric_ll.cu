@@ -63,6 +63,7 @@ static ncclResult_t ncclAllGatherDdaFabricLLTyped(
   const void* sendbuff, void* recvbuff,
   size_t sendcount, // per-rank element count of T (== bytes when T == int8_t)
   ncclComm* comm, cudaStream_t stream) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchLL);
   const int nRanks = comm->nRanks;
   const size_t perRankBytes = sendcount * sizeof(T);
 
@@ -71,10 +72,10 @@ static ncclResult_t ncclAllGatherDdaFabricLLTyped(
   const dim3 block = gridBlock.second;
   const uint32_t blocksPerPeer = grid.y;
 
-  T** peers = reinterpret_cast<T**>(comm->ddaPeerPtrsDev);
-  uint32_t* epochDev = comm->ddaLLEpochDev;
-  const int epochLen = comm->ddaLLEpochLen;
-  const size_t bankSize = ddaBankSize(comm->ddaScratchBytes);
+  T** peers = reinterpret_cast<T**>(scratch.peerPtrsDev);
+  uint32_t* epochDev = scratch.epochDev;
+  const int epochLen = scratch.epochLen;
+  const size_t bankSize = ddaBankSize(scratch.bytes);
 
   INFO(NCCL_COLL, "DDA fabric AllGather LL: nRanks=%d perRankBytes=%zu grid=%ux%u block=%u (block-per-peer, bpp=%u)",
        nRanks, perRankBytes, grid.x, grid.y, block.x, blocksPerPeer);
@@ -109,12 +110,17 @@ static ncclResult_t ncclAllGatherDdaFabricLLTyped(
 
 bool ncclAllGatherDdaFabricLLEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t sendcount,
                                       ncclDataType_t datatype) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchLL);
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(sendcount, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes)) return false;
+
   (void)sendbuff;
   (void)recvbuff;
   if (comm == nullptr || comm->bootstrap == nullptr) {
     return false;
   }
-  if (comm->ddaFabricMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr) {
+  if (comm->ddaFabricMemHandler == nullptr || scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr) {
     return false;
   }
   if (sendcount == 0) {
@@ -138,7 +144,7 @@ bool ncclAllGatherDdaFabricLLEligible(ncclComm* comm, const void* sendbuff, void
   // One packet carries 8B of payload, so this rank's contribution has to fit the
   // slot the bank gives each rank. A bank too small for one packet per rank takes
   // the tier out entirely.
-  if ((perRankBytes >> 3) > ddaLLAgSlotPkts(ddaBankSize(comm->ddaScratchBytes), comm->nRanks)) {
+  if (!ncclDdaScratchFits("all_gather LL packets/slot/bank", (perRankBytes >> 3), ddaLLAgSlotPkts(ddaBankSize(scratch.bytes), comm->nRanks))) {
     return false;
   }
 
@@ -152,6 +158,11 @@ uint32_t ncclAllGatherDdaFabricLLBlocks(ncclComm* comm, size_t sendcount, ncclDa
 
 ncclResult_t ncclAllGatherDdaFabricLL(const void* sendbuff, void* recvbuff, size_t sendcount, ncclDataType_t datatype,
                                       ncclComm* comm, cudaStream_t stream) {
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(sendcount, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes))
+    return ncclInvalidArgument;
+
   if (!rcclDdaDatatypeSupported(comm, datatype)) {
     return ncclInvalidArgument;
   }

@@ -175,16 +175,17 @@ static ncclResult_t ddaAllToAllFabricTdmPrepare() {
 template <typename T>
 static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvbuff, size_t count, ncclComm* comm,
                                                cudaStream_t stream) {
-  if (comm->ddaFabricMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr ||
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchSimple);
+  if (comm->ddaFabricMemHandler == nullptr || scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr ||
       comm->ddaFabricBarrierState == nullptr) {
     return ncclInvalidUsage;
   }
 
   const int nRanks = comm->nRanks;
   const size_t totalBytes = count * nRanks;
-  if (totalBytes > comm->ddaScratchBytes) {
+  if (!ncclDdaScratchFits("alltoall Simple bytes", totalBytes, scratch.bytes)) {
     WARN("DDA fabric alltoall: total %zu bytes exceeds comm scratch %zu bytes", totalBytes,
-         comm->ddaScratchBytes);
+         scratch.bytes);
     return ncclInvalidArgument;
   }
 
@@ -197,7 +198,7 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
   auto* barrierState = static_cast<DdaFabricBarrierState*>(comm->ddaFabricBarrierState);
   dda::common::FabricGpuBarrier barrierHost = barrierState->barrierHost;
 
-  void* peerPtrsDev = comm->ddaPeerPtrsDev;
+  void* peerPtrsDev = scratch.peerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
 
   const char* unroll = (nRanks == 4 || nRanks == 8) ? " (unrolled)" : " (runtime)";
@@ -330,7 +331,7 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
   // Stage sendbuff into this rank's scratch before the peer exchange. A single
   // host-launched cudaMemcpyAsync avoids the per-block in-kernel copy race on
   // the fabric path.
-  CUDACHECK(cudaMemcpyAsync(comm->ddaScratch, sendbuff, totalBytes, cudaMemcpyDeviceToDevice, stream));
+  CUDACHECK(cudaMemcpyAsync(scratch.scratch, sendbuff, totalBytes, cudaMemcpyDeviceToDevice, stream));
 
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
   switch (nRanks) {
@@ -360,6 +361,11 @@ static ncclResult_t ncclAllToAllDdaFabricTyped(const void* sendbuff, void* recvb
 
 bool ncclAllToAllDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
                                    ncclDataType_t datatype) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchSimple);
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(count, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes)) return false;
+
   (void)sendbuff;
   (void)recvbuff;
   if (comm == nullptr || comm->bootstrap == nullptr) {
@@ -370,7 +376,7 @@ bool ncclAllToAllDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* r
   if (comm->ddaFabricMemHandler == nullptr || comm->ddaFabricBarrierState == nullptr) {
     return false;
   }
-  if (comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr) {
+  if (scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr) {
     return false;
   }
   if (count == 0) {
@@ -385,16 +391,13 @@ bool ncclAllToAllDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* r
 
   size_t totalCount = count * comm->nRanks;
   size_t need = totalCount * ncclTypeSize(datatype);
-  if (need > comm->ddaScratchBytes) {
-    return false;
-  }
 
   // Check for data size divisible by 16 (kernel does 16-byte vectorized loads)
   if ((count * ncclTypeSize(datatype)) % 16) {
     return false;
   }
 
-  return true;
+  return ncclDdaScratchFits("alltoall Simple bytes", need, scratch.bytes);
 }
 
 uint32_t ncclAllToAllDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_t datatype) {
@@ -404,6 +407,11 @@ uint32_t ncclAllToAllDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_
 
 ncclResult_t ncclAllToAllDdaFabric(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                    ncclComm* comm, cudaStream_t stream) {
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(count, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes))
+    return ncclInvalidArgument;
+
   if (!rcclDdaDatatypeSupported(comm, datatype)) {
     return ncclInvalidArgument;
   }

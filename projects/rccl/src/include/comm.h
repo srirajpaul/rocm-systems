@@ -34,6 +34,7 @@
 #include "recorder.h"
 #include "algorithms/dda/dda_init_detail.h"
 #include "mem_manager.h"
+#include "dda_scratch.h"
 #include "tuning.h"
 #include "enqueue/raw_task.h"
 #include "enqueue/task_pretuning.h"
@@ -725,10 +726,9 @@ struct ncclComm {
   void* bootstrap;
   bool isGrow; // true if this comm is created via ncclCommGrow
 
-  // DDA all-reduce. The scratch buffer and peer-pointer table below are shared
-  // by both the IPC path (ncclDdaIpcCommInit) and the fabric/VMM path
-  // (ncclDdaFabricCommInit); only one path is active per comm. The handler and
-  // barrier-state pointers are path-specific.
+  // Fabric protocols own disjoint regions in one exported allocation.
+  // The legacy scratch/peer/epoch fields below belong only to IPC.
+  ncclDdaFabricScratch ddaFabricScratch;
   ncclIpcMemHandler* ddaIpcMemHandler; /* IPC path only */
   ncclFabricMemHandler* ddaFabricMemHandler; /* fabric path only */
   void* ddaScratch;
@@ -737,9 +737,6 @@ struct ncclComm {
   nccl_dda_detail::DdaIpcBarrierState* ddaIpcBarrierState; /* IPC path only */
   nccl_dda_detail::DdaFabricBarrierState* ddaFabricBarrierState; /* fabric path only */
   int ddaFabricMaxBlocks;
-  // True when ddaScratch is VMM (cuMem) backed (fabric path); selects the
-  // matching deallocator at teardown.
-  bool ddaScratchIsVmm;
   // Device-resident per-block epoch cells for the LL-protocol DDA collectives,
   uint32_t* ddaLLEpochDev;
   int ddaLLEpochLen;
@@ -1351,5 +1348,23 @@ ncclResult_t ncclParseCommConfig(ncclComm_t comm, ncclConfig_t* config);
 
 // Process-wide NCCL_CTA_POLICY env override, or NCCL_CONFIG_UNDEF_INT when unset/invalid.
 int ncclGetEnvCtaPolicy();
+
+// A value view keeps the IPC ownership/lifetime unchanged. Fabric never falls
+// back to IPC storage merely because an individual region is disabled.
+inline ncclDdaScratchRegion ncclDdaGetScratch(const ncclComm* comm, ncclDdaScratchKind kind) {
+  if (comm == nullptr) return {};
+  if (comm->ddaFabricMemHandler != nullptr) return comm->ddaFabricScratch.regions[kind];
+  if (comm->ddaIpcMemHandler != nullptr)
+    return {comm->ddaScratch, comm->ddaScratchBytes, comm->ddaPeerPtrsDev, comm->ddaPeerPtrsHost,
+            comm->ddaLLEpochDev, comm->ddaLLEpochLen};
+  return {};
+}
+
+// Pure eligibility diagnostic; never allocates, advances epochs or enqueues work.
+inline bool ncclDdaScratchFits(const char* layout, size_t required, size_t available) {
+  if (required <= available) return true;
+  INFO(NCCL_TUNING, "DDA scratch capacity fallback: %s required=%zu available=%zu", layout, required, available);
+  return false;
+}
 
 #endif

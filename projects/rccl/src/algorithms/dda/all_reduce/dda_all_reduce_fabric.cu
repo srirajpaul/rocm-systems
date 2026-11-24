@@ -42,13 +42,14 @@ static inline std::pair<dim3, dim3> ddaAllReduceFabricGeom(ncclComm* comm, size_
 template <typename T>
 static ncclResult_t ncclAllReduceDdaFabricTyped(const void* sendbuff, void* recvbuff, size_t count, ncclComm* comm,
                                                 cudaStream_t stream, rcclDdaLaunchCap cap) {
-  if (comm->ddaFabricMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr ||
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchSimple);
+  if (comm->ddaFabricMemHandler == nullptr || scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr ||
       comm->ddaFabricBarrierState == nullptr) {
     return ncclInvalidUsage;
   }
-  if (count * sizeof(T) > comm->ddaScratchBytes) {
+  if (!ncclDdaScratchFits("all_reduce Simple bytes", count * sizeof(T), scratch.bytes)) {
     WARN("DDA fabric allreduce: element count %zu needs %zu bytes; comm scratch is %zu bytes", count, count * sizeof(T),
-         comm->ddaScratchBytes);
+         scratch.bytes);
     return ncclInvalidArgument;
   }
 
@@ -70,7 +71,7 @@ static ncclResult_t ncclAllReduceDdaFabricTyped(const void* sendbuff, void* recv
   auto* barrierState = static_cast<DdaFabricBarrierState*>(comm->ddaFabricBarrierState);
   dda::common::FabricGpuBarrier barrierHost = barrierState->barrierHost;
 
-  void* peerPtrsDev = comm->ddaPeerPtrsDev;
+  void* peerPtrsDev = scratch.peerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
 
   // Specialize the kernel for common clique sizes (compile-time NRANKS -> the
@@ -82,7 +83,7 @@ static ncclResult_t ncclAllReduceDdaFabricTyped(const void* sendbuff, void* recv
 
   const hipEvent_t stopEvent = rcclTakeAddonStopEvent(comm);
   if (treeOk) {
-    CUDACHECK(cudaMemcpyAsync(comm->ddaScratch, sendbuff, count * sizeof(T), cudaMemcpyDeviceToDevice, stream));
+    CUDACHECK(cudaMemcpyAsync(scratch.scratch, sendbuff, count * sizeof(T), cudaMemcpyDeviceToDevice, stream));
     // NRANKS_CT 4/8: unrolled CollCommon reduce; 0: runtime fallback.
     switch (nRanks) {
     case 4:
@@ -136,6 +137,11 @@ static ncclResult_t ncclAllReduceDdaFabricTyped(const void* sendbuff, void* recv
 
 bool ncclAllReduceDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
                                     ncclDataType_t datatype, ncclRedOp_t op) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchSimple);
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(count, (size_t)ncclTypeSize(datatype), 1, &checkedBytes)) return false;
+
   (void)sendbuff;
   (void)recvbuff;
   if (comm == nullptr) {
@@ -153,7 +159,7 @@ bool ncclAllReduceDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* 
   if (comm->bootstrap == nullptr) {
     return false;
   }
-  if (comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr) {
+  if (scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr) {
     return false;
   }
   if (count == 0) {
@@ -166,9 +172,6 @@ bool ncclAllReduceDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* 
     return false;
   }
   const size_t bytes = count * ncclTypeSize(datatype);
-  if (bytes > comm->ddaScratchBytes) {
-    return false;
-  }
   if (bytes % 16) {
     // 16-byte alignment: the DDA kernels do 16-byte vectorized loads.
     return false;
@@ -180,7 +183,7 @@ bool ncclAllReduceDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* 
       return false;
     }
   }
-  return true;
+  return ncclDdaScratchFits("all_reduce Simple bytes", bytes, scratch.bytes);
 }
 
 uint32_t ncclAllReduceDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType_t datatype, rcclDdaLaunchCap cap) {
@@ -190,6 +193,11 @@ uint32_t ncclAllReduceDdaFabricBlocks(ncclComm* comm, size_t count, ncclDataType
 
 ncclResult_t ncclAllReduceDdaFabric(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                     ncclRedOp_t op, ncclComm* comm, cudaStream_t stream, rcclDdaLaunchCap cap) {
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(count, (size_t)ncclTypeSize(datatype), 1, &checkedBytes))
+    return ncclInvalidArgument;
+
   (void)op;
   switch (datatype) {
   case ncclFloat32:

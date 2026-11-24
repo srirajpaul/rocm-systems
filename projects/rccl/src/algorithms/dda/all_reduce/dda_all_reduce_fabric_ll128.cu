@@ -63,6 +63,7 @@ static inline unsigned ddaLL128ArThreads(unsigned dflt) {
 // block has threads/16 groups), capped by the block count and clamped so
 // flatBlockId (blockIdx.x) stays within the device epoch array.
 static inline std::pair<dim3, dim3> ddaAllReduceFabricLL128Geom(ncclComm* comm, size_t count, int typeSize) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchLL128);
   const size_t nWords = ((size_t)count * (size_t)typeSize) >> 3;
   const size_t numLines = (nWords + (size_t)kDdaLL128DataElems - 1) / (size_t)kDdaLL128DataElems;
   const unsigned threads = ddaLL128ArThreads(1024); // multiple of 16 (lanes/line)
@@ -75,8 +76,8 @@ static inline std::pair<dim3, dim3> ddaAllReduceFabricLL128Geom(ncclComm* comm, 
   if (blocks == 0) {
     blocks = 1;
   }
-  if ((int)blocks > comm->ddaLLEpochLen) {
-    blocks = (unsigned)comm->ddaLLEpochLen;
+  if ((int)blocks > scratch.epochLen) {
+    blocks = (unsigned)scratch.epochLen;
     if (blocks == 0) blocks = 1;
   }
   return std::make_pair(dim3(blocks), dim3(threads));
@@ -85,6 +86,7 @@ static inline std::pair<dim3, dim3> ddaAllReduceFabricLL128Geom(ncclComm* comm, 
 template <typename T>
 static ncclResult_t ncclAllReduceDdaFabricLL128Typed(const void* sendbuff, void* recvbuff, size_t count, ncclComm* comm,
                                                      cudaStream_t stream) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchLL128);
   const int nRanks = comm->nRanks;
   const size_t bytes = count * sizeof(T);
   const size_t nWords = bytes >> 3;
@@ -95,9 +97,9 @@ static ncclResult_t ncclAllReduceDdaFabricLL128Typed(const void* sendbuff, void*
   const dim3 grid = gridBlock.first;
   const dim3 block = gridBlock.second;
 
-  T** peers = reinterpret_cast<T**>(comm->ddaPeerPtrsDev);
-  uint32_t* epochDev = comm->ddaLLEpochDev;
-  const int epochLen = comm->ddaLLEpochLen;
+  T** peers = reinterpret_cast<T**>(scratch.peerPtrsDev);
+  uint32_t* epochDev = scratch.epochDev;
+  const int epochLen = scratch.epochLen;
 
   INFO(NCCL_COLL, "DDA fabric AllReduce LL128: nRanks=%d bytes=%zu numLines=%zu grid=%u block=%u", nRanks, bytes,
        numLines, grid.x, block.x);
@@ -132,12 +134,17 @@ static ncclResult_t ncclAllReduceDdaFabricLL128Typed(const void* sendbuff, void*
 
 bool ncclAllReduceDdaFabricLL128Eligible_old(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t count,
                                          ncclDataType_t datatype, ncclRedOp_t op) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchLL128);
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(count, (size_t)ncclTypeSize(datatype), 1, &checkedBytes)) return false;
+
   (void)sendbuff;
   (void)recvbuff;
   if (comm == nullptr || comm->bootstrap == nullptr) {
     return false;
   }
-  if (comm->ddaFabricMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr) {
+  if (comm->ddaFabricMemHandler == nullptr || scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr) {
     return false;
   }
   if (comm->nRanks < 2 || comm->nRanks > dda::common::kDdaMaxNranks) {
@@ -168,7 +175,7 @@ bool ncclAllReduceDdaFabricLL128Eligible_old(ncclComm* comm, const void* sendbuf
   // eligibility is bounded by the runtime scratch capacity for this size.
   const size_t nWords = bytes >> 3;
   const size_t numLines = (nWords + (size_t)kDdaLL128DataElems - 1) / (size_t)kDdaLL128DataElems;
-  if (ddaLL128ArScratchSize(comm->nRanks, numLines) > comm->ddaScratchBytes) {
+  if (!ncclDdaScratchFits("all_reduce LL128 bytes", ddaLL128ArScratchSize(comm->nRanks, numLines), scratch.bytes)) {
     return false;
   }
 
@@ -182,6 +189,11 @@ uint32_t ncclAllReduceDdaFabricLL128Blocks_old(ncclComm* comm, size_t count, ncc
 
 ncclResult_t ncclAllReduceDdaFabricLL128_old(const void* sendbuff, void* recvbuff, size_t count, ncclDataType_t datatype,
                                          ncclRedOp_t op, ncclComm* comm, cudaStream_t stream) {
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(count, (size_t)ncclTypeSize(datatype), 1, &checkedBytes))
+    return ncclInvalidArgument;
+
   (void)op;
   switch (datatype) {
   case ncclFloat32:

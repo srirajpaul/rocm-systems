@@ -33,16 +33,18 @@ static inline std::pair<dim3, dim3> ddaAllGatherFabricGeom(ncclComm* comm, size_
 template <typename T>
 static ncclResult_t ncclAllGatherDdaFabricTyped(const void* sendbuff, void* recvbuff, size_t sendcount, ncclComm* comm,
                                                 cudaStream_t stream) {
-  if (comm->ddaFabricMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr ||
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchSimple);
+  if (comm->ddaFabricMemHandler == nullptr || scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr ||
       comm->ddaFabricBarrierState == nullptr) {
     return ncclInvalidUsage;
   }
 
   const int nRanks = comm->nRanks;
-  const size_t totalCount = sendcount * nRanks;
-  if (totalCount * sizeof(T) > comm->ddaScratchBytes) {
+  // Each rank stages only its own contribution; user output holds the gathered result.
+  const size_t totalCount = sendcount;
+  if (!ncclDdaScratchFits("all_gather Simple bytes", totalCount * sizeof(T), scratch.bytes)) {
     WARN("DDA fabric allgather: send element count %zu needs %zu bytes; comm scratch is %zu bytes", sendcount,
-         totalCount * sizeof(T), comm->ddaScratchBytes);
+         totalCount * sizeof(T), scratch.bytes);
     return ncclInvalidArgument;
   }
 
@@ -55,7 +57,7 @@ static ncclResult_t ncclAllGatherDdaFabricTyped(const void* sendbuff, void* recv
   auto* barrierState = static_cast<DdaFabricBarrierState*>(comm->ddaFabricBarrierState);
   dda::common::FabricGpuBarrier barrierHost = barrierState->barrierHost;
 
-  void* peerPtrsDev = comm->ddaPeerPtrsDev;
+  void* peerPtrsDev = scratch.peerPtrsDev;
   T** d_ipcbuffs = reinterpret_cast<T**>(peerPtrsDev);
 
   INFO(NCCL_COLL, "DDA fabric AllGather: launching kernel: nRanks=%d sendcount=%zu grid=%u block=%u%s", nRanks,
@@ -92,6 +94,11 @@ static ncclResult_t ncclAllGatherDdaFabricTyped(const void* sendbuff, void* recv
 
 bool ncclAllGatherDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t sendcount,
                                     ncclDataType_t datatype) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchSimple);
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(sendcount, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes)) return false;
+
   (void)sendbuff;
   (void)recvbuff;
   if (comm == nullptr || comm->bootstrap == nullptr) {
@@ -102,7 +109,7 @@ bool ncclAllGatherDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* 
   if (comm->ddaFabricMemHandler == nullptr || comm->ddaFabricBarrierState == nullptr) {
     return false;
   }
-  if (comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr) {
+  if (scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr) {
     return false;
   }
   if (sendcount == 0) {
@@ -116,16 +123,13 @@ bool ncclAllGatherDdaFabricEligible(ncclComm* comm, const void* sendbuff, void* 
   }
 
   size_t need = sendcount * ncclTypeSize(datatype);
-  if (need > comm->ddaScratchBytes) {
-    return false;
-  }
 
   // Check for data size divisible by 16 (kernel does 16-byte vectorized loads)
   if ((sendcount * ncclTypeSize(datatype)) % 16) {
     return false;
   }
 
-  return true;
+  return ncclDdaScratchFits("all_gather Simple bytes", need, scratch.bytes);
 }
 
 uint32_t ncclAllGatherDdaFabricBlocks(ncclComm* comm, size_t sendcount, ncclDataType_t datatype) {
@@ -135,6 +139,11 @@ uint32_t ncclAllGatherDdaFabricBlocks(ncclComm* comm, size_t sendcount, ncclData
 
 ncclResult_t ncclAllGatherDdaFabric(const void* sendbuff, void* recvbuff, size_t sendcount, ncclDataType_t datatype,
                                     ncclComm* comm, cudaStream_t stream) {
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(sendcount, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes))
+    return ncclInvalidArgument;
+
   if (!rcclDdaDatatypeSupported(comm, datatype)) {
     return ncclInvalidArgument;
   }

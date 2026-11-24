@@ -76,19 +76,20 @@ static ncclResult_t ncclAllGatherDdaFabricLL128Typed(
   const void* sendbuff, void* recvbuff,
   size_t sendcount, // per-rank element count of T (== bytes when T == int8_t)
   ncclComm* comm, cudaStream_t stream) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchLL128);
   const int nRanks = comm->nRanks;
   const size_t perRankBytes = sendcount * sizeof(T);
   const size_t slices = ddaLL128Slices(perRankBytes);
-  const size_t bankSize = ddaBankSize(comm->ddaScratchBytes);
+  const size_t bankSize = ddaBankSize(scratch.bytes);
 
   auto gridBlock = ddaAllGatherFabricLL128Geom(comm, perRankBytes);
   const dim3 grid = gridBlock.first;
   const dim3 block = gridBlock.second;
   const unsigned blocksPerPeer = grid.y;
 
-  T** peers = reinterpret_cast<T**>(comm->ddaPeerPtrsDev);
-  uint32_t* epochDev = comm->ddaLLEpochDev;
-  const int epochLen = comm->ddaLLEpochLen;
+  T** peers = reinterpret_cast<T**>(scratch.peerPtrsDev);
+  uint32_t* epochDev = scratch.epochDev;
+  const int epochLen = scratch.epochLen;
 
   INFO(NCCL_COLL,
        "DDA fabric AllGather LL128: nRanks=%d perRankBytes=%zu slices=%zu grid=%ux%u block=%u "
@@ -126,15 +127,20 @@ static ncclResult_t ncclAllGatherDdaFabricLL128Typed(
 
 bool ncclAllGatherDdaFabricLL128Eligible(ncclComm* comm, const void* sendbuff, void* recvbuff, size_t sendcount,
                                          ncclDataType_t datatype) {
+  const auto scratch = ncclDdaGetScratch(comm, ncclDdaScratchLL128);
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(sendcount, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes)) return false;
+
   (void)sendbuff;
   (void)recvbuff;
   if (comm == nullptr || comm->bootstrap == nullptr) {
     return false;
   }
-  if (comm->ddaFabricMemHandler == nullptr || comm->ddaScratch == nullptr || comm->ddaPeerPtrsDev == nullptr) {
+  if (comm->ddaFabricMemHandler == nullptr || scratch.scratch == nullptr || scratch.peerPtrsDev == nullptr) {
     return false;
   }
-  if (comm->ddaLLEpochDev == nullptr || comm->ddaLLEpochLen < 1) {
+  if (scratch.epochDev == nullptr || scratch.epochLen < 1) {
     return false;
   }
   if (sendcount == 0) {
@@ -157,7 +163,8 @@ bool ncclAllGatherDdaFabricLL128Eligible(ncclComm* comm, const void* sendbuff, v
     return false;
   }
   // Derived from the scratch allocation
-  if (perRankBytes > ddaLL128AGMaxPerRankBytes(comm->nRanks, comm->ddaScratchBytes)) {
+  if (!ncclDdaScratchFits("AllGather LL128 payload bytes/rank", perRankBytes,
+                         ddaLL128AGMaxPerRankBytes(comm->nRanks, scratch.bytes))) {
     return false;
   }
 
@@ -171,6 +178,11 @@ uint32_t ncclAllGatherDdaFabricLL128Blocks(ncclComm* comm, size_t sendcount, ncc
 
 ncclResult_t ncclAllGatherDdaFabricLL128(const void* sendbuff, void* recvbuff, size_t sendcount,
                                          ncclDataType_t datatype, ncclComm* comm, cudaStream_t stream) {
+  size_t checkedBytes;
+  if (comm == nullptr || comm->nRanks < 1 ||
+      !ncclDdaByteCount(sendcount, (size_t)ncclTypeSize(datatype), (size_t)comm->nRanks, &checkedBytes))
+    return ncclInvalidArgument;
+
   if (!rcclDdaDatatypeSupported(comm, datatype)) {
     return ncclInvalidArgument;
   }
